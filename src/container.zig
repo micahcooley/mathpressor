@@ -82,10 +82,10 @@ pub const FatEntry = struct {
     /// FNV-1a of the original uncompressed bytes.
     checksum: u32,
 
-    pub fn setPath(self: *FatEntry, p: []const u8) void {
-        const n = @min(p.len, MAX_PATH_LEN - 1);
-        @memcpy(self.path[0..n], p[0..n]);
-        self.path[n] = 0;
+    pub fn setPath(self: *FatEntry, p: []const u8) error{PathTooLong}!void {
+        if (p.len >= MAX_PATH_LEN) return error.PathTooLong;
+        @memcpy(self.path[0..p.len], p);
+        self.path[p.len] = 0;
     }
 
     pub fn getPath(self: *const FatEntry) []const u8 {
@@ -132,7 +132,7 @@ pub const Builder = struct {
             .compressed_size = bytecode.len,
             .checksum = checksum,
         };
-        fat.setPath(path);
+        try fat.setPath(path);
         try self.entries.append(.{
             .fat = fat,
             .data = try self.allocator.dupe(u8, bytecode),
@@ -155,7 +155,7 @@ pub const Builder = struct {
             .compressed_size = compressed.len,
             .checksum = checksum,
         };
-        fat.setPath(path);
+        try fat.setPath(path);
         try self.entries.append(.{
             .fat = fat,
             .data = try self.allocator.dupe(u8, compressed),
@@ -192,7 +192,7 @@ pub const Builder = struct {
                 .compressed_size = gz.len,
                 .checksum = csum,
             };
-            fat.setPath(path);
+            try fat.setPath(path);
             try self.entries.append(.{ .fat = fat, .data = gz });
             return .{
                 .comp_type = .fallback_stream,
@@ -214,7 +214,7 @@ pub const Builder = struct {
                 .compressed_size = raw.len, // stored_size == original_size for STORE
                 .checksum = csum,
             };
-            fat.setPath(path);
+            try fat.setPath(path);
             try self.entries.append(.{ .fat = fat, .data = raw_copy });
             return .{
                 .comp_type = .store,
@@ -267,7 +267,7 @@ pub const Builder = struct {
             .compressed_size = block_len,
             .checksum = checksum,
         };
-        fat.setPath(path);
+        try fat.setPath(path);
         try self.entries.append(.{ .fat = fat, .data = block });
     }
 
@@ -382,7 +382,7 @@ pub const StreamingBuilder = struct {
             .compressed_size = bytecode.len,
             .checksum = checksum,
         };
-        fat.setPath(path);
+        try fat.setPath(path);
         try self.appendBlock(fat, bytecode);
     }
 
@@ -415,7 +415,7 @@ pub const StreamingBuilder = struct {
             .compressed_size = block_len,
             .checksum = checksum,
         };
-        fat.setPath(path);
+        try fat.setPath(path);
         try self.appendBlock(fat, block);
     }
 
@@ -437,7 +437,7 @@ pub const StreamingBuilder = struct {
                 .compressed_size = gz.len,
                 .checksum = csum,
             };
-            fat.setPath(path);
+            try fat.setPath(path);
             try self.appendBlock(fat, gz);
             return Builder.StorageDecision{ .comp_type = .fallback_stream, .stored_size = gz.len,
                        .guard_fired = false, .gzip_would_have_been = gz.len };
@@ -450,7 +450,7 @@ pub const StreamingBuilder = struct {
                 .compressed_size = raw.len,
                 .checksum = csum,
             };
-            fat.setPath(path);
+            try fat.setPath(path);
             try self.appendBlock(fat, raw);
             return Builder.StorageDecision{ .comp_type = .store, .stored_size = raw.len,
                        .guard_fired = true, .gzip_would_have_been = gz_len };

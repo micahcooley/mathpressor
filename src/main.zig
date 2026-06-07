@@ -551,6 +551,11 @@ fn packFile(
     };
     defer root.free(data);
 
+    if (rel_path.len >= container.MAX_PATH_LEN) {
+        try out.print("  SKIP      {s} (path too long: {d} chars)\n", .{ rel_path, rel_path.len });
+        return;
+    }
+
     total_raw.* += data.len;
     file_count.* += 1;
 
@@ -612,6 +617,9 @@ fn unpackContainer(root: std.mem.Allocator, in_path: []const u8, out_dir: []cons
 
         var path_buf: [512]u8 = undefined;
         const full_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ out_dir, entry.getPath() });
+        if (std.fs.path.dirname(full_path)) |parent| {
+            try std.fs.cwd().makePath(parent);
+        }
         const f = try std.fs.cwd().createFile(full_path, .{});
         defer f.close();
         try f.writeAll(reconstructed);
