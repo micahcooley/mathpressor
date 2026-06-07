@@ -360,7 +360,7 @@ pub const StreamingBuilder = struct {
     }
 
     /// Write a raw block to the temp file and register the FAT entry.
-    fn appendBlock(self: *StreamingBuilder, fat: FatEntry, block: []const u8) !void {
+    pub fn appendBlock(self: *StreamingBuilder, fat: FatEntry, block: []const u8) !void {
         var entry = fat;
         entry.data_offset = self.data_cursor;
         try self.tmp_file.writeAll(block);
@@ -671,7 +671,7 @@ pub fn gzipCompress(data: []const u8, a: std.mem.Allocator) ![]u8 {
     var buf = std.ArrayList(u8).init(a);
     errdefer buf.deinit();
     var fbs = std.io.fixedBufferStream(data);
-    try std.compress.gzip.compress(fbs.reader(), buf.writer(), .{ .level = .best });
+    try std.compress.gzip.compress(fbs.reader(), buf.writer(), .{ .level = .fast });
     return buf.toOwnedSlice();
 }
 

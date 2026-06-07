@@ -454,51 +454,165 @@ const TranslateProgress = translator.TranslateProgress;
 // Pack / Unpack CLI
 // ---------------------------------------------------------------------------
 
-fn packDirectory(root: std.mem.Allocator, dir_path: []const u8, out_path: []const u8, out: anytype) !void {
-    // StreamingBuilder writes compressed blocks straight to a temp file as each
-    // file is processed — peak RAM = one file at a time, not the whole archive.
-    var cb = try container.StreamingBuilder.init(root);
-    defer cb.deinit();
+// ---------------------------------------------------------------------------
+// Parallel pack pipeline
+// ---------------------------------------------------------------------------
 
-    var total_raw: u64 = 0;
-    var file_count: u32 = 0;
+const PackCtx = struct {
+    alloc: std.mem.Allocator,
+    base_dir: []const u8,
+    cb: *container.StreamingBuilder,
+    cb_mu: std.Thread.Mutex = .{},
+    total_raw: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    file_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    print_mu: std.Thread.Mutex = .{},
+    out: std.io.AnyWriter,
+};
 
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    try packWalk(root, dir_path, "", &path_buf, &cb, &total_raw, &file_count, out);
-
-    const out_file = try std.fs.cwd().createFile(out_path, .{});
-    defer out_file.close();
-    try cb.finish(out_file);
-
-    // Container size = header + FAT + all data blocks.
-    const fat_overhead = HEADER_SIZE + FAT_ENTRY_SIZE * cb.entryCount();
-    const container_size = fat_overhead + cb.dataBytes();
-
-    const ratio = if (container_size > 0)
-        @as(f64, @floatFromInt(total_raw)) / @as(f64, @floatFromInt(container_size))
-    else 0.0;
-
-    try out.print("\n  Files packed   : {d}\n", .{file_count});
-    try out.print("  Raw total      : {d:.1} MB\n", .{@as(f64, @floatFromInt(total_raw)) / (1024 * 1024)});
-    try out.print("  Container size : {d:.1} MB\n", .{@as(f64, @floatFromInt(container_size)) / (1024 * 1024)});
-    try out.print("  Ratio          : {d:.2}x\n", .{ratio});
-    try out.print("Wrote {s}\n", .{out_path});
+fn processFileJob(ctx: *PackCtx, rel_path: []u8) void {
+    packFileParallel(ctx, rel_path) catch |err| {
+        var buf: [std.fs.max_path_bytes + 64]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "  ERROR     {s} ({s})\n",
+            .{ rel_path, @errorName(err) }) catch return;
+        ctx.print_mu.lock();
+        defer ctx.print_mu.unlock();
+        ctx.out.writeAll(line) catch {};
+    };
 }
 
-const HEADER_SIZE = container.HEADER_SIZE;
-const FAT_ENTRY_SIZE = container.FAT_ENTRY_SIZE;
+fn packFileParallel(ctx: *PackCtx, rel_path: []u8) !void {
+    if (rel_path.len >= container.MAX_PATH_LEN) {
+        var buf: [std.fs.max_path_bytes + 64]u8 = undefined;
+        const line = try std.fmt.bufPrint(&buf,
+            "  SKIP      {s} (path too long: {d} chars)\n", .{ rel_path, rel_path.len });
+        ctx.print_mu.lock();
+        defer ctx.print_mu.unlock();
+        try ctx.out.writeAll(line);
+        return;
+    }
 
-fn packWalk(
-    root: std.mem.Allocator,
+    var arena = std.heap.ArenaAllocator.init(ctx.alloc);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Build full path and read the file.
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const full_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ ctx.base_dir, rel_path });
+    const MAX_FILE: usize = 256 * 1024 * 1024;
+    const data = std.fs.cwd().readFileAlloc(alloc, full_path, MAX_FILE) catch |err| {
+        var buf: [std.fs.max_path_bytes + 64]u8 = undefined;
+        const line = try std.fmt.bufPrint(&buf, "  SKIP      {s} ({s})\n",
+            .{ rel_path, @errorName(err) });
+        ctx.print_mu.lock();
+        defer ctx.print_mu.unlock();
+        try ctx.out.writeAll(line);
+        return;
+    };
+
+    const csum = container.fnv1a(data);
+    const orig_size = data.len;
+
+    // Math translation (CPU-intensive, runs outside the lock).
+    const side: u32 = @intFromFloat(@sqrt(@as(f64, @floatFromInt(data.len))));
+    var prog_info = translator.TranslateProgress{};
+    const result = try translator.translate(data, side, side, alloc, &prog_info);
+
+    // Gzip compression also runs outside the lock — this is the hot path for
+    // the vast majority of files that go through FALLBACK or STORE.
+    // We build the FAT entry and pre-compressed block here, then hold the lock
+    // only for the cheap tmp-file write + FAT append.
+    var line_buf: [std.fs.max_path_bytes + 128]u8 = undefined;
+    var line: []const u8 = undefined;
+
+    var fat = container.FatEntry{
+        .comp_type = .math_bytecode, // overwritten in every arm below
+        .data_offset = 0,            // assigned by appendBlock
+        .original_size = @intCast(orig_size),
+        .compressed_size = 0,
+        .checksum = csum,
+    };
+    try fat.setPath(rel_path);
+
+    switch (result) {
+        .math_bytecode => |code| {
+            fat.comp_type = .math_bytecode;
+            fat.compressed_size = code.len;
+            {
+                ctx.cb_mu.lock();
+                defer ctx.cb_mu.unlock();
+                try ctx.cb.appendBlock(fat, code);
+            }
+            line = try std.fmt.bufPrint(&line_buf,
+                "  MATH      {s} ({d}B → {d}B program)\n",
+                .{ rel_path, orig_size, code.len });
+        },
+        .approximate => |approx| {
+            // Compress delta outside the lock.
+            const gz_delta = try container.gzipCompress(approx.delta, alloc);
+            const block_len = 1 + approx.bytecode.len + 8 + gz_delta.len;
+            const block = try alloc.alloc(u8, block_len);
+            block[0] = @intCast(approx.bytecode.len);
+            @memcpy(block[1..][0..approx.bytecode.len], approx.bytecode);
+            std.mem.writeInt(u64, block[1 + approx.bytecode.len ..][0..8], gz_delta.len, .little);
+            @memcpy(block[1 + approx.bytecode.len + 8 ..], gz_delta);
+
+            fat.comp_type = .math_residual;
+            fat.compressed_size = block_len;
+            {
+                ctx.cb_mu.lock();
+                defer ctx.cb_mu.unlock();
+                try ctx.cb.appendBlock(fat, block);
+            }
+            line = try std.fmt.bufPrint(&line_buf,
+                "  RESIDUAL  {s} ({d}B, {d}% exact)\n",
+                .{ rel_path, orig_size, approx.exact_pct });
+        },
+        .fallback => {
+            // Compress outside the lock; STORE guard: keep raw if gzip inflates.
+            const gz = try container.gzipCompress(data, alloc);
+            if (gz.len < data.len) {
+                fat.comp_type = .fallback_stream;
+                fat.compressed_size = gz.len;
+                {
+                    ctx.cb_mu.lock();
+                    defer ctx.cb_mu.unlock();
+                    try ctx.cb.appendBlock(fat, gz);
+                }
+                line = try std.fmt.bufPrint(&line_buf,
+                    "  FALLBACK  {s} ({d}B → {d}B gzip, {d:.1}x)\n",
+                    .{ rel_path, orig_size, gz.len,
+                       @as(f64, @floatFromInt(orig_size)) / @as(f64, @floatFromInt(gz.len)) });
+            } else {
+                fat.comp_type = .store;
+                fat.compressed_size = data.len;
+                {
+                    ctx.cb_mu.lock();
+                    defer ctx.cb_mu.unlock();
+                    try ctx.cb.appendBlock(fat, data);
+                }
+                line = try std.fmt.bufPrint(&line_buf,
+                    "  STORE     {s} ({d}B raw — guard fired)\n",
+                    .{ rel_path, data.len });
+            }
+        },
+    }
+
+    _ = ctx.total_raw.fetchAdd(@intCast(orig_size), .monotonic);
+    _ = ctx.file_count.fetchAdd(1, .monotonic);
+
+    ctx.print_mu.lock();
+    defer ctx.print_mu.unlock();
+    try ctx.out.writeAll(line);
+}
+
+// Walk the directory tree and collect relative file paths into `jobs`.
+fn collectWalk(
+    alloc: std.mem.Allocator,
     base_dir: []const u8,
     rel_prefix: []const u8,
     path_buf: *[std.fs.max_path_bytes]u8,
-    cb: *container.StreamingBuilder,
-    total_raw: *u64,
-    file_count: *u32,
-    out: anytype,
+    jobs: *std.ArrayList([]u8),
 ) !void {
-    // Build the absolute path for this level.
     const abs = if (rel_prefix.len == 0)
         base_dir
     else
@@ -509,7 +623,6 @@ fn packWalk(
 
     var it = dir.iterate();
     while (try it.next()) |entry| {
-        // Compose the relative path for this entry (used as the archive key).
         var rel_buf: [std.fs.max_path_bytes]u8 = undefined;
         const rel_path = if (rel_prefix.len == 0)
             try std.fmt.bufPrint(&rel_buf, "{s}", .{entry.name})
@@ -518,84 +631,73 @@ fn packWalk(
 
         switch (entry.kind) {
             .directory => {
-                // Recurse — allocate a fresh path_buf on the stack to avoid
-                // clobbering the parent's buffer mid-iteration.
                 var child_buf: [std.fs.max_path_bytes]u8 = undefined;
-                try packWalk(root, base_dir, rel_path, &child_buf, cb, total_raw, file_count, out);
+                try collectWalk(alloc, base_dir, rel_path, &child_buf, jobs);
             },
-            .file => {
-                try packFile(root, dir, entry.name, rel_path, cb, total_raw, file_count, out);
-            },
-            else => {}, // skip symlinks, devices, etc.
+            .file => try jobs.append(try alloc.dupe(u8, rel_path)),
+            else => {},
         }
     }
 }
 
-/// Read, translate, and add a single file to the container.
-fn packFile(
-    root: std.mem.Allocator,
-    dir: std.fs.Dir,
-    name: []const u8,
-    rel_path: []const u8,
-    cb: *container.StreamingBuilder,
-    total_raw: *u64,
-    file_count: *u32,
-    out: anytype,
-) !void {
-    // 256 MB per-file cap — large enough for any game asset, skips Steam's
-    // multi-hundred-MB depots without running out of memory.
-    const MAX_FILE: usize = 256 * 1024 * 1024;
-    const data = dir.readFileAlloc(root, name, MAX_FILE) catch |err| {
-        try out.print("  SKIP      {s} ({s})\n", .{ rel_path, @errorName(err) });
-        return;
+fn packDirectory(root: std.mem.Allocator, dir_path: []const u8, out_path: []const u8, out: anytype) !void {
+    var cb = try container.StreamingBuilder.init(root);
+    defer cb.deinit();
+
+    // Phase 1: collect all relative file paths (serial, fast — just readdir).
+    var jobs = std.ArrayList([]u8).init(root);
+    defer {
+        for (jobs.items) |p| root.free(p);
+        jobs.deinit();
+    }
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    try collectWalk(root, dir_path, "", &path_buf, &jobs);
+
+    // Phase 2: compress + pack files in parallel across all CPU cores.
+    // Each thread owns its arena; only the tmp-file write is serialised.
+    var ctx = PackCtx{
+        .alloc = root,
+        .base_dir = dir_path,
+        .cb = &cb,
+        .out = out.any(),
     };
-    defer root.free(data);
 
-    if (rel_path.len >= container.MAX_PATH_LEN) {
-        try out.print("  SKIP      {s} (path too long: {d} chars)\n", .{ rel_path, rel_path.len });
-        return;
+    var pool: std.Thread.Pool = undefined;
+    try pool.init(.{ .allocator = root, .n_jobs = null });
+    defer pool.deinit();
+
+    var wg = std.Thread.WaitGroup{};
+    for (jobs.items) |rel_path| {
+        pool.spawnWg(&wg, processFileJob, .{ &ctx, rel_path });
     }
+    pool.waitAndWork(&wg);
 
-    total_raw.* += data.len;
-    file_count.* += 1;
+    // Phase 3: write header + FAT + stream data to the output file.
+    const out_file = try std.fs.cwd().createFile(out_path, .{});
+    defer out_file.close();
+    try cb.finish(out_file);
 
-    const csum = container.fnv1a(data);
-    const orig_size = data.len;
+    const fat_overhead = HEADER_SIZE + FAT_ENTRY_SIZE * cb.entryCount();
+    const container_size = fat_overhead + cb.dataBytes();
+    const total_raw = ctx.total_raw.load(.monotonic);
+    const file_count = ctx.file_count.load(.monotonic);
 
-    // Attempt math translation if the canvas is a perfect square.
-    const side: u32 = @intFromFloat(@sqrt(@as(f64, @floatFromInt(data.len))));
-    var prog_info = translator.TranslateProgress{};
-    const result = try translator.translate(data, side, side, root, &prog_info);
+    const ratio = if (container_size > 0)
+        @as(f64, @floatFromInt(total_raw)) / @as(f64, @floatFromInt(container_size))
+    else
+        0.0;
 
-    switch (result) {
-        .math_bytecode => |code| {
-            defer root.free(code);
-            try cb.addMath(rel_path, code, orig_size, csum);
-            try out.print("  MATH      {s} ({d}B → {d}B program)\n",
-                .{ rel_path, orig_size, code.len });
-        },
-        .approximate => |approx| {
-            defer root.free(approx.bytecode);
-            defer root.free(approx.delta);
-            try cb.addResidual(rel_path, approx.bytecode, approx.delta, orig_size, csum);
-            try out.print("  RESIDUAL  {s} ({d}B, {d}% exact)\n",
-                .{ rel_path, orig_size, approx.exact_pct });
-        },
-        // STORE guard active: addBinary picks gzip vs raw, never inflates.
-        .fallback => {
-            const decision = try cb.addBinary(rel_path, data);
-            switch (decision.comp_type) {
-                .store => try out.print("  STORE     {s} ({d}B raw — guard fired)\n",
-                    .{ rel_path, decision.stored_size }),
-                .fallback_stream => try out.print("  FALLBACK  {s} ({d}B → {d}B gzip, {d:.1}x)\n",
-                    .{ rel_path, orig_size, decision.stored_size,
-                       @as(f64, @floatFromInt(orig_size)) /
-                           @as(f64, @floatFromInt(decision.stored_size)) }),
-                else => unreachable,
-            }
-        },
-    }
+    try out.print("\n  Files packed   : {d}\n", .{file_count});
+    try out.print("  Raw total      : {d:.1} MB\n",
+        .{@as(f64, @floatFromInt(total_raw)) / (1024 * 1024)});
+    try out.print("  Container size : {d:.1} MB\n",
+        .{@as(f64, @floatFromInt(container_size)) / (1024 * 1024)});
+    try out.print("  Ratio          : {d:.2}x\n", .{ratio});
+    try out.print("Wrote {s}\n", .{out_path});
 }
+
+const HEADER_SIZE = container.HEADER_SIZE;
+const FAT_ENTRY_SIZE = container.FAT_ENTRY_SIZE;
 
 fn unpackContainer(root: std.mem.Allocator, in_path: []const u8, out_dir: []const u8, out: anytype) !void {
     const data = try std.fs.cwd().readFileAlloc(root, in_path, 512 * 1024 * 1024);
