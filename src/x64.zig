@@ -369,23 +369,74 @@ pub fn apply(data: []u8, forward: bool) usize {
     return n;
 }
 
+const Range = struct { start: usize, end: usize };
+
+inline fn rd64(d: []const u8, o: usize) u64 {
+    return std.mem.readInt(u64, d[o..][0..8], .little);
+}
+inline fn rd16(d: []const u8, o: usize) u16 {
+    return std.mem.readInt(u16, d[o..][0..2], .little);
+}
+
+/// Executable byte ranges of an ELF64. The filter is restricted to these so it
+/// never garbage-walks data sections (which produced false RIP conversions and
+/// hurt compression). Section headers live outside exec sections and are never
+/// rewritten, so the decoder re-derives identical ranges — still reversible.
+/// Returns an empty slice for non-ELF input (caller filters the whole buffer).
+fn execRanges(data: []const u8, buf: *[96]Range) []Range {
+    if (data.len < 64 or data[0] != 0x7F or data[1] != 'E' or data[2] != 'L' or data[3] != 'F') return buf[0..0];
+    if (data[4] != 2) return buf[0..0]; // ELF64 only
+    const shoff: usize = @intCast(rd64(data, 0x28));
+    const shentsize: usize = rd16(data, 0x3A);
+    const shnum: usize = rd16(data, 0x3C);
+    if (shoff == 0 or shentsize < 64) return buf[0..0];
+    var n: usize = 0;
+    var k: usize = 0;
+    while (k < shnum and n < buf.len) : (k += 1) {
+        const off = shoff + k * shentsize;
+        if (off + 64 > data.len) break;
+        const flags = rd64(data, off + 8); // sh_flags
+        if (flags & 0x4 != 0) { // SHF_EXECINSTR
+            const so: usize = @intCast(rd64(data, off + 0x18)); // sh_offset
+            const ss: usize = @intCast(rd64(data, off + 0x20)); // sh_size
+            if (ss > 0 and so < data.len and so + ss <= data.len) {
+                buf[n] = .{ .start = so, .end = so + ss };
+                n += 1;
+            }
+        }
+    }
+    return buf[0..n];
+}
+
+fn applyRanges(data: []u8, forward: bool, ranges: []const Range) usize {
+    if (ranges.len == 0) return apply(data, forward);
+    var n: usize = 0;
+    for (ranges) |r| n += apply(data[r.start..r.end], forward);
+    return n;
+}
+
 /// Forward-filter a copy of `src`, returning owned bytes, OR null when the
-/// filter wouldn't help / isn't safe. Verify-then-use: re-runs the inverse and
-/// confirms it reconstructs `src` exactly, so a decoder imperfection can never
-/// corrupt — it just declines. Also declines if too few refs convert.
+/// filter wouldn't help / isn't safe. For ELF64 input only the executable
+/// sections are filtered (no data-section false positives). Verify-then-use:
+/// re-runs the inverse and confirms it reconstructs `src` exactly, so a decoder
+/// imperfection can never corrupt — it just declines.
 pub fn filter(src: []const u8, a: std.mem.Allocator) !?[]u8 {
     if (src.len < 64) return null;
+    var rbuf: [96]Range = undefined;
+    const ranges = execRanges(src, &rbuf);
     const out = try a.dupe(u8, src);
     errdefer a.free(out);
-    const n = apply(out, true);
+    const n = applyRanges(out, true, ranges);
     if (n < 8) {
         a.free(out);
         return null;
     }
-    // verify-then-use
+    // verify-then-use (re-derive ranges from the filtered bytes, as decode will)
     const chk = try a.dupe(u8, out);
     defer a.free(chk);
-    _ = apply(chk, false);
+    var rbuf2: [96]Range = undefined;
+    const cr = execRanges(chk, &rbuf2);
+    _ = applyRanges(chk, false, cr);
     if (!std.mem.eql(u8, chk, src)) {
         a.free(out);
         return null;
@@ -393,9 +444,11 @@ pub fn filter(src: []const u8, a: std.mem.Allocator) !?[]u8 {
     return out;
 }
 
-/// Inverse of the forward filter (in place).
+/// Inverse of the forward filter (in place); re-derives ELF exec ranges.
 pub fn unfilter(data: []u8) void {
-    _ = apply(data, false);
+    var rbuf: [96]Range = undefined;
+    const ranges = execRanges(data, &rbuf);
+    _ = applyRanges(data, false, ranges);
 }
 
 // ---- tests -----------------------------------------------------------------

@@ -101,7 +101,10 @@ fn x64Bench(root: std.mem.Allocator, path: []const u8, out: anytype) !void {
         x64.unfilter(back);
         rt = if (std.mem.eql(u8, back, data)) "OK" else "FAIL";
     }
-    try out.print("x64 bench on {s} ({d} B), rip-filter rt {s}\n", .{ path, data.len, rt });
+    const cnt_buf = try root.dupe(u8, data);
+    defer root.free(cnt_buf);
+    const ripn = x64.apply(cnt_buf, true);
+    try out.print("x64 bench on {s} ({d} B), rip-filter rt {s}, rip-refs-found {d}\n", .{ path, data.len, rt, ripn });
     try out.print("  plain LZMA            : {d}\n", .{raw_lz.len});
     try out.print("  x86 BCJ LZMA          : {d}\n", .{bcj_raw.len});
     try out.print("  BCJ2 (raw)            : {d}\n", .{if (bcj2_raw) |b| b.len else 0});
