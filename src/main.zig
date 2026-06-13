@@ -2835,7 +2835,6 @@ pub fn packTarFullAbi(
                 rel: []const u8,
                 slot: *?Lifted,
                 eff: Effort,
-                lcomp: container.Compressor,
                 cancel: ?*const std.atomic.Value(u8),
             ) void {
                 if (jobShouldStop(cancel)) return;
@@ -2877,21 +2876,9 @@ pub fn packTarFullAbi(
                         }
                     } else |_| {}
                 }
-
-                // (b) BCJ-filtered executable: lift only if the filter beats
-                // plain compression of the same file (so the tar never loses a
-                // file that would have compressed better inside it).
-                if (size >= 4096 and looksLikeX86(data)) {
-                    const filtered = container.applyFilter(.bcj_x86, data, aa) catch return;
-                    const fz = lcomp.compress(filtered, aa) catch return;
-                    const plain = lcomp.compress(data, aa) catch return;
-                    if (fz.len + 1 < plain.len) {
-                        const payload = alloc.alloc(u8, 1 + fz.len) catch return;
-                        payload[0] = @intFromEnum(container.Filter.bcj_x86);
-                        @memcpy(payload[1..], fz);
-                        slot.* = .{ .comp_type = .math_filtered, .payload = payload, .size = size, .csum = csum };
-                    }
-                }
+                // Executables are NOT lifted here: the whole tar is compressed
+                // through liblzma's x86 BCJ filter chain (xz-grade, with solid
+                // cross-file sharing), which beats per-file hand-rolled BCJ.
             }
         };
         var pool: std.Thread.Pool = undefined;
@@ -2900,7 +2887,7 @@ pub fn packTarFullAbi(
         var wg = std.Thread.WaitGroup{};
         for (jobs.items, 0..) |rel, i| {
             pool.spawnWg(&wg, Worker.run, .{
-                root, base_dir, rel, &hits[i], effort, lift_comp,
+                root, base_dir, rel, &hits[i], effort,
                 @as(?*const std.atomic.Value(u8), cancel_flag),
             });
         }
@@ -2999,7 +2986,9 @@ pub fn packTarFullAbi(
         const tar_data = try tf.readToEndAlloc(root, @intCast(tsize));
         defer root.free(tar_data);
         const csum = container.fnv1a(tar_data);
-        const comp = try container.lzmaCompress(tar_data, root, container.lzmaPreset(effort_tier));
+        // x86 BCJ filter chain (xz --x86 grade) in front of LZMA — the .xz
+        // stream self-describes the chain, so decode needs no special case.
+        const comp = try container.lzmaCompressX86(tar_data, root, container.lzmaPreset(effort_tier));
         defer root.free(comp);
         // STORE guard: never let the wrapper inflate the tar.
         if (comp.len < tar_data.len) {

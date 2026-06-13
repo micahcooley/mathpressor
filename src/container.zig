@@ -1912,6 +1912,73 @@ pub fn lzmaCompress(data: []const u8, a: std.mem.Allocator, preset: u32) ![]u8 {
     return a.dupe(u8, buf[0..out_pos]);
 }
 
+// Filter-chain encode with liblzma's own x86 BCJ in front of LZMA2 — the same
+// thing `xz --x86` does, using xz's mature, conservative BCJ (transforms a
+// CALL/JMP operand only when it looks like a real near address), which beats
+// the hand-rolled byte filter. The .xz stream header self-describes the chain,
+// so lzmaDecompress (lzma_stream_buffer_decode) reverses it with no extra code.
+const lzma_filter = extern struct { id: u64, options: ?*anyopaque };
+const lzma_options_lzma = extern struct {
+    dict_size: u32,
+    preset_dict: ?[*]const u8,
+    preset_dict_size: u32,
+    lc: u32,
+    lp: u32,
+    pb: u32,
+    mode: c_int,
+    nice_len: u32,
+    mf: c_int,
+    depth: u32,
+    ext_flags: u32,
+    ext_size_low: u32,
+    ext_size_high: u32,
+    reserved_int4: u32,
+    reserved_int5: u32,
+    reserved_int6: u32,
+    reserved_int7: u32,
+    reserved_int8: u32,
+    reserved_enum1: c_int,
+    reserved_enum2: c_int,
+    reserved_enum3: c_int,
+    reserved_enum4: c_int,
+    reserved_ptr1: ?*anyopaque,
+    reserved_ptr2: ?*anyopaque,
+};
+const LZMA_FILTER_X86: u64 = 0x04;
+const LZMA_FILTER_LZMA2: u64 = 0x21;
+const LZMA_VLI_UNKNOWN: u64 = std.math.maxInt(u64);
+extern fn lzma_lzma_preset(options: *lzma_options_lzma, preset: u32) c_int; // nonzero = error
+extern fn lzma_stream_buffer_encode(
+    filters: [*]lzma_filter,
+    check: c_int,
+    allocator: ?*const anyopaque,
+    in: [*]const u8,
+    in_size: usize,
+    out: [*]u8,
+    out_pos: *usize,
+    out_size: usize,
+) c_int;
+
+pub fn lzmaCompressX86(data: []const u8, a: std.mem.Allocator, preset: u32) ![]u8 {
+    var opt: lzma_options_lzma = std.mem.zeroes(lzma_options_lzma);
+    if (lzma_lzma_preset(&opt, preset) != 0) return error.LzmaCompressFailed;
+    var filters = [_]lzma_filter{
+        .{ .id = LZMA_FILTER_X86, .options = null },
+        .{ .id = LZMA_FILTER_LZMA2, .options = &opt },
+        .{ .id = LZMA_VLI_UNKNOWN, .options = null },
+    };
+    const bound = lzma_stream_buffer_bound(data.len);
+    const buf = try a.alloc(u8, bound);
+    defer a.free(buf);
+    var out_pos: usize = 0;
+    const rc = lzma_stream_buffer_encode(
+        &filters, LZMA_CHECK_NONE, null,
+        data.ptr, data.len, buf.ptr, &out_pos, buf.len,
+    );
+    if (rc != LZMA_OK) return error.LzmaCompressFailed;
+    return a.dupe(u8, buf[0..out_pos]);
+}
+
 pub fn lzmaDecompress(block: []const u8, original_size: u64, a: std.mem.Allocator) ![]u8 {
     const out = try a.alloc(u8, @intCast(original_size));
     errdefer a.free(out);
