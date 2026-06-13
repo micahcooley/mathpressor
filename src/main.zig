@@ -177,7 +177,7 @@ fn bcj2Bench(root: std.mem.Allocator, path: []const u8, out: anytype) !void {
         bj.c.lc, bj.c.lp, bj.c.pb, bj.len,
     });
     try out.print("  BCJ2 + CM(main)   : {d}  (cm_main={d})\n", .{ cm_total, cm_main.len });
-    const prod = container.buildBcj2Block(data, preset, root) catch &[_]u8{};
+    const prod = container.buildBcj2Block(data, preset, true, root) catch &[_]u8{};
     defer if (prod.len > 0) root.free(prod);
     try out.print("  BCJ2 production   : {d}  (what full mode stores)\n", .{prod.len});
     const base: f64 = @floatFromInt(inplace.len);
@@ -1475,7 +1475,9 @@ fn bestAudioBlock(data: []const u8, effort: Effort, final_comp: container.Compre
 fn bestBcj2Block(data: []const u8, effort: Effort, alloc: std.mem.Allocator) !?[]u8 {
     if (effort.tier != 2) return null;
     if (data.len < 8192 or !looksLikeX86(data)) return null;
-    return try container.buildBcj2Block(data, container.lzmaPreset(effort.tier), alloc);
+    // allow_cm = false: regular mode is LIVE, so the main stream stays LZMA
+    // (fast decode). CM-main is full/cold mode's edge only.
+    return try container.buildBcj2Block(data, container.lzmaPreset(effort.tier), false, alloc);
 }
 
 /// Pick the cheapest reversible representation for a file the translator routed
@@ -3866,22 +3868,22 @@ pub fn packTarFullAbi(
         }
         defer root.free(comp);
 
-        // Backend race (Max only), keep the smallest:
-        //  - BCJ2: 4-stream range-coded x86 filter — wins on code-heavy tars.
-        //  - CM: context-mixing backend — wins big on text-heavy tars (beats
-        //    LZMA ~12% on text), but slow, so it's gated by size. Decode for
-        //    each is self-contained in its block (math_bcj2 / math_cm).
-        // The keep-smaller guard means neither ever loses on the wrong content.
-        const bcj2_block: ?[]u8 = if (effort_tier == 2)
-            (container.buildBcj2Block(tar_data, preset, root) catch null)
+        // Backend race (Max only, mutually exclusive by content), keep smallest:
+        //  - x86 code -> BCJ2 with CM main stream (allow_cm=true): the 4-stream
+        //    filter + context-mixing the de-addressed code beats 7-Zip.
+        //  - everything else -> whole-tar CM (beats LZMA on text by ~15%).
+        // CM is ~0.2-0.4 MB/s, so it's full/cold only and size-capped. The
+        // keep-smaller guard means neither ever loses to plain LZMA.
+        const cm = @import("cm.zig");
+        const CM_CAP: u64 = 96 * 1024 * 1024;
+        const is_code = looksLikeX86(tar_data);
+        const bcj2_block: ?[]u8 = if (effort_tier == 2 and is_code and tsize <= CM_CAP)
+            (container.buildBcj2Block(tar_data, preset, true, root) catch null)
         else
             null;
         defer if (bcj2_block) |b| root.free(b);
 
-        const cm = @import("cm.zig");
-        const CM_CAP: u64 = 96 * 1024 * 1024; // CM is ~0.2 MB/s; bound pack/unpack time
-        // Skip CM on x86-heavy tars: BCJ2+LZMA wins there and CM only burns time.
-        const cm_block: ?[]u8 = if (effort_tier == 2 and tsize <= CM_CAP and !looksLikeX86(tar_data))
+        const cm_block: ?[]u8 = if (effort_tier == 2 and tsize <= CM_CAP and !is_code)
             (cm.compress(tar_data, root) catch null)
         else
             null;

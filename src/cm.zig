@@ -59,6 +59,36 @@ fn initDt() void {
     dt_ready = true;
 }
 
+// Bit-history state machine (indirect context model). A state is a bounded
+// (n0,n1) pair — counts of 0/1 bits seen in a context, with the opposite count
+// discounted on a flip so the model tracks NONSTATIONARY data (runs, recency).
+// state = n0*16 + n1 (n0,n1 in 0..15). A StateMap then maps state -> probability.
+// This is what a flat per-context counter can't capture, and it's the lever that
+// lets CM rival LZMA on binary code.
+var trans: [256][2]u8 = undefined;
+var trans_ready = false;
+fn initTrans() void {
+    if (trans_ready) return;
+    var n0: u32 = 0;
+    while (n0 < 16) : (n0 += 1) {
+        var n1: u32 = 0;
+        while (n1 < 16) : (n1 += 1) {
+            const s: usize = n0 * 16 + n1;
+            // observe a 0:
+            const a0: u32 = @min(n0 + 1, 15);
+            var a1: u32 = n1;
+            if (a1 > 2) a1 = a1 / 2 + 1;
+            trans[s][0] = @intCast(a0 * 16 + a1);
+            // observe a 1:
+            const b1: u32 = @min(n1 + 1, 15);
+            var b0: u32 = n0;
+            if (b0 > 2) b0 = b0 / 2 + 1;
+            trans[s][1] = @intCast(b0 * 16 + b1);
+        }
+    }
+    trans_ready = true;
+}
+
 inline fn clampP(p: i32) u32 {
     if (p < 1) return 1;
     if (p > 4095) return 4095;
@@ -210,43 +240,53 @@ const APM = struct {
 
 // ---- the predictor ---------------------------------------------------------
 
-const NUM_ORDERS = 6; // context orders 1,2,3,4,6 + a sparse model
-const orders = [NUM_ORDERS]u32{ 1, 2, 3, 4, 6, 0 }; // 0 = sparse (skip) model handled specially
-const TBITS = 22; // 4M entries per model table
+// Context orders hashed from the full history buffer (0 = sparse skip-gram).
+// More/deeper orders help binary; CM is cold-only so the memory (16 MB/table)
+// is fine. Order hashes come from `buf`, so they're not capped at 8 bytes.
+const orders = [_]u32{ 1, 2, 3, 4, 6, 8, 12, 16, 0 };
+const NUM_ORDERS = orders.len;
+const TBITS = 22; // 4M entries per model table (16 MB)
 const TSIZE = 1 << TBITS;
 const TMASK = TSIZE - 1;
-const NINPUTS = NUM_ORDERS + 2; // orders + match + bias
-const NMIXCTX = 2048; // mixer weight sets: (match-length bucket << 8) | order-0 byte
+const NMATCH = 2; // two match models: short-range and long-range
+const match_min = [NMATCH]u32{ 4, 8 }; // bytes hashed to seed each
+const MATCH_HBITS = 22;
+const MATCH_HSIZE = 1 << MATCH_HBITS;
+const NINPUTS = NUM_ORDERS + NMATCH + 1; // orders + matches + bias
+const NMIXCTX = 2048; // mixer weight sets: (match bucket << 8) | last byte
+
+const MatchState = struct {
+    ht: []u32,
+    ptr: usize = 0,
+    len: u32 = 0,
+    sm: []u32, // learned confidence: P(bit=1 | len bucket, predicted bit)
+    ctx: usize = 0,
+    used: bool = false,
+};
 
 const Predictor = struct {
     a: std.mem.Allocator,
 
-    // per-order count-adaptive StateMaps: u32 = (22-bit prediction << 10) | 10-bit count
-    tables: [NUM_ORDERS][]u32,
+    // indirect context models: per-context bit-history STATE (u8), then a shared
+    // per-model StateMap maps state -> probability (count-adaptive).
+    tables: [NUM_ORDERS][]u8,
+    model_sm: [NUM_ORDERS][]u32,
     ctxhash: [NUM_ORDERS]u32 = [_]u32{0} ** NUM_ORDERS,
     cur_idx: [NUM_ORDERS]usize = [_]usize{0} ** NUM_ORDERS,
+    cur_state: [NUM_ORDERS]u8 = [_]u8{0} ** NUM_ORDERS,
 
     // partial-byte state
     c0: u32 = 1, // 1-prefixed bits of current byte
     bitpos: u5 = 0,
+    last_byte: u8 = 0,
 
-    // byte history (for context hashing + match model)
-    hist: [8]u8 = [_]u8{0} ** 8, // last 8 bytes (ring not needed; shift)
-
-    // match model
+    // history buffer (context hashing + match models)
     buf: []u8,
     buf_len: usize = 0,
-    match_ht: []u32, // hash -> position+1 (0 = empty)
-    match_ptr: usize = 0,
-    match_len: u32 = 0,
-    pred_bit: u1 = 0,
-    match_valid: bool = false,
-    // learned match confidence: P(actual bit=1 | match length bucket, predicted bit)
-    match_sm: []u32,
-    match_ctx: usize = 0,
-    match_used: bool = false,
 
-    // mixer: weights[ctx][input], i32 fixed point
+    match: [NMATCH]MatchState,
+
+    // mixer
     weights: []i32,
     mix_ctx: usize = 0,
     inputs: [NINPUTS]i32 = [_]i32{0} ** NINPUTS,
@@ -257,109 +297,111 @@ const Predictor = struct {
     apm2: APM,
     final_p: u32 = 2048,
 
-    const MATCH_HBITS = 22;
-    const MATCH_HSIZE = 1 << MATCH_HBITS;
-    const MATCH_MINLEN = 4; // bytes hashed to seed a match
-
     fn init(a: std.mem.Allocator, max_len: usize) !Predictor {
         initStretch();
         initDt();
+        initTrans();
         var p = Predictor{
             .a = a,
             .tables = undefined,
+            .model_sm = undefined,
             .buf = try a.alloc(u8, @max(max_len, 1)),
-            .match_ht = try a.alloc(u32, MATCH_HSIZE),
-            .match_sm = try a.alloc(u32, 256),
+            .match = undefined,
             .weights = try a.alloc(i32, NMIXCTX * NINPUTS),
             .apm1 = try APM.init(a, 256),
             .apm2 = try APM.init(a, 0x10000),
         };
         for (&p.tables) |*t| {
-            t.* = try a.alloc(u32, TSIZE);
-            @memset(t.*, 1 << 31); // prediction = 0.5, count = 0
+            t.* = try a.alloc(u8, TSIZE);
+            @memset(t.*, 0); // state (0,0)
         }
-        @memset(p.match_ht, 0);
-        @memset(p.match_sm, 1 << 31);
+        for (&p.model_sm) |*sm| {
+            sm.* = try a.alloc(u32, 256); // state -> probability
+            @memset(sm.*, 1 << 31);
+        }
+        for (&p.match) |*m| {
+            m.* = .{ .ht = try a.alloc(u32, MATCH_HSIZE), .sm = try a.alloc(u32, 256) };
+            @memset(m.ht, 0);
+            @memset(m.sm, 1 << 31);
+        }
         @memset(p.weights, 0);
         return p;
     }
 
     fn deinit(self: *Predictor) void {
         for (self.tables) |t| self.a.free(t);
+        for (self.model_sm) |sm| self.a.free(sm);
+        for (self.match) |m| {
+            self.a.free(m.ht);
+            self.a.free(m.sm);
+        }
         self.a.free(self.buf);
-        self.a.free(self.match_ht);
-        self.a.free(self.match_sm);
         self.a.free(self.weights);
         self.apm1.deinit();
         self.apm2.deinit();
     }
 
-    inline fn hashBytes(self: *Predictor, k: u32) u32 {
-        // hash the last k bytes of history
-        var h: u32 = 0x811C_9DC5 +% k *% 0x9E37_79B1;
-        var i: u32 = 0;
-        while (i < k) : (i += 1) {
-            h = (h ^ self.hist[i]) *% 0x0100_0193;
-        }
-        return h;
-    }
-
-    /// Recompute per-order base context hashes at a byte boundary.
+    /// Recompute per-order base context hashes from the history buffer.
     fn refreshContexts(self: *Predictor) void {
+        const L = self.buf_len;
         for (orders, 0..) |k, i| {
             if (k == 0) {
-                // sparse: hash bytes at lag 1 and 3 (skip-gram)
-                self.ctxhash[i] = (@as(u32, self.hist[0]) *% 0x9E37_79B1) ^ (@as(u32, self.hist[2]) *% 0x85EB_CA6B);
+                // sparse skip-gram: bytes at lag 2 and 4
+                const b2: u32 = if (L >= 2) self.buf[L - 2] else 0;
+                const b4: u32 = if (L >= 4) self.buf[L - 4] else 0;
+                self.ctxhash[i] = (b2 *% 0x9E37_79B1) ^ (b4 *% 0x85EB_CA6B) ^ 0x1234_5678;
             } else {
-                self.ctxhash[i] = self.hashBytes(k);
+                var h: u32 = 0x811C_9DC5 +% k *% 0x9E37_79B1;
+                var j: u32 = 0;
+                while (j < k and j < L) : (j += 1) h = (h ^ self.buf[L - 1 - j]) *% 0x0100_0193;
+                self.ctxhash[i] = h;
             }
         }
     }
 
     /// Predict P(next bit = 1) as a 12-bit value.
     fn predict(self: *Predictor) u32 {
-        // per-order model lookups, combined with the partial byte c0
         var ni: usize = 0;
         for (0..NUM_ORDERS) |i| {
             const idx: usize = (@as(usize, self.ctxhash[i] ^ (self.c0 *% 0x6F4A_7C15)) & TMASK);
             self.cur_idx[i] = idx;
-            const p12: i32 = @intCast(self.tables[i][idx] >> 20); // 22-bit pred -> 12-bit
+            const state = self.tables[i][idx];
+            self.cur_state[i] = state;
+            const p12: i32 = smPredict12(self.model_sm[i][state]);
             self.inputs[ni] = stretch(@intCast(clampP(p12)));
             ni += 1;
         }
 
-        // match model input: predict the next bit from the matched byte (while
-        // the bits already coded this byte agree with it), and read a LEARNED
-        // probability for "match of this length predicts bit b" from a StateMap
-        // — far better calibrated than a fixed confidence ramp.
-        var match_in: i32 = 0;
-        self.match_valid = false;
-        self.match_used = false;
+        // match model inputs: predict next bit from each matched byte (while the
+        // bits coded so far this byte still agree), read a LEARNED probability
+        // keyed by (length bucket, predicted bit). The longest match drives the
+        // mixer's weight-set selection.
         var mbucket: usize = 0;
-        if (self.match_len > 0 and self.match_ptr < self.buf_len) {
-            const pbyte: u32 = self.buf[self.match_ptr];
-            const bp: u32 = self.bitpos; // 0..7 bits consumed so far
-            const top: u32 = if (bp == 0) 0 else (pbyte >> @as(u5, @intCast(8 - bp)));
-            const expected: u32 = (@as(u32, 1) << @as(u5, @intCast(bp))) | top;
-            if (expected == self.c0) {
-                self.match_valid = true;
-                self.match_used = true;
-                const sh: u5 = @intCast(7 - bp);
-                self.pred_bit = @intCast((pbyte >> sh) & 1);
-                const lb: usize = @intCast(@min(self.match_len, @as(u32, 63)));
-                mbucket = @min(self.match_len, @as(u32, 7));
-                self.match_ctx = (lb << 1) | @as(usize, self.pred_bit);
-                match_in = stretch(@intCast(clampP(smPredict12(self.match_sm[self.match_ctx]))));
+        const bp: u32 = self.bitpos;
+        for (&self.match) |*m| {
+            m.used = false;
+            var in: i32 = 0;
+            if (m.len > 0 and m.ptr < self.buf_len) {
+                const pbyte: u32 = self.buf[m.ptr];
+                const top: u32 = if (bp == 0) 0 else (pbyte >> @as(u5, @intCast(8 - bp)));
+                const expected: u32 = (@as(u32, 1) << @as(u5, @intCast(bp))) | top;
+                if (expected == self.c0) {
+                    m.used = true;
+                    const sh: u5 = @intCast(7 - bp);
+                    const pb: u1 = @intCast((pbyte >> sh) & 1);
+                    const lb: usize = @intCast(@min(m.len, @as(u32, 63)));
+                    m.ctx = (lb << 1) | @as(usize, pb);
+                    in = stretch(@intCast(clampP(smPredict12(m.sm[m.ctx]))));
+                    mbucket = @max(mbucket, @min(m.len, @as(u32, 7)));
+                }
             }
+            self.inputs[ni] = in;
+            ni += 1;
         }
-        self.inputs[ni] = match_in;
-        ni += 1;
         self.inputs[ni] = 256; // bias
         ni += 1;
 
-        // mixer: weight set selected by match-length bucket + order-0 byte, so
-        // the mix learns to trust the match more as it lengthens.
-        self.mix_ctx = ((mbucket << 8) | self.hist[0]) & (NMIXCTX - 1);
+        self.mix_ctx = ((mbucket << 8) | self.last_byte) & (NMIXCTX - 1);
         const w = self.weights[self.mix_ctx * NINPUTS ..][0..NINPUTS];
         var dot: i64 = 0;
         for (0..NINPUTS) |k| dot += @as(i64, w[k]) * @as(i64, self.inputs[k]);
@@ -368,77 +410,71 @@ const Predictor = struct {
         if (pm > 2047) pm = 2047;
         self.mixed_p = clampP(squash(pm));
 
-        // SSE: two APM stages, averaged
-        const p1 = self.apm1.pp(@intCast(self.mixed_p), self.hist[0]);
+        const p1 = self.apm1.pp(@intCast(self.mixed_p), self.last_byte);
         const p2 = self.apm2.pp(@intCast(self.mixed_p), self.c0 & 0xFFFF);
-        var pf = (@as(i32, @intCast(self.mixed_p)) + p1 + 2 * p2) >> 2;
+        const pf = (@as(i32, @intCast(self.mixed_p)) + p1 + 2 * p2) >> 2;
         self.final_p = clampP(pf);
-        _ = &pf;
         return self.final_p;
     }
 
-    /// Update all models with the actual bit, then advance partial-byte state.
     fn update(self: *Predictor, bit: u1) void {
-        // per-order + match count-adaptive StateMap updates
-        for (0..NUM_ORDERS) |i| smUpdate(self.tables[i], self.cur_idx[i], bit);
-        if (self.match_used) smUpdate(self.match_sm, self.match_ctx, bit);
+        // calibrate each model's state->prob map, then advance the per-context state
+        for (0..NUM_ORDERS) |i| {
+            smUpdate(self.model_sm[i], self.cur_state[i], bit);
+            self.tables[i][self.cur_idx[i]] = trans[self.cur_state[i]][bit];
+        }
+        for (&self.match) |*m| if (m.used) smUpdate(m.sm, m.ctx, bit);
 
-        // mixer weight update
         const err: i32 = (@as(i32, bit) << 12) - @as(i32, @intCast(self.mixed_p));
         const w = self.weights[self.mix_ctx * NINPUTS ..][0..NINPUTS];
-        for (0..NINPUTS) |k| {
-            w[k] += (self.inputs[k] * err) >> 10;
-        }
+        for (0..NINPUTS) |k| w[k] += (self.inputs[k] * err) >> 10;
 
-        // SSE update
         self.apm1.update(bit, 7);
         self.apm2.update(bit, 7);
 
-        // advance partial byte
         self.c0 = (self.c0 << 1) | bit;
         self.bitpos += 1;
         if (self.bitpos == 8) {
-            const byte: u8 = @truncate(self.c0); // low 8 bits
-            self.byteBoundary(byte);
+            self.byteBoundary(@truncate(self.c0));
             self.c0 = 1;
             self.bitpos = 0;
         }
     }
 
     fn byteBoundary(self: *Predictor, byte: u8) void {
-        // match model: extend or re-seed
-        if (self.match_len > 0 and self.match_ptr < self.buf_len and self.buf[self.match_ptr] == byte) {
-            self.match_ptr += 1;
-            self.match_len +%= 1;
-        } else {
-            self.match_len = 0;
+        // extend each match if it predicted this byte, else drop it
+        for (&self.match) |*m| {
+            if (m.len > 0 and m.ptr < self.buf_len and self.buf[m.ptr] == byte) {
+                m.ptr += 1;
+                m.len +%= 1;
+            } else {
+                m.len = 0;
+            }
         }
 
-        // append to history buffer
         if (self.buf_len < self.buf.len) {
             self.buf[self.buf_len] = byte;
             self.buf_len += 1;
         }
+        self.last_byte = byte;
 
-        // shift byte history (hist[0] = most recent)
-        var i: usize = self.hist.len - 1;
-        while (i > 0) : (i -= 1) self.hist[i] = self.hist[i - 1];
-        self.hist[0] = byte;
-
-        // seed a new match from the last MATCH_MINLEN bytes
-        if (self.buf_len >= MATCH_MINLEN) {
-            var h: u32 = 0x811C_9DC5;
-            var k: usize = 0;
-            while (k < MATCH_MINLEN) : (k += 1) h = (h ^ self.buf[self.buf_len - 1 - k]) *% 0x0100_0193;
-            const slot = h & (MATCH_HSIZE - 1);
-            if (self.match_len == 0) {
-                const cand = self.match_ht[slot];
-                if (cand != 0 and cand <= self.buf_len) {
-                    self.match_ptr = cand; // predict buf[cand] next
-                    self.match_len = 1;
+        // re-seed each match model from a hash of its last `min` bytes
+        for (&self.match, 0..) |*m, k| {
+            const minlen = match_min[k];
+            if (self.buf_len >= minlen) {
+                var h: u32 = 0x811C_9DC5 +% @as(u32, @intCast(k)) *% 0x9E37_79B1;
+                var j: u32 = 0;
+                while (j < minlen) : (j += 1) h = (h ^ self.buf[self.buf_len - 1 - j]) *% 0x0100_0193;
+                const slot = h & (MATCH_HSIZE - 1);
+                if (m.len == 0) {
+                    const cand = m.ht[slot];
+                    if (cand != 0 and cand < self.buf_len) {
+                        m.ptr = cand;
+                        m.len = 1;
+                    }
                 }
+                m.ht[slot] = @intCast(self.buf_len);
             }
-            self.match_ht[slot] = @intCast(self.buf_len); // position of next byte
         }
 
         self.refreshContexts();

@@ -2487,13 +2487,32 @@ fn lzmaAddrStream(data: []const u8, preset: u32, a: std.mem.Allocator) ![]u8 {
     return def;
 }
 
-/// Build a MATH_BCJ2 block from `tar`: split via BCJ2, LZMA each stream.
+/// Build a MATH_BCJ2 block from `tar`: split via BCJ2, compress each stream.
+/// The main stream is LZMA'd; when `allow_cm` is set (full/cold mode only — CM
+/// decode is too slow for the live path) it ALSO tries the context-mixing coder
+/// and keeps the smaller, recording which in the version byte (1=LZMA, 2=CM).
 /// Returns owned bytes (the entry block). original_size for the FAT == tar.len.
-pub fn buildBcj2Block(tar: []const u8, preset: u32, a: std.mem.Allocator) ![]u8 {
+pub fn buildBcj2Block(tar: []const u8, preset: u32, allow_cm: bool, a: std.mem.Allocator) ![]u8 {
     var s = try bcj2.encode(tar, a);
     defer s.deinit(a);
-    const cmain = try lzmaOrEmpty(s.main, preset, a);
-    defer a.free(cmain);
+    const lz_main = try lzmaOrEmpty(s.main, preset, a);
+    defer a.free(lz_main);
+
+    // Main-stream codec race (full mode only): CM beats LZMA on code by ~6%.
+    var cmain: []const u8 = lz_main;
+    var main_ver: u8 = 1;
+    var cm_main: ?[]u8 = null;
+    defer if (cm_main) |b| a.free(b);
+    if (allow_cm and s.main.len > 0) {
+        if (cm.compress(s.main, a) catch null) |cmm| {
+            cm_main = cmm;
+            if (cmm.len < lz_main.len) {
+                cmain = cmm;
+                main_ver = 2;
+            }
+        }
+    }
+
     const cc = try lzmaAddrStream(s.call, preset, a);
     defer a.free(cc);
     const cj = try lzmaAddrStream(s.jump, preset, a);
@@ -2502,7 +2521,7 @@ pub fn buildBcj2Block(tar: []const u8, preset: u32, a: std.mem.Allocator) ![]u8 
     const total = BCJ2_HDR + cmain.len + cc.len + cj.len + s.rc.len;
     const out = try a.alloc(u8, total);
     errdefer a.free(out);
-    out[0] = 1;
+    out[0] = main_ver;
     std.mem.writeInt(u32, out[1..5], @intCast(s.main.len), .little);
     std.mem.writeInt(u32, out[5..9], @intCast(cmain.len), .little);
     std.mem.writeInt(u32, out[9..13], @intCast(s.call.len), .little);
@@ -2523,7 +2542,8 @@ pub fn buildBcj2Block(tar: []const u8, preset: u32, a: std.mem.Allocator) ![]u8 
 
 /// Decode a MATH_BCJ2 block back to the original `original_size` bytes (the tar).
 fn extractBcj2(block: []const u8, original_size: u64, a: std.mem.Allocator) ![]u8 {
-    if (block.len < BCJ2_HDR or block[0] != 1) return error.TruncatedContainer;
+    if (block.len < BCJ2_HDR or (block[0] != 1 and block[0] != 2)) return error.TruncatedContainer;
+    const main_ver = block[0]; // 1 = LZMA main, 2 = CM main
     const main_ulen: usize = std.mem.readInt(u32, block[1..5], .little);
     const main_clen: usize = std.mem.readInt(u32, block[5..9], .little);
     const call_ulen: usize = std.mem.readInt(u32, block[9..13], .little);
@@ -2535,7 +2555,12 @@ fn extractBcj2(block: []const u8, original_size: u64, a: std.mem.Allocator) ![]u
         return error.TruncatedContainer;
 
     var off: usize = BCJ2_HDR;
-    const main = if (main_ulen == 0) try a.alloc(u8, 0) else try lzmaDecompress(block[off .. off + main_clen], main_ulen, a);
+    const main = if (main_ulen == 0)
+        try a.alloc(u8, 0)
+    else if (main_ver == 2)
+        try cm.decompress(block[off .. off + main_clen], main_ulen, a)
+    else
+        try lzmaDecompress(block[off .. off + main_clen], main_ulen, a);
     defer a.free(main);
     off += main_clen;
     const call = if (call_ulen == 0) try a.alloc(u8, 0) else try lzmaDecompress(block[off .. off + call_clen], call_ulen, a);
