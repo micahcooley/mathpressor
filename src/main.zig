@@ -48,6 +48,8 @@ pub fn main() !void {
         try out.print("Wrote {s}\n", .{args[3]});
     } else if (args.len >= 3 and std.mem.eql(u8, args[1], "bcj2bench")) {
         try bcj2Bench(root, args[2], out);
+    } else if (args.len >= 3 and std.mem.eql(u8, args[1], "cmbench")) {
+        try cmBench(root, args[2], out);
     } else if (args.len >= 4 and std.mem.eql(u8, args[1], "unpack")) {
         try unpackContainer(root, args[2], args[3], out);
     } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench")) {
@@ -59,6 +61,35 @@ pub fn main() !void {
     } else {
         try runDemo(root, out);
     }
+}
+
+/// Diagnostic: measure the CM backend vs LZMA 9e on a file, with round-trip + timing.
+fn cmBench(root: std.mem.Allocator, path: []const u8, out: anytype) !void {
+    const cm = @import("cm.zig");
+    const f = try std.fs.cwd().openFile(path, .{});
+    defer f.close();
+    const data = try f.readToEndAlloc(root, 1 << 30);
+    defer root.free(data);
+
+    var t = try std.time.Timer.start();
+    const comp = try cm.compress(data, root);
+    defer root.free(comp);
+    const enc_ms = t.read() / std.time.ns_per_ms;
+    t.reset();
+    const back = try cm.decompress(comp, data.len, root);
+    defer root.free(back);
+    const dec_ms = t.read() / std.time.ns_per_ms;
+    const ok = std.mem.eql(u8, data, back);
+
+    const lz = try container.lzmaCompress(data, root, container.lzmaPreset(2));
+    defer root.free(lz);
+
+    try out.print("CM bench on {s} ({d} B), round-trip {s}\n", .{ path, data.len, if (ok) "OK" else "FAIL" });
+    try out.print("  CM          : {d}  ({d} ms enc, {d} ms dec)\n", .{ comp.len, enc_ms, dec_ms });
+    try out.print("  LZMA 9e     : {d}\n", .{lz.len});
+    const c: f64 = @floatFromInt(comp.len);
+    const l: f64 = @floatFromInt(lz.len);
+    try out.print("  CM vs LZMA  : {d:.2}% ({s})\n", .{ (c / l - 1.0) * 100.0, if (comp.len < lz.len) "CM wins" else "LZMA wins" });
 }
 
 /// Diagnostic: measure BCJ2 (4-stream, range-coded control) vs in-place x86 BCJ
@@ -116,6 +147,12 @@ fn bcj2Bench(root: std.mem.Allocator, path: []const u8, out: anytype) !void {
     const bj = Best.of(s.jump, root, preset, &combos);
     const tuned_total = bm.len + bc.len + bj.len + s.rc.len;
 
+    // BCJ2 + CM: context-mix the main stream (LZMA the small address streams).
+    const cm = @import("cm.zig");
+    const cm_main = cm.compress(s.main, root) catch &[_]u8{};
+    defer if (cm_main.len > 0) root.free(cm_main);
+    const cm_total = cm_main.len + bc.len + bj.len + s.rc.len;
+
     // Round-trip check.
     const back = try bcj2.decode(s.main, s.call, s.jump, s.rc, data.len, root);
     defer root.free(back);
@@ -139,6 +176,7 @@ fn bcj2Bench(root: std.mem.Allocator, path: []const u8, out: anytype) !void {
         bc.c.lc, bc.c.lp, bc.c.pb, bc.len,
         bj.c.lc, bj.c.lp, bj.c.pb, bj.len,
     });
+    try out.print("  BCJ2 + CM(main)   : {d}  (cm_main={d})\n", .{ cm_total, cm_main.len });
     const base: f64 = @floatFromInt(inplace.len);
     const b2: f64 = @floatFromInt(tuned_total);
     try out.print("  BCJ2-tuned vs in-place : {d:.2}% ({s})\n",
@@ -3818,39 +3856,51 @@ pub fn packTarFullAbi(
         }
         defer root.free(comp);
 
-        // BCJ2 candidate (Max only): 4-stream range-coded x86 filter. On
-        // code-heavy tars it beats in-place BCJ by 3-5% (measured ~0.8% off
-        // 7-Zip on libc); the keep-smaller guard means it never loses on
-        // data-heavy tars. Decode is self-contained in the math_bcj2 block.
+        // Backend race (Max only), keep the smallest:
+        //  - BCJ2: 4-stream range-coded x86 filter — wins on code-heavy tars.
+        //  - CM: context-mixing backend — wins big on text-heavy tars (beats
+        //    LZMA ~12% on text), but slow, so it's gated by size. Decode for
+        //    each is self-contained in its block (math_bcj2 / math_cm).
+        // The keep-smaller guard means neither ever loses on the wrong content.
         const bcj2_block: ?[]u8 = if (effort_tier == 2)
             (container.buildBcj2Block(tar_data, preset, root) catch null)
         else
             null;
         defer if (bcj2_block) |b| root.free(b);
 
+        const cm = @import("cm.zig");
+        const CM_CAP: u64 = 96 * 1024 * 1024; // CM is ~0.2 MB/s; bound pack/unpack time
+        // Skip CM on x86-heavy tars: BCJ2+LZMA wins there and CM only burns time.
+        const cm_block: ?[]u8 = if (effort_tier == 2 and tsize <= CM_CAP and !looksLikeX86(tar_data))
+            (cm.compress(tar_data, root) catch null)
+        else
+            null;
+        defer if (cm_block) |b| root.free(b);
+
+        // Pick the smallest representation across LZMA / BCJ2 / CM.
+        var best_block: []const u8 = comp;
+        var best_ct: container.CompressionType = .fallback_stream;
+        if (bcj2_block) |b| if (b.len < best_block.len) {
+            best_block = b;
+            best_ct = .math_bcj2;
+        };
+        if (cm_block) |b| if (b.len < best_block.len) {
+            best_block = b;
+            best_ct = .math_cm;
+        };
+
         // STORE guard: never let the wrapper inflate the tar.
-        if (bcj2_block != null and bcj2_block.?.len < comp.len and bcj2_block.?.len < tar_data.len) {
+        if (best_block.len < tar_data.len) {
             var fat = container.FatEntry{
-                .comp_type = .math_bcj2,
+                .comp_type = best_ct,
                 .data_offset = 0,
                 .original_size = tsize,
-                .compressed_size = bcj2_block.?.len,
+                .compressed_size = best_block.len,
                 .checksum = csum,
                 .codec = .lzma,
             };
             try fat.setPath("archive.tar");
-            try cb.appendBlock(fat, bcj2_block.?);
-        } else if (comp.len < tar_data.len) {
-            var fat = container.FatEntry{
-                .comp_type = .fallback_stream,
-                .data_offset = 0,
-                .original_size = tsize,
-                .compressed_size = comp.len,
-                .checksum = csum,
-                .codec = .lzma,
-            };
-            try fat.setPath("archive.tar");
-            try cb.appendBlock(fat, comp);
+            try cb.appendBlock(fat, best_block);
         } else {
             var fat = container.FatEntry{
                 .comp_type = .store,

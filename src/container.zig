@@ -49,6 +49,7 @@
 const std = @import("std");
 const vm_mod = @import("vm.zig");
 const bcj2 = @import("bcj2.zig");
+const cm = @import("cm.zig");
 
 // ---------------------------------------------------------------------------
 // Format constants
@@ -138,6 +139,7 @@ pub const CompressionType = enum(u8) {
     math_dict       = 0x0B, // zstd frame compressed against a shared trained dictionary
     math_audio      = 0x0C, // fixed-order LPC over PCM (WAV) samples, then compressed
     math_bcj2       = 0x0D, // full mode: 4-stream BCJ2 x86 filter, each LZMA'd
+    math_cm         = 0x0E, // context-mixing backend (cold/full mode; beats LZMA on text)
 };
 
 /// Per-entry compression codec (FAT byte 245). gzip = 0 is the legacy default,
@@ -1460,6 +1462,7 @@ pub const Reader = struct {
             },
             .math_audio      => extractAudio(block, entry.original_size, entry.codec, a),
             .math_bcj2       => extractBcj2(block, entry.original_size, a),
+            .math_cm         => cm.decompress(block, @intCast(entry.original_size), a),
             // A symlink's "contents" are its target path, stored verbatim.
             .symlink         => extractStore(block, entry.original_size, a),
             .solid_block     => extractSolidEntry(
@@ -2489,27 +2492,27 @@ fn lzmaAddrStream(data: []const u8, preset: u32, a: std.mem.Allocator) ![]u8 {
 pub fn buildBcj2Block(tar: []const u8, preset: u32, a: std.mem.Allocator) ![]u8 {
     var s = try bcj2.encode(tar, a);
     defer s.deinit(a);
-    const cm = try lzmaOrEmpty(s.main, preset, a);
-    defer a.free(cm);
+    const cmain = try lzmaOrEmpty(s.main, preset, a);
+    defer a.free(cmain);
     const cc = try lzmaAddrStream(s.call, preset, a);
     defer a.free(cc);
     const cj = try lzmaAddrStream(s.jump, preset, a);
     defer a.free(cj);
 
-    const total = BCJ2_HDR + cm.len + cc.len + cj.len + s.rc.len;
+    const total = BCJ2_HDR + cmain.len + cc.len + cj.len + s.rc.len;
     const out = try a.alloc(u8, total);
     errdefer a.free(out);
     out[0] = 1;
     std.mem.writeInt(u32, out[1..5], @intCast(s.main.len), .little);
-    std.mem.writeInt(u32, out[5..9], @intCast(cm.len), .little);
+    std.mem.writeInt(u32, out[5..9], @intCast(cmain.len), .little);
     std.mem.writeInt(u32, out[9..13], @intCast(s.call.len), .little);
     std.mem.writeInt(u32, out[13..17], @intCast(cc.len), .little);
     std.mem.writeInt(u32, out[17..21], @intCast(s.jump.len), .little);
     std.mem.writeInt(u32, out[21..25], @intCast(cj.len), .little);
     std.mem.writeInt(u32, out[25..29], @intCast(s.rc.len), .little);
     var off: usize = BCJ2_HDR;
-    @memcpy(out[off..][0..cm.len], cm);
-    off += cm.len;
+    @memcpy(out[off..][0..cmain.len], cmain);
+    off += cmain.len;
     @memcpy(out[off..][0..cc.len], cc);
     off += cc.len;
     @memcpy(out[off..][0..cj.len], cj);
