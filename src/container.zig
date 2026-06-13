@@ -2741,7 +2741,7 @@ pub const Compressor = struct {
         return switch (tier) {
             0 => .{ .codec = .zstd, .gzip_level = .fast, .zstd_level = 3, .lzma_preset = lzmaPreset(0) },
             2 => .{ .codec = .zstd, .gzip_level = .best, .zstd_level = 19, .lzma_preset = lzmaPreset(2) },
-            else => .{ .codec = .zstd, .gzip_level = .default, .zstd_level = 12, .lzma_preset = lzmaPreset(1) },
+            else => .{ .codec = .zstd, .gzip_level = .default, .zstd_level = 19, .lzma_preset = lzmaPreset(1) },
         };
     }
 

@@ -243,7 +243,9 @@ const APM = struct {
 // Context orders hashed from the full history buffer (0 = sparse skip-gram).
 // More/deeper orders help binary; CM is cold-only so the memory (16 MB/table)
 // is fine. Order hashes come from `buf`, so they're not capped at 8 bytes.
-const orders = [_]u32{ 1, 2, 3, 4, 6, 8, 12, 16, 0 };
+const WORD: u32 = 0xFFFF_FFFF; // sentinel: a word-context model (alnum/_ run), not an order-k history
+const WORD2: u32 = 0xFFFF_FFFE; // sentinel: previous-word + current-word context (text/code structure)
+const orders = [_]u32{ 1, 2, 3, 4, 6, 8, 12, 16, 0, WORD, WORD2 };
 const NUM_ORDERS = orders.len;
 const TBITS = 22; // 4M entries per model table (16 MB)
 const TSIZE = 1 << TBITS;
@@ -279,6 +281,8 @@ const Predictor = struct {
     c0: u32 = 1, // 1-prefixed bits of current byte
     bitpos: u5 = 0,
     last_byte: u8 = 0,
+    word_hash: u32 = 0, // rolling hash of the current word (alnum/_ run), reset on a separator
+    prev_word: u32 = 0, // hash of the last completed word (for the word-pair context)
 
     // history buffer (context hashing + match models)
     buf: []u8,
@@ -350,6 +354,12 @@ const Predictor = struct {
                 const b2: u32 = if (L >= 2) self.buf[L - 2] else 0;
                 const b4: u32 = if (L >= 4) self.buf[L - 4] else 0;
                 self.ctxhash[i] = (b2 *% 0x9E37_79B1) ^ (b4 *% 0x85EB_CA6B) ^ 0x1234_5678;
+            } else if (k == WORD) {
+                // word-context model: predict from the whole current word (great for text + identifiers)
+                self.ctxhash[i] = (self.word_hash *% 0x9E37_79B1) ^ 0xABCD_1234;
+            } else if (k == WORD2) {
+                // word-pair: previous completed word + current word prefix (language/structure model)
+                self.ctxhash[i] = (self.prev_word *% 0x85EB_CA6B) ^ (self.word_hash *% 0xC2B2_AE35) ^ 0x55AA_33CC;
             } else {
                 var h: u32 = 0x811C_9DC5 +% k *% 0x9E37_79B1;
                 var j: u32 = 0;
@@ -475,6 +485,15 @@ const Predictor = struct {
                 }
                 m.ht[slot] = @intCast(self.buf_len);
             }
+        }
+
+        // word model: extend the rolling word hash on alnum/_; on a separator, retire the word to prev_word
+        const wc = (byte >= 'a' and byte <= 'z') or (byte >= 'A' and byte <= 'Z') or (byte >= '0' and byte <= '9') or byte == '_';
+        if (wc) {
+            self.word_hash = (self.word_hash *% 0x6F4A_7C15) +% byte +% 1;
+        } else {
+            if (self.word_hash != 0) self.prev_word = self.word_hash;
+            self.word_hash = 0;
         }
 
         self.refreshContexts();

@@ -698,7 +698,10 @@ const Effort = struct {
     /// xz. Fast/Balanced stay on zstd so the live-hot path keeps fast decode.
     fn fromTierRegular(tier: u8) Effort {
         var e = fromTier(tier);
-        if (tier == 2) e.comp = container.Compressor.lzmaFromTier(2);
+        // Max-regular must stay LIVE. zstd decode is fast and ~level-independent, so push the
+        // per-entry codec to max zstd level (best ratio at flat decode latency) instead of LZMA,
+        // which decodes ~2.5x slower and breaks the live promise. LZMA/CM ratio is full mode's job.
+        if (tier == 2) e.comp.zstd_level = 22;
         return e;
     }
 };
@@ -1257,20 +1260,24 @@ fn bestFilteredBlock(data: []const u8, effort: Effort, alloc: std.mem.Allocator)
         n += 1;
     }
 
-    var best: ?[]u8 = null;
-    var best_filter: container.Filter = .none;
+    // Rank filters with a FAST codec (zstd-1), then run the expensive final
+    // codec once on the winner. Without this, large files paid one full LZMA-9e
+    // pass PER filter (up to 4×) — pathological on big binaries.
+    var best_filter: container.Filter = .delta1;
+    var best_rank: usize = std.math.maxInt(usize);
     for (cand[0..n]) |f| {
         const filtered = try container.applyFilter(f, data, alloc);
         defer alloc.free(filtered);
-        const gz = try effort.comp.compress(filtered, alloc);
-        if (best == null or gz.len < best.?.len) {
-            if (best) |b| alloc.free(b);
-            best = gz;
+        const rank = (try container.zstdCompress(filtered, alloc, 1)).len;
+        if (rank < best_rank) {
+            best_rank = rank;
             best_filter = f;
-        } else alloc.free(gz);
+        }
     }
 
-    const b = best orelse return null;
+    const filtered = try container.applyFilter(best_filter, data, alloc);
+    defer alloc.free(filtered);
+    const b = try effort.comp.compress(filtered, alloc);
     defer alloc.free(b);
     const payload = try alloc.alloc(u8, 1 + b.len);
     payload[0] = @intFromEnum(best_filter);
@@ -1582,7 +1589,12 @@ fn bestAudioBlock(data: []const u8, effort: Effort, final_comp: container.Compre
 /// regular mode keep pace with 7-Zip on binaries instead of losing to BCJ2.
 fn bestBcj2Block(data: []const u8, effort: Effort, alloc: std.mem.Allocator) !?[]u8 {
     if (effort.tier != 2) return null;
-    if (data.len < 8192 or !looksLikeX86(data)) return null;
+    // Upper cap: buildBcj2Block runs LZMA on the main stream twice (plain + RIP
+    // keep-smaller), so on a giant binary that's several full-file LZMA passes.
+    // Above the cap, fall back to the single-pass plain/filtered route — bounds
+    // worst-case pack time without hurting the common case (binaries are small).
+    const BCJ2_FILE_CAP: usize = 48 * 1024 * 1024;
+    if (data.len < 8192 or data.len > BCJ2_FILE_CAP or !looksLikeX86(data)) return null;
     // allow_cm = false: regular mode is LIVE, so the main stream stays LZMA
     // (fast decode). CM-main is full/cold mode's edge only.
     return try container.buildBcj2Block(data, container.lzmaPreset(effort.tier), false, alloc);
