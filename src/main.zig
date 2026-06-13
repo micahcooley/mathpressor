@@ -1324,14 +1324,27 @@ fn bestColumnarBlock(data: []const u8, effort: Effort, final_comp: container.Com
     }
     if (best_stride == 0) return null; // no stride beat plain even at fast level
 
-    // Commit the winning stride at the chosen final codec.
+    // Commit the winning stride at the chosen final codec, trying plain transpose
+    // and transpose + per-column delta (huge on smooth record arrays); keep the
+    // smaller. Delta is reversible + fast, so it stays live-safe. The stride's
+    // high bit flags delta for the decoder.
     const t = try container.columnarForward(data, best_stride, alloc);
     defer alloc.free(t);
+    const td = try alloc.dupe(u8, t);
+    defer alloc.free(td);
+    container.columnarColDelta(td, best_stride, data.len, true);
+
     const comp = try final_comp.compress(t, alloc);
     defer alloc.free(comp);
-    const payload = try alloc.alloc(u8, 2 + comp.len);
-    std.mem.writeInt(u16, payload[0..2], @intCast(best_stride), .little);
-    @memcpy(payload[2..], comp);
+    const compd = try final_comp.compress(td, alloc);
+    defer alloc.free(compd);
+
+    const use_delta = compd.len < comp.len;
+    const chosen = if (use_delta) compd else comp;
+    const sflag: u16 = @as(u16, @intCast(best_stride)) | (if (use_delta) @as(u16, 0x8000) else 0);
+    const payload = try alloc.alloc(u8, 2 + chosen.len);
+    std.mem.writeInt(u16, payload[0..2], sflag, .little);
+    @memcpy(payload[2..], chosen);
     return payload;
 }
 

@@ -1808,13 +1808,45 @@ fn columnarInverse(t: []const u8, stride: usize, a: std.mem.Allocator) ![]u8 {
 
 /// MATH_COLUMNAR: [u16 le stride][codec-compressed transposed bytes].
 /// Decompress to original_size, then inverse-transpose — bit-perfect.
+/// Per-column delta over a transposed (columnar) buffer: within each of the
+/// `stride` columns (each `rows` bytes long), replace bytes with successive
+/// differences. On smooth record arrays (vertex streams) consecutive records
+/// are nearly equal, so the deltas collapse toward zero — a big extra win.
+/// Reversible and fast (a single pass), so it stays live-safe. In place.
+pub fn columnarColDelta(buf: []u8, stride: usize, original_size: usize, forward: bool) void {
+    if (stride == 0) return;
+    const rows = original_size / stride;
+    var c: usize = 0;
+    while (c < stride) : (c += 1) {
+        const seg = buf[c * rows ..][0..rows];
+        var prev: u8 = 0;
+        if (forward) {
+            for (seg) |*b| {
+                const cur = b.*;
+                b.* = cur -% prev;
+                prev = cur;
+            }
+        } else {
+            for (seg) |*b| {
+                b.* = b.* +% prev;
+                prev = b.*;
+            }
+        }
+    }
+}
+
+/// MATH_COLUMNAR block: [u16 stride|flag][codec-compressed transposed bytes].
+/// stride's high bit (0x8000) marks per-column delta (stride values are small).
 fn extractColumnar(block: []const u8, original_size: u64, codec: Codec, a: std.mem.Allocator) ![]u8 {
     if (block.len < 2) return error.TruncatedContainer;
-    const stride: usize = std.mem.readInt(u16, block[0..2], .little);
+    const sflag: usize = std.mem.readInt(u16, block[0..2], .little);
+    const delta = (sflag & 0x8000) != 0;
+    const stride: usize = sflag & 0x7FFF;
     if (stride == 0) return error.TruncatedContainer;
     const transposed = try inflateBlock(block[2..], original_size, codec, a);
     defer a.free(transposed);
     if (transposed.len != original_size) return error.SizeMismatch;
+    if (delta) columnarColDelta(transposed, stride, @intCast(original_size), false);
     return columnarInverse(transposed, stride, a);
 }
 
