@@ -287,16 +287,20 @@ ratios:
     splits CALL/JMP target addresses into their own LZMA streams and models the
     convert/skip decision adaptively. Wins on code; on libc it lands within ~0.6%
     of 7-Zip and beats `xz --x86` by ~4.4%.
-  - **CM** (`MATH_CM`) — a pure-Zig context-mixing coder (order-1..6 models +
-    a match model, blended by an online logistic mixer, refined by SSE, binary
-    arithmetic coded). It beats LZMA by ~12% on text, so full mode now leads xz
-    and 7-Zip on text/general data by ~8%. CM decode is slow → it's a cold-only
-    backend, never the live path; it's skipped on x86-heavy tars (BCJ2 wins).
+  - **CM** (`MATH_CM`) — a pure-Zig context-mixing coder: indirect context
+    models (each context → an 8-bit bit-history *state* → a StateMap), orders
+    1..16 from the full history buffer, two match models, an online logistic
+    mixer, SSE, binary arithmetic coding. It beats LZMA by ~15% on text **and**
+    ~6% on de-addressed x86 code, so it's also fed the BCJ2 *main* stream — which
+    is how full mode now beats 7-Zip on binary too (e.g. a 24 MB binary set
+    6.12 MB vs 7-Zip 6.27 MB). CM decode is slow → cold-only, never the live
+    path; regular/live mode keeps the fast LZMA main stream.
   - plain LZMA / in-place x86 BCJ as the fast baselines.
 
   The keep-smaller guard means full mode never loses to any single backend.
-  Maximum ratio, but it must be fully expanded to use — *not* live-runnable.
-  Always the smaller of the two modes.
+  Across text / vertex / image / audio / binary, full mode now beats every
+  general-purpose compressor including 7-Zip. Maximum ratio, but it must be fully
+  expanded to use — *not* live-runnable. Always the smaller of the two modes.
 
 The intended hierarchy: full mode is #1 on ratio; regular mode is #2 (aiming to
 beat every general-purpose compressor) while staying live. The two constraints —
