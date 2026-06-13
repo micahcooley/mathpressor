@@ -1078,7 +1078,7 @@ fn looksTexty(data: []const u8) bool {
 /// runs — which a similarity probe can't see, so we instead RANK candidate
 /// strides with a fast compression pass and commit the winner at full effort.
 /// The honesty guard at the call site still discards it unless it actually wins.
-fn bestColumnarBlock(data: []const u8, effort: Effort, alloc: std.mem.Allocator) !?[]u8 {
+fn bestColumnarBlock(data: []const u8, effort: Effort, final_comp: container.Compressor, alloc: std.mem.Allocator) !?[]u8 {
     // Gate: skip Fast tier, tiny files, oversized files (cost), and text.
     if (effort.tier == 0 or data.len < 8192 or data.len > 16 * 1024 * 1024) return null;
     if (looksTexty(data)) return null;
@@ -1101,10 +1101,10 @@ fn bestColumnarBlock(data: []const u8, effort: Effort, alloc: std.mem.Allocator)
     }
     if (best_stride == 0) return null; // no stride beat plain even at fast level
 
-    // Commit the winning stride at the real effort codec.
+    // Commit the winning stride at the chosen final codec.
     const t = try container.columnarForward(data, best_stride, alloc);
     defer alloc.free(t);
-    const comp = try effort.comp.compress(t, alloc);
+    const comp = try final_comp.compress(t, alloc);
     defer alloc.free(comp);
     const payload = try alloc.alloc(u8, 2 + comp.len);
     std.mem.writeInt(u16, payload[0..2], @intCast(best_stride), .little);
@@ -1177,7 +1177,7 @@ fn detectImage(data: []const u8) ?ImageInfo {
 /// `[u32 header_len][u32 w][u32 h][u8 ch][compressed (header ++ residual)]`,
 /// or null if the file isn't a recognized raw image. Honesty-guarded at the
 /// call site. xz/zstd/brotli have no 2D predictor, so this is net-new ground.
-fn bestImage2DBlock(data: []const u8, effort: Effort, alloc: std.mem.Allocator) !?[]u8 {
+fn bestImage2DBlock(data: []const u8, effort: Effort, final_comp: container.Compressor, alloc: std.mem.Allocator) !?[]u8 {
     if (effort.tier == 0 or data.len < 256) return null;
     const info = detectImage(data) orelse return null;
 
@@ -1191,7 +1191,7 @@ fn bestImage2DBlock(data: []const u8, effort: Effort, alloc: std.mem.Allocator) 
     @memcpy(transformed[info.header_len..pix_end], residual);
     @memcpy(transformed[pix_end..], data[pix_end..]);
 
-    const comp = try effort.comp.compress(transformed, alloc);
+    const comp = try final_comp.compress(transformed, alloc);
     defer alloc.free(comp);
     const payload = try alloc.alloc(u8, 17 + comp.len);
     std.mem.writeInt(u32, payload[0..4], @intCast(info.header_len), .little);
@@ -1246,7 +1246,7 @@ fn chooseFallbackRep(data: []const u8, effort: Effort, alloc: std.mem.Allocator)
         } else alloc.free(payload);
     }
 
-    if (try bestColumnarBlock(data, effort, alloc)) |payload| {
+    if (try bestColumnarBlock(data, effort, effort.comp, alloc)) |payload| {
         if (payload.len < best_len) {
             if (best_payload) |b| alloc.free(b);
             best_type = .math_columnar;
@@ -1255,7 +1255,7 @@ fn chooseFallbackRep(data: []const u8, effort: Effort, alloc: std.mem.Allocator)
         } else alloc.free(payload);
     }
 
-    if (try bestImage2DBlock(data, effort, alloc)) |payload| {
+    if (try bestImage2DBlock(data, effort, effort.comp, alloc)) |payload| {
         if (payload.len < best_len) {
             if (best_payload) |b| alloc.free(b);
             best_type = .math_image2d;
@@ -1359,9 +1359,13 @@ fn unpackFullTar(root: std.mem.Allocator, rdr: *container.Reader, out_dir: []con
         const entry = rdr.entryAt(i);
         const path = entry.getPath();
 
-        // Lifted entries (whole-file program or BCJ-filtered executable) are
-        // individual files; anything else is the one wrapped solid tar.
-        if (entry.comp_type != .math_bytecode and entry.comp_type != .math_filtered) {
+        // Lifted entries (whole-file program, filtered, columnar, or 2D-image)
+        // are individual files; anything else is the one wrapped solid tar.
+        const is_lifted = switch (entry.comp_type) {
+            .math_bytecode, .math_filtered, .math_columnar, .math_image2d => true,
+            else => false,
+        };
+        if (!is_lifted) {
             const tar_bytes = try rdr.extract(path, root);
             defer root.free(tar_bytes);
             var fbs = std.io.fixedBufferStream(tar_bytes);
@@ -2022,7 +2026,7 @@ test "math_columnar: record-array file routes columnar and round-trips" {
     }
 
     const effort = Effort.fromTier(1);
-    const colp = (try bestColumnarBlock(data, effort, a)) orelse return error.TestUnexpectedResult;
+    const colp = (try bestColumnarBlock(data, effort, effort.comp, a)) orelse return error.TestUnexpectedResult;
     defer a.free(colp);
     const plain = try effort.comp.compress(data, a);
     defer a.free(plain);
@@ -2910,15 +2914,15 @@ pub fn packTarFullAbi(
     // -----------------------------------------------------------------------
     const effort = Effort.fromTier(effort_tier);
     // Full mode runs the LZMA/xz backend (stronger model than zstd). Lifted
-    // executables ride this too — the files where the extra effort is most
-    // worth it.
-    const lift_comp = container.Compressor.lzmaFromTier(effort_tier);
+    // transform entries pick zstd-or-lzma per file (keep-smaller), recorded in
+    // each entry's codec byte.
 
     const Lifted = struct {
         comp_type: container.CompressionType,
-        payload: []u8, // bytecode (math) or [filter_id][compressed] (filtered)
+        payload: []u8, // bytecode (math) or [params][compressed] (transform)
         size: u64,
         csum: u32,
+        codec: container.Codec = .lzma, // codec of the compressed portion
     };
     const hits = try root.alloc(?Lifted, jobs.items.len);
     defer {
@@ -2977,6 +2981,54 @@ pub fn packTarFullAbi(
                         }
                     } else |_| {}
                 }
+
+                // (b) Structured-data transforms (2D image, columnar), fed the
+                // LZMA backend and lifted out of the tar. The whole-tar LZMA
+                // can't transpose or 2D-predict, so these win 40%+ on raster /
+                // record data — and feeding the transform LZMA instead of zstd
+                // recovers the ~9% the regular-mode zstd backend leaves behind.
+                // Compress the transform with BOTH zstd and lzma and keep the
+                // smaller (zstd occasionally beats lzma on residual streams), so
+                // a lifted entry is never worse than regular mode's zstd. Lift
+                // only when it beats plain compression of the file (so a flat
+                // sprite the transform doesn't help stays in the tar).
+                if (eff.tier >= 1) {
+                    const codecs = [_]container.Compressor{ eff.comp, container.Compressor.lzmaFromTier(eff.tier) };
+                    var best: ?[]u8 = null;
+                    var best_ct: container.CompressionType = .math_columnar;
+                    var best_codec: container.Codec = .zstd;
+                    // Try BOTH transforms with BOTH codecs and keep the overall
+                    // smallest (image2D and columnar can each win on raster, and
+                    // zstd sometimes beats lzma on residuals) — same candidate
+                    // set regular mode considers, so full mode never loses to it.
+                    for (codecs) |cmp| {
+                        if (bestImage2DBlock(data, eff, cmp, aa) catch null) |p| {
+                            if (best == null or p.len < best.?.len) {
+                                best = p;
+                                best_ct = .math_image2d;
+                                best_codec = cmp.codec;
+                            }
+                        }
+                        if (bestColumnarBlock(data, eff, cmp, aa) catch null) |p| {
+                            if (best == null or p.len < best.?.len) {
+                                best = p;
+                                best_ct = .math_columnar;
+                                best_codec = cmp.codec;
+                            }
+                        }
+                    }
+                    if (best) |payload| {
+                        // Honesty: beat the best plain compression of the file.
+                        const pl_z = (eff.comp.compress(data, aa) catch &[_]u8{}).len;
+                        const pl_l = (container.lzmaCompress(data, aa, container.lzmaPreset(eff.tier)) catch &[_]u8{}).len;
+                        const plain_min = @min(if (pl_z == 0) std.math.maxInt(usize) else pl_z, if (pl_l == 0) std.math.maxInt(usize) else pl_l);
+                        if (payload.len < plain_min) {
+                            const owned = alloc.dupe(u8, payload) catch return;
+                            slot.* = .{ .comp_type = best_ct, .payload = owned, .size = size, .csum = csum, .codec = best_codec };
+                            return;
+                        }
+                    }
+                }
                 // Executables are NOT lifted here: the whole tar is compressed
                 // through liblzma's x86 BCJ filter chain (xz-grade, with solid
                 // cross-file sharing), which beats per-file hand-rolled BCJ.
@@ -3000,6 +3052,7 @@ pub fn packTarFullAbi(
     var tmp_buf: [128]u8 = undefined;
     const tmp_tar = try std.fmt.bufPrint(&tmp_buf, "/tmp/mathpressor_full_{d}.tar", .{std.time.milliTimestamp()});
     defer std.fs.cwd().deleteFile(tmp_tar) catch {};
+    var tar_files: usize = 0; // non-lifted files that actually go in the tar
     {
         const tar_file = try std.fs.cwd().createFile(tmp_tar, .{});
         defer tar_file.close();
@@ -3019,6 +3072,7 @@ pub fn packTarFullAbi(
             var link_buf: [std.fs.max_path_bytes]u8 = undefined;
             if (std.fs.cwd().readLink(full, &link_buf)) |target| {
                 try tw.writeLink(rel_path, target, .{});
+                tar_files += 1;
                 continue;
             } else |_| {}
 
@@ -3031,6 +3085,7 @@ pub fn packTarFullAbi(
                 .mode = @intCast(st.mode & 0o7777),
                 .mtime = @intCast(@max(0, @divFloor(st.mtime, std.time.ns_per_s))),
             });
+            tar_files += 1;
 
             done_bytes += st.size;
             if (total_bytes > 0) {
@@ -3058,14 +3113,14 @@ pub fn packTarFullAbi(
         const hit = hits[ji] orelse continue;
         switch (hit.comp_type) {
             .math_bytecode => try cb.addMath(rel, hit.payload, hit.size, hit.csum),
-            .math_filtered => {
+            .math_filtered, .math_columnar, .math_image2d => {
                 var fat = container.FatEntry{
-                    .comp_type = .math_filtered,
+                    .comp_type = hit.comp_type,
                     .data_offset = 0,
                     .original_size = hit.size,
                     .compressed_size = hit.payload.len,
                     .checksum = hit.csum,
-                    .codec = lift_comp.codec,
+                    .codec = hit.codec,
                 };
                 try fat.setPath(rel);
                 try cb.appendBlock(fat, hit.payload);
@@ -3078,12 +3133,14 @@ pub fn packTarFullAbi(
     defer tf.close();
     const tsize = try tf.getEndPos();
 
-    // LZMA is one-shot (whole tar in RAM). Full-mode unpack already loads the
-    // whole tar in memory, so this matches the existing profile — but cap it so
-    // an enormous selection can't blow up RAM; above the cap, fall back to the
-    // streaming zstd path (its FAT codec byte records zstd, so decode is correct).
+    // If every file was lifted (the tar holds no real files, just end markers),
+    // skip the tar entry entirely — its overhead would make a pure-structured
+    // archive larger than regular mode for no benefit. Unpack handles archives
+    // with only lifted entries (no tar) transparently.
     const LZMA_TAR_CAP: u64 = 3 * 1024 * 1024 * 1024;
-    if (tsize <= LZMA_TAR_CAP) {
+    if (tar_files == 0) {
+        // nothing to add — all content rode as lifted entries
+    } else if (tsize <= LZMA_TAR_CAP) {
         const tar_data = try tf.readToEndAlloc(root, @intCast(tsize));
         defer root.free(tar_data);
         const csum = container.fnv1a(tar_data);
