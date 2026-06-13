@@ -149,6 +149,7 @@ pub const Codec = enum(u8) {
     gzip = 0x00,
     zstd = 0x01,
     lzma = 0x02, // xz/LZMA backend (full mode) — stronger model than zstd
+    cm = 0x03, // context-mixing backend (full/cold only; slow decode, best ratio)
 };
 
 // ---------------------------------------------------------------------------
@@ -1284,8 +1285,8 @@ pub fn decompressSolidBlock(block_gz: []const u8, codec: Codec, a: std.mem.Alloc
             return all.toOwnedSlice();
         },
         // Solid blocks are only ever built with gzip/zstd (full mode, which
-        // uses LZMA, doesn't bucket into solid blocks). Unreachable in practice.
-        .lzma => return error.LzmaDecompressFailed,
+        // uses LZMA/CM, doesn't bucket into solid blocks). Unreachable in practice.
+        .lzma, .cm => return error.LzmaDecompressFailed,
     }
 }
 
@@ -2692,6 +2693,7 @@ pub const Compressor = struct {
             .gzip => gzipCompress(data, a, self.gzip_level),
             .zstd => zstdCompress(data, a, self.zstd_level),
             .lzma => lzmaCompress(data, a, self.lzma_preset),
+            .cm => cm.compress(data, a),
         };
     }
 };
@@ -2702,6 +2704,7 @@ fn inflateBlock(block: []const u8, original_size: u64, codec: Codec, a: std.mem.
         .gzip => extractFallback(block, original_size, a),
         .zstd => zstdDecompress(block, original_size, a),
         .lzma => lzmaDecompress(block, original_size, a),
+        .cm => cm.decompress(block, @intCast(original_size), a),
     };
 }
 

@@ -3756,7 +3756,13 @@ pub fn packTarFullAbi(
                 // only when it beats plain compression of the file (so a flat
                 // sprite the transform doesn't help stays in the tar).
                 if (eff.tier >= 1) {
-                    const codecs = [_]container.Compressor{ eff.comp, container.Compressor.lzmaFromTier(eff.tier) };
+                    // At Max, also race the context-mixing codec on the residual
+                    // (full/cold only — CM beats LZMA ~5-15% on decorrelated
+                    // residuals). zstd/lzma kept for the live-tier and as floors.
+                    const codecs: []const container.Compressor = if (eff.tier >= 2)
+                        &.{ eff.comp, container.Compressor.lzmaFromTier(eff.tier), .{ .codec = .cm } }
+                    else
+                        &.{ eff.comp, container.Compressor.lzmaFromTier(eff.tier) };
                     var best: ?[]u8 = null;
                     var best_ct: container.CompressionType = .math_columnar;
                     var best_codec: container.Codec = .zstd;
