@@ -1654,10 +1654,10 @@ fn unpackFullTar(root: std.mem.Allocator, rdr: *container.Reader, out_dir: []con
         const entry = rdr.entryAt(i);
         const path = entry.getPath();
 
-        // Lifted entries (whole-file program, filtered, columnar, or 2D-image)
-        // are individual files; anything else is the one wrapped solid tar.
+        // Lifted entries (whole-file program, filtered, columnar, 2D-image, or
+        // audio-LPC) are individual files; anything else is the one wrapped tar.
         const is_lifted = switch (entry.comp_type) {
-            .math_bytecode, .math_filtered, .math_columnar, .math_image2d => true,
+            .math_bytecode, .math_filtered, .math_columnar, .math_image2d, .math_audio => true,
             else => false,
         };
         if (!is_lifted) {
@@ -3696,6 +3696,13 @@ pub fn packTarFullAbi(
                                 best_codec = cmp.codec;
                             }
                         }
+                        if (bestAudioBlock(data, eff, cmp, aa) catch null) |p| {
+                            if (best == null or p.len < best.?.len) {
+                                best = p;
+                                best_ct = .math_audio;
+                                best_codec = cmp.codec;
+                            }
+                        }
                     }
                     if (best) |payload| {
                         // Honesty: beat the best plain compression of the file.
@@ -3793,7 +3800,7 @@ pub fn packTarFullAbi(
         const hit = hits[ji] orelse continue;
         switch (hit.comp_type) {
             .math_bytecode => try cb.addMath(rel, hit.payload, hit.size, hit.csum),
-            .math_filtered, .math_columnar, .math_image2d => {
+            .math_filtered, .math_columnar, .math_image2d, .math_audio => {
                 var fat = container.FatEntry{
                     .comp_type = hit.comp_type,
                     .data_offset = 0,
