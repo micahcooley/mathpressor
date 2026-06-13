@@ -295,11 +295,18 @@ ratios:
     is how full mode now beats 7-Zip on binary too (e.g. a 24 MB binary set
     6.12 MB vs 7-Zip 6.27 MB). CM decode is slow → cold-only, never the live
     path; regular/live mode keeps the fast LZMA main stream.
+  - **RIP filter** — an x86-64 length decoder rewrites `[rip+disp32]` references
+    (the GOT/data refs that fill PIC `.so`/PIE binaries) to position-absolute so
+    repeated refs match for the LZ stage. 7-Zip's x86 filter doesn't do this. It's
+    restricted to ELF executable sections (verify-then-use safe) and feeds LZMA,
+    so it's **fast-decode and used in regular/live mode too** — which is how
+    regular mode also beats 7-Zip on binaries while staying live.
   - plain LZMA / in-place x86 BCJ as the fast baselines.
 
   The keep-smaller guard means full mode never loses to any single backend.
   Across text / vertex / image / audio / binary, full mode now beats every
-  general-purpose compressor including 7-Zip. Maximum ratio, but it must be fully
+  general-purpose compressor including 7-Zip — and regular (live) mode holds the
+  #2 spot on every type, beating the 7-Zip archiver everywhere. Maximum ratio, but it must be fully
   expanded to use — *not* live-runnable. Always the smaller of the two modes.
 
 The intended hierarchy: full mode is #1 on ratio; regular mode is #2 (aiming to
