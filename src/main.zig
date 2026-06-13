@@ -50,6 +50,8 @@ pub fn main() !void {
         try bcj2Bench(root, args[2], out);
     } else if (args.len >= 3 and std.mem.eql(u8, args[1], "cmbench")) {
         try cmBench(root, args[2], out);
+    } else if (args.len >= 3 and std.mem.eql(u8, args[1], "x64bench")) {
+        try x64Bench(root, args[2], out);
     } else if (args.len >= 4 and std.mem.eql(u8, args[1], "unpack")) {
         try unpackContainer(root, args[2], args[3], out);
     } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench")) {
@@ -61,6 +63,50 @@ pub fn main() !void {
     } else {
         try runDemo(root, out);
     }
+}
+
+/// Diagnostic: measure the x86-64 RIP-relative filter's effect on LZMA size.
+fn x64Bench(root: std.mem.Allocator, path: []const u8, out: anytype) !void {
+    const x64 = @import("x64.zig");
+    const f = try std.fs.cwd().openFile(path, .{});
+    defer f.close();
+    const data = try f.readToEndAlloc(root, 1 << 30);
+    defer root.free(data);
+    const preset = container.lzmaPreset(2);
+
+    const raw_lz = try container.lzmaCompress(data, root, preset);
+    defer root.free(raw_lz);
+    const bcj_raw = try container.lzmaCompressX86(data, root, preset);
+    defer root.free(bcj_raw);
+    // BCJ2 on raw, and BCJ2 on RIP-filtered (both fast-decode, full mode CM off here)
+    const bcj2_raw = container.buildBcj2Block(data, preset, false, root) catch null;
+    defer if (bcj2_raw) |b| root.free(b);
+
+    const filt = try x64.filter(data, root);
+    defer if (filt) |fb| root.free(fb);
+
+    var filt_lz_len: usize = raw_lz.len;
+    var filt_bcj2_len: usize = if (bcj2_raw) |b| b.len else raw_lz.len;
+    var rt: []const u8 = "n/a";
+    if (filt) |fb| {
+        const flz = try container.lzmaCompress(fb, root, preset);
+        defer root.free(flz);
+        filt_lz_len = flz.len;
+        if (container.buildBcj2Block(fb, preset, false, root) catch null) |fb2| {
+            defer root.free(fb2);
+            filt_bcj2_len = fb2.len;
+        }
+        const back = try root.dupe(u8, fb);
+        defer root.free(back);
+        x64.unfilter(back);
+        rt = if (std.mem.eql(u8, back, data)) "OK" else "FAIL";
+    }
+    try out.print("x64 bench on {s} ({d} B), rip-filter rt {s}\n", .{ path, data.len, rt });
+    try out.print("  plain LZMA            : {d}\n", .{raw_lz.len});
+    try out.print("  x86 BCJ LZMA          : {d}\n", .{bcj_raw.len});
+    try out.print("  BCJ2 (raw)            : {d}\n", .{if (bcj2_raw) |b| b.len else 0});
+    try out.print("  RIP + LZMA            : {d}\n", .{filt_lz_len});
+    try out.print("  RIP + BCJ2            : {d}\n", .{filt_bcj2_len});
 }
 
 /// Diagnostic: measure the CM backend vs LZMA 9e on a file, with round-trip + timing.

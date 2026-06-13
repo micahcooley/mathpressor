@@ -50,6 +50,7 @@ const std = @import("std");
 const vm_mod = @import("vm.zig");
 const bcj2 = @import("bcj2.zig");
 const cm = @import("cm.zig");
+const x64 = @import("x64.zig");
 
 // ---------------------------------------------------------------------------
 // Format constants
@@ -2487,12 +2488,30 @@ fn lzmaAddrStream(data: []const u8, preset: u32, a: std.mem.Allocator) ![]u8 {
     return def;
 }
 
-/// Build a MATH_BCJ2 block from `tar`: split via BCJ2, compress each stream.
-/// The main stream is LZMA'd; when `allow_cm` is set (full/cold mode only — CM
-/// decode is too slow for the live path) it ALSO tries the context-mixing coder
-/// and keeps the smaller, recording which in the version byte (1=LZMA, 2=CM).
-/// Returns owned bytes (the entry block). original_size for the FAT == tar.len.
+/// Build a MATH_BCJ2 block. Keep-smaller over an optional x86-64 RIP-relative
+/// pre-filter (a fast-decode transform 7-Zip lacks): try BCJ2 of the raw tar and
+/// BCJ2 of the RIP-filtered tar, keep the smaller, and record the choice in the
+/// version byte's 0x10 bit. The RIP filter is verify-then-use safe and in-place
+/// (same length), so original_size is unchanged; decode unfilters after BCJ2.
 pub fn buildBcj2Block(tar: []const u8, preset: u32, allow_cm: bool, a: std.mem.Allocator) ![]u8 {
+    const plain = try buildBcj2BlockInner(tar, preset, allow_cm, false, a);
+    errdefer a.free(plain);
+    if (x64.filter(tar, a) catch null) |rf| {
+        defer a.free(rf);
+        if (buildBcj2BlockInner(rf, preset, allow_cm, true, a) catch null) |rb| {
+            if (rb.len < plain.len) {
+                a.free(plain);
+                return rb;
+            }
+            a.free(rb);
+        }
+    }
+    return plain;
+}
+
+/// Inner builder over already-prepared bytes. `rip` records (in the version byte)
+/// that the input was RIP-filtered so the decoder unfilters after reassembly.
+fn buildBcj2BlockInner(tar: []const u8, preset: u32, allow_cm: bool, rip: bool, a: std.mem.Allocator) ![]u8 {
     var s = try bcj2.encode(tar, a);
     defer s.deinit(a);
     const lz_main = try lzmaOrEmpty(s.main, preset, a);
@@ -2521,7 +2540,7 @@ pub fn buildBcj2Block(tar: []const u8, preset: u32, allow_cm: bool, a: std.mem.A
     const total = BCJ2_HDR + cmain.len + cc.len + cj.len + s.rc.len;
     const out = try a.alloc(u8, total);
     errdefer a.free(out);
-    out[0] = main_ver;
+    out[0] = main_ver | (if (rip) @as(u8, 0x10) else 0);
     std.mem.writeInt(u32, out[1..5], @intCast(s.main.len), .little);
     std.mem.writeInt(u32, out[5..9], @intCast(cmain.len), .little);
     std.mem.writeInt(u32, out[9..13], @intCast(s.call.len), .little);
@@ -2542,8 +2561,11 @@ pub fn buildBcj2Block(tar: []const u8, preset: u32, allow_cm: bool, a: std.mem.A
 
 /// Decode a MATH_BCJ2 block back to the original `original_size` bytes (the tar).
 fn extractBcj2(block: []const u8, original_size: u64, a: std.mem.Allocator) ![]u8 {
-    if (block.len < BCJ2_HDR or (block[0] != 1 and block[0] != 2)) return error.TruncatedContainer;
-    const main_ver = block[0]; // 1 = LZMA main, 2 = CM main
+    if (block.len < BCJ2_HDR) return error.TruncatedContainer;
+    const ver_byte = block[0];
+    const rip = (ver_byte & 0x10) != 0; // RIP-relative pre-filter applied
+    const main_ver = ver_byte & 0x0F; // 1 = LZMA main, 2 = CM main
+    if (main_ver != 1 and main_ver != 2) return error.TruncatedContainer;
     const main_ulen: usize = std.mem.readInt(u32, block[1..5], .little);
     const main_clen: usize = std.mem.readInt(u32, block[5..9], .little);
     const call_ulen: usize = std.mem.readInt(u32, block[9..13], .little);
@@ -2571,7 +2593,9 @@ fn extractBcj2(block: []const u8, original_size: u64, a: std.mem.Allocator) ![]u
     off += jump_clen;
     const rc = block[off .. off + rc_len];
 
-    return bcj2.decode(main, call, jump, rc, @intCast(original_size), a);
+    const result = try bcj2.decode(main, call, jump, rc, @intCast(original_size), a);
+    if (rip) x64.unfilter(result); // reverse the RIP-relative pre-filter in place
+    return result;
 }
 
 /// Compression config carried by each builder: which codec + its level.
