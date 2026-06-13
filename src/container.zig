@@ -2406,6 +2406,32 @@ pub fn lzmaCompressX86(data: []const u8, a: std.mem.Allocator, preset: u32) ![]u
     return a.dupe(u8, buf[0..out_pos]);
 }
 
+/// LZMA with explicit literal-context / literal-position / position bits. The
+/// .xz stream self-describes the filter params, so lzmaDecompress reads it back
+/// with no extra metadata. Used to tune the BCJ2 address streams (4-byte-aligned
+/// big-endian addresses compress better with position bits matched to 4).
+pub fn lzmaCompressTuned(data: []const u8, a: std.mem.Allocator, preset: u32, lc: u32, lp: u32, pb: u32) ![]u8 {
+    var opt: lzma_options_lzma = std.mem.zeroes(lzma_options_lzma);
+    if (lzma_lzma_preset(&opt, preset) != 0) return error.LzmaCompressFailed;
+    opt.lc = lc;
+    opt.lp = lp;
+    opt.pb = pb;
+    var filters = [_]lzma_filter{
+        .{ .id = LZMA_FILTER_LZMA2, .options = &opt },
+        .{ .id = LZMA_VLI_UNKNOWN, .options = null },
+    };
+    const bound = lzma_stream_buffer_bound(data.len);
+    const buf = try a.alloc(u8, bound);
+    defer a.free(buf);
+    var out_pos: usize = 0;
+    const rc = lzma_stream_buffer_encode(
+        &filters, LZMA_CHECK_NONE, null,
+        data.ptr, data.len, buf.ptr, &out_pos, buf.len,
+    );
+    if (rc != LZMA_OK) return error.LzmaCompressFailed;
+    return a.dupe(u8, buf[0..out_pos]);
+}
+
 pub fn lzmaDecompress(block: []const u8, original_size: u64, a: std.mem.Allocator) ![]u8 {
     const out = try a.alloc(u8, @intCast(original_size));
     errdefer a.free(out);
@@ -2441,6 +2467,23 @@ fn lzmaOrEmpty(data: []const u8, preset: u32, a: std.mem.Allocator) ![]u8 {
     return lzmaCompress(data, a, preset);
 }
 
+/// LZMA-compress a BCJ2 address stream, keeping the smaller of the default model
+/// and one tuned for 4-byte-aligned big-endian records (lc0/lp2/pb2). The .xz
+/// stream self-describes its params, so decode needs no extra metadata.
+fn lzmaAddrStream(data: []const u8, preset: u32, a: std.mem.Allocator) ![]u8 {
+    if (data.len == 0) return a.alloc(u8, 0);
+    const def = try lzmaCompress(data, a, preset);
+    const tuned = lzmaCompressTuned(data, a, preset, 0, 2, 2) catch {
+        return def;
+    };
+    if (tuned.len < def.len) {
+        a.free(def);
+        return tuned;
+    }
+    a.free(tuned);
+    return def;
+}
+
 /// Build a MATH_BCJ2 block from `tar`: split via BCJ2, LZMA each stream.
 /// Returns owned bytes (the entry block). original_size for the FAT == tar.len.
 pub fn buildBcj2Block(tar: []const u8, preset: u32, a: std.mem.Allocator) ![]u8 {
@@ -2448,9 +2491,9 @@ pub fn buildBcj2Block(tar: []const u8, preset: u32, a: std.mem.Allocator) ![]u8 
     defer s.deinit(a);
     const cm = try lzmaOrEmpty(s.main, preset, a);
     defer a.free(cm);
-    const cc = try lzmaOrEmpty(s.call, preset, a);
+    const cc = try lzmaAddrStream(s.call, preset, a);
     defer a.free(cc);
-    const cj = try lzmaOrEmpty(s.jump, preset, a);
+    const cj = try lzmaAddrStream(s.jump, preset, a);
     defer a.free(cj);
 
     const total = BCJ2_HDR + cm.len + cc.len + cj.len + s.rc.len;

@@ -84,6 +84,38 @@ fn bcj2Bench(root: std.mem.Allocator, path: []const u8, out: anytype) !void {
     defer root.free(lj);
     const bcj2_total = lm.len + lc.len + lj.len + s.rc.len;
 
+    // Param sweep: find the smallest LZMA (lc,lp,pb) for each stream. The address
+    // streams are 4-byte big-endian records, so position/literal-position bits
+    // matched to 4 (pb/lp=2) usually beat the default lc3/lp0/pb2.
+    const Combo = struct { lc: u32, lp: u32, pb: u32 };
+    const combos = [_]Combo{
+        .{ .lc = 3, .lp = 0, .pb = 2 }, // default
+        .{ .lc = 0, .lp = 2, .pb = 2 },
+        .{ .lc = 1, .lp = 2, .pb = 2 },
+        .{ .lc = 0, .lp = 0, .pb = 0 },
+        .{ .lc = 4, .lp = 0, .pb = 0 },
+        .{ .lc = 2, .lp = 2, .pb = 2 },
+    };
+    const Best = struct {
+        fn of(stream: []const u8, a: std.mem.Allocator, pr: u32, cs: []const Combo) struct { len: usize, c: Combo } {
+            var best_len: usize = std.math.maxInt(usize);
+            var best_c = cs[0];
+            for (cs) |c| {
+                const z = container.lzmaCompressTuned(stream, a, pr, c.lc, c.lp, c.pb) catch continue;
+                defer a.free(z);
+                if (z.len < best_len) {
+                    best_len = z.len;
+                    best_c = c;
+                }
+            }
+            return .{ .len = best_len, .c = best_c };
+        }
+    };
+    const bm = Best.of(s.main, root, preset, &combos);
+    const bc = Best.of(s.call, root, preset, &combos);
+    const bj = Best.of(s.jump, root, preset, &combos);
+    const tuned_total = bm.len + bc.len + bj.len + s.rc.len;
+
     // Round-trip check.
     const back = try bcj2.decode(s.main, s.call, s.jump, s.rc, data.len, root);
     defer root.free(back);
@@ -101,10 +133,16 @@ fn bcj2Bench(root: std.mem.Allocator, path: []const u8, out: anytype) !void {
     try out.print("  plain LZMA        : {d}\n", .{plain.len});
     try out.print("  in-place x86 BCJ  : {d}\n", .{inplace.len});
     try out.print("  BCJ2 (4-stream)   : {d}\n", .{bcj2_total});
+    try out.print("  BCJ2 tuned        : {d}  (main lc{d}lp{d}pb{d}={d}, call lc{d}lp{d}pb{d}={d}, jump lc{d}lp{d}pb{d}={d})\n", .{
+        tuned_total,
+        bm.c.lc, bm.c.lp, bm.c.pb, bm.len,
+        bc.c.lc, bc.c.lp, bc.c.pb, bc.len,
+        bj.c.lc, bj.c.lp, bj.c.pb, bj.len,
+    });
     const base: f64 = @floatFromInt(inplace.len);
-    const b2: f64 = @floatFromInt(bcj2_total);
-    try out.print("  BCJ2 vs in-place  : {d:.2}% ({s})\n",
-        .{ (b2 / base - 1.0) * 100.0, if (bcj2_total < inplace.len) "BCJ2 wins" else "in-place wins" });
+    const b2: f64 = @floatFromInt(tuned_total);
+    try out.print("  BCJ2-tuned vs in-place : {d:.2}% ({s})\n",
+        .{ (b2 / base - 1.0) * 100.0, if (tuned_total < inplace.len) "BCJ2 wins" else "in-place wins" });
 }
 
 // ---------------------------------------------------------------------------
@@ -1387,6 +1425,18 @@ fn bestAudioBlock(data: []const u8, effort: Effort, final_comp: container.Compre
     return payload;
 }
 
+/// Per-file BCJ2 for regular mode: an x86 binary gets the same 4-stream
+/// range-coded filter full mode uses, but as a single per-entry block (still
+/// random-access / live-decodable). Max-tier only (the streams are LZMA'd), and
+/// only on files that look like x86 code with enough body to amortize the
+/// per-stream overhead. Honesty-guarded at the call site. This is what lets
+/// regular mode keep pace with 7-Zip on binaries instead of losing to BCJ2.
+fn bestBcj2Block(data: []const u8, effort: Effort, alloc: std.mem.Allocator) !?[]u8 {
+    if (effort.tier != 2) return null;
+    if (data.len < 8192 or !looksLikeX86(data)) return null;
+    return try container.buildBcj2Block(data, container.lzmaPreset(effort.tier), alloc);
+}
+
 /// Pick the cheapest reversible representation for a file the translator routed
 /// to fallback: STORE (raw), plain compression, per-block math, a filtered
 /// stream, a columnar transpose, or a 2D image predictor. Returns the chosen
@@ -1457,6 +1507,15 @@ fn chooseFallbackRep(data: []const u8, effort: Effort, alloc: std.mem.Allocator)
         } else alloc.free(payload);
     }
 
+    if (try bestBcj2Block(data, effort, alloc)) |payload| {
+        if (payload.len < best_len) {
+            if (best_payload) |b| alloc.free(b);
+            best_type = .math_bcj2;
+            best_len = payload.len;
+            best_payload = payload;
+        } else alloc.free(payload);
+    }
+
     return .{ .comp_type = best_type, .payload = best_payload };
 }
 
@@ -1469,6 +1528,7 @@ fn fallbackLabel(ct: container.CompressionType) []const u8 {
         .math_columnar => "COLUMNAR",
         .math_image2d => "IMAGE2D ",
         .math_audio => "AUDIO   ",
+        .math_bcj2 => "BCJ2    ",
         else => "STORE   ",
     };
 }
