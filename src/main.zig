@@ -1250,6 +1250,95 @@ fn bestImage2DBlock(data: []const u8, effort: Effort, final_comp: container.Comp
     return payload;
 }
 
+const AudioInfo = struct { header_len: usize, data_len: usize, channels: u8 };
+
+/// Parse a WAV header for 16-bit PCM geometry: walk RIFF chunks, read `fmt `
+/// (format, channels, bits) and locate `data`. Returns null for non-PCM,
+/// non-16-bit, or anything that isn't a clean WAVE container. Header + sample
+/// region + trailer cover the file; only the sample region is predicted.
+fn detectAudio(data: []const u8) ?AudioInfo {
+    if (data.len < 44) return null;
+    if (!std.mem.eql(u8, data[0..4], "RIFF") or !std.mem.eql(u8, data[8..12], "WAVE")) return null;
+    var i: usize = 12;
+    var channels: u8 = 0;
+    var bits: u16 = 0;
+    var fmt_ok = false;
+    var data_off: usize = 0;
+    var data_sz: usize = 0;
+    while (i + 8 <= data.len) {
+        const id = data[i .. i + 4];
+        const sz: usize = std.mem.readInt(u32, data[i + 4 .. i + 8][0..4], .little);
+        const payload = i + 8;
+        if (std.mem.eql(u8, id, "fmt ")) {
+            if (payload + 16 > data.len) return null;
+            const audio_format = std.mem.readInt(u16, data[payload .. payload + 2][0..2], .little);
+            const chv = std.mem.readInt(u16, data[payload + 2 .. payload + 4][0..2], .little);
+            bits = std.mem.readInt(u16, data[payload + 14 .. payload + 16][0..2], .little);
+            if (audio_format != 1) return null; // PCM only
+            if (chv == 0 or chv > 8) return null;
+            channels = @intCast(chv);
+            fmt_ok = true;
+        } else if (std.mem.eql(u8, id, "data")) {
+            data_off = payload;
+            data_sz = sz;
+            break;
+        }
+        // Chunks are word-aligned: advance past the payload + its pad byte.
+        i = payload + sz + (sz & 1);
+    }
+    if (!fmt_ok or bits != 16 or data_off == 0) return null;
+    if (data_off + data_sz > data.len) data_sz = data.len - data_off; // clamp ragged data chunk
+    if (data_sz < 4) return null;
+    return .{ .header_len = data_off, .data_len = data_sz, .channels = channels };
+}
+
+/// LPC-predict a detected WAV and return the MATH_AUDIO payload, or null if the
+/// file isn't 16-bit PCM WAV. Tries fixed-predictor orders 0..3 and keeps the
+/// one with the smallest residual magnitude. Honesty-guarded at the call site;
+/// general compressors have no per-channel sample predictor, so this is net-new.
+fn bestAudioBlock(data: []const u8, effort: Effort, final_comp: container.Compressor, alloc: std.mem.Allocator) !?[]u8 {
+    if (effort.tier == 0 or data.len < 256) return null;
+    const info = detectAudio(data) orelse return null;
+    const region = data[info.header_len .. info.header_len + info.data_len];
+
+    var best_order: u8 = 0;
+    var best_cost: u64 = std.math.maxInt(u64);
+    var ord: u8 = 0;
+    while (ord <= 3) : (ord += 1) {
+        const res = try container.lpcForward(region, info.channels, ord, alloc);
+        defer alloc.free(res);
+        var cost: u64 = 0;
+        var j: usize = 0;
+        while (j + 1 < res.len) : (j += 2) {
+            const v: i32 = @as(i16, @bitCast(std.mem.readInt(u16, res[j..][0..2], .little)));
+            cost += @abs(v);
+        }
+        if (cost < best_cost) {
+            best_cost = cost;
+            best_order = ord;
+        }
+    }
+
+    const residual = try container.lpcForward(region, info.channels, best_order, alloc);
+    defer alloc.free(residual);
+    const transformed = try alloc.alloc(u8, data.len);
+    defer alloc.free(transformed);
+    const dend = info.header_len + info.data_len;
+    @memcpy(transformed[0..info.header_len], data[0..info.header_len]);
+    @memcpy(transformed[info.header_len..dend], residual);
+    @memcpy(transformed[dend..], data[dend..]);
+
+    const comp = try final_comp.compress(transformed, alloc);
+    defer alloc.free(comp);
+    const payload = try alloc.alloc(u8, 10 + comp.len);
+    std.mem.writeInt(u32, payload[0..4], @intCast(info.header_len), .little);
+    std.mem.writeInt(u32, payload[4..8], @intCast(info.data_len), .little);
+    payload[8] = info.channels;
+    payload[9] = best_order;
+    @memcpy(payload[10..], comp);
+    return payload;
+}
+
 /// Pick the cheapest reversible representation for a file the translator routed
 /// to fallback: STORE (raw), plain compression, per-block math, a filtered
 /// stream, a columnar transpose, or a 2D image predictor. Returns the chosen
@@ -1311,6 +1400,15 @@ fn chooseFallbackRep(data: []const u8, effort: Effort, alloc: std.mem.Allocator)
         } else alloc.free(payload);
     }
 
+    if (try bestAudioBlock(data, effort, effort.comp, alloc)) |payload| {
+        if (payload.len < best_len) {
+            if (best_payload) |b| alloc.free(b);
+            best_type = .math_audio;
+            best_len = payload.len;
+            best_payload = payload;
+        } else alloc.free(payload);
+    }
+
     return .{ .comp_type = best_type, .payload = best_payload };
 }
 
@@ -1322,6 +1420,7 @@ fn fallbackLabel(ct: container.CompressionType) []const u8 {
         .math_filtered => "FILTERED",
         .math_columnar => "COLUMNAR",
         .math_image2d => "IMAGE2D ",
+        .math_audio => "AUDIO   ",
         else => "STORE   ",
     };
 }

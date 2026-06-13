@@ -48,6 +48,7 @@ When you pack a directory, Mathpressor automatically routes each file:
 | `MATH_COLUMNAR` | `0x09` | Record array (vertex/float tables) | AoS→SoA transpose + compressed |
 | `MATH_IMAGE2D` | `0x0A` | Raw raster (TGA/PGM/PPM) | 2D MED predictor + compressed |
 | `MATH_DICT` | `0x0B` | Many similar small files (JSON/strings/shaders) | zstd frame primed with a shared trained dictionary |
+| `MATH_AUDIO` | `0x0C` | 16-bit PCM WAV | fixed-order LPC (per-channel sample predictor) + compressed |
 
 All routes reconstruct to bit-identical original bytes. To the caller, they are invisible.
 
@@ -73,6 +74,19 @@ It is fully guarded so it never costs bytes:
 - Files that don't benefit fall through to normal per-file routing.
 
 Set `MATHPRESSOR_NODICT=1` to disable the route (diagnostic / A-B switch).
+
+### Per-channel sample prediction for audio (`MATH_AUDIO`)
+
+16-bit PCM samples are strongly correlated sample-to-sample, but general
+compressors only have *byte-level* delta — they can't predict across a 2-byte
+sample or per channel. `MATH_AUDIO` deinterleaves a WAV's channels and applies a
+fixed-order linear predictor (the FLAC/Shorten family, orders 0–3, best chosen
+per file), storing the residual. The WAV header and any post-data chunks stay
+verbatim; only the PCM region is predicted; wrapping integer arithmetic makes it
+an exact involution. Because the predictor is net-new ground, this beats general
+compressors — even *solid* ones — on raw audio while staying per-entry/live
+(measured: a 7-file WAV set packed to 11.9 KB vs solid 7z 18.5 KB, solid xz
+23.5 KB, per-file xz 25.3 KB). Honesty-guarded like every route.
 
 ---
 

@@ -135,6 +135,7 @@ pub const CompressionType = enum(u8) {
     math_columnar   = 0x09, // AoS->SoA transpose (record arrays), then compressed
     math_image2d    = 0x0A, // 2D MED predictor over raw raster, then compressed
     math_dict       = 0x0B, // zstd frame compressed against a shared trained dictionary
+    math_audio      = 0x0C, // fixed-order LPC over PCM (WAV) samples, then compressed
 };
 
 /// Per-entry compression codec (FAT byte 245). gzip = 0 is the legacy default,
@@ -1455,6 +1456,7 @@ pub const Reader = struct {
                 if (entry.solid_index >= self.dicts.len) break :blk error.BadDictIndex;
                 break :blk zstdDecompressUsingDict(block, entry.original_size, self.dicts[entry.solid_index], a);
             },
+            .math_audio      => extractAudio(block, entry.original_size, entry.codec, a),
             // A symlink's "contents" are its target path, stored verbatim.
             .symlink         => extractStore(block, entry.original_size, a),
             .solid_block     => extractSolidEntry(
@@ -1918,6 +1920,149 @@ fn extractImage2D(block: []const u8, original_size: u64, codec: Codec, a: std.me
     // Header (front) and footer (back) are verbatim; invert MED over the pixels.
     medInverse(t[header_len .. header_len + @as(usize, @intCast(pixels))], w, h, ch);
     return t;
+}
+
+// ---------------------------------------------------------------------------
+// Fixed-order linear predictors (FLAC / Shorten family) for raw PCM audio.
+//
+// 16-bit PCM samples are strongly correlated sample-to-sample; a fixed integer
+// predictor on the SAMPLE stream collapses smooth waveforms to small residuals.
+// General compressors only have byte-level delta — they can't predict across a
+// 2-byte sample or per channel — so this is net-new ground on audio, the same
+// way the 2D MED predictor is on raster. It's a per-entry transform, so it
+// stays live (random access). Stereo is deinterleaved per channel before
+// prediction (residuals stored channel-major). Wrapping i16 arithmetic makes it
+// an exact involution: residual r = wrap(x - pred), reconstruction wrap(r + pred).
+// Order 0..3 are the standard FLAC fixed predictors; warm-up history is 0 (the
+// inverse uses the same zero history, so it stays exact).
+// ---------------------------------------------------------------------------
+
+inline fn lpcPredict(order: u8, h1: i32, h2: i32, h3: i32) i32 {
+    return switch (order) {
+        1 => h1,
+        2 => 2 * h1 - h2,
+        3 => 3 * h1 - 3 * h2 + h3,
+        else => 0,
+    };
+}
+
+inline fn wrapI16(v: i32) i16 {
+    return @bitCast(@as(u16, @truncate(@as(u32, @bitCast(v)))));
+}
+
+/// Deinterleave by channel and apply the order-`order` fixed predictor; output
+/// is channel-major residuals (same byte length as input). Trailing bytes that
+/// don't fill a full per-channel sample row are copied verbatim.
+pub fn lpcForward(data: []const u8, channels: u8, order: u8, a: std.mem.Allocator) ![]u8 {
+    const out = try a.alloc(u8, data.len);
+    errdefer a.free(out);
+    const ch: usize = channels;
+    const n_total = data.len / 2;
+    const n_per = n_total / ch;
+    const body = n_per * ch * 2;
+    var c: usize = 0;
+    while (c < ch) : (c += 1) {
+        var h1: i32 = 0;
+        var h2: i32 = 0;
+        var h3: i32 = 0;
+        var k: usize = 0;
+        while (k < n_per) : (k += 1) {
+            const in_off = (k * ch + c) * 2;
+            const x: i32 = @as(i16, @bitCast(std.mem.readInt(u16, data[in_off..][0..2], .little)));
+            const pred = lpcPredict(order, h1, h2, h3);
+            const r = wrapI16(x - pred);
+            const out_off = (c * n_per + k) * 2;
+            std.mem.writeInt(u16, out[out_off..][0..2], @bitCast(r), .little);
+            h3 = h2;
+            h2 = h1;
+            h1 = x;
+        }
+    }
+    @memcpy(out[body..], data[body..]);
+    return out;
+}
+
+/// Inverse of lpcForward: channel-major residuals -> interleaved PCM samples.
+fn lpcInverse(res: []const u8, channels: u8, order: u8, a: std.mem.Allocator) ![]u8 {
+    const out = try a.alloc(u8, res.len);
+    errdefer a.free(out);
+    const ch: usize = channels;
+    const n_total = res.len / 2;
+    const n_per = n_total / ch;
+    const body = n_per * ch * 2;
+    var c: usize = 0;
+    while (c < ch) : (c += 1) {
+        var h1: i32 = 0;
+        var h2: i32 = 0;
+        var h3: i32 = 0;
+        var k: usize = 0;
+        while (k < n_per) : (k += 1) {
+            const in_off = (c * n_per + k) * 2;
+            const r: i32 = @as(i16, @bitCast(std.mem.readInt(u16, res[in_off..][0..2], .little)));
+            const pred = lpcPredict(order, h1, h2, h3);
+            const x = wrapI16(r + pred);
+            const out_off = (k * ch + c) * 2;
+            std.mem.writeInt(u16, out[out_off..][0..2], @bitCast(x), .little);
+            h3 = h2;
+            h2 = h1;
+            h1 = x;
+        }
+    }
+    @memcpy(out[body..], res[body..]);
+    return out;
+}
+
+/// MATH_AUDIO block layout:
+///   [u32 header_len][u32 data_len][u8 channels][u8 order][T]
+/// where T (len == original_size, codec-compressed) is
+///   raw header ++ lpcForward(samples) ++ raw trailer.
+/// The WAV header and any post-data chunks stay verbatim; only the PCM sample
+/// region is predicted.
+fn extractAudio(block: []const u8, original_size: u64, codec: Codec, a: std.mem.Allocator) ![]u8 {
+    if (block.len < 10) return error.TruncatedContainer;
+    const header_len: usize = std.mem.readInt(u32, block[0..4], .little);
+    const data_len: usize = std.mem.readInt(u32, block[4..8], .little);
+    const channels = block[8];
+    const order = block[9];
+    if (channels == 0) return error.TruncatedContainer;
+    if (@as(u64, header_len) + data_len > original_size) return error.SizeMismatch;
+
+    const t = try inflateBlock(block[10..], original_size, codec, a);
+    errdefer a.free(t);
+    if (t.len != original_size) return error.SizeMismatch;
+    const samples = try lpcInverse(t[header_len .. header_len + data_len], channels, order, a);
+    defer a.free(samples);
+    @memcpy(t[header_len .. header_len + data_len], samples);
+    return t;
+}
+
+test "LPC fixed predictors are exact involutions (mono + stereo, all orders)" {
+    const a = testing.allocator;
+    var rng = @import("math_gen.zig").XorShift32.init(0xA0D1);
+    for ([_]u8{ 1, 2 }) |channels| {
+        // Smooth-ish waveform + a little noise, interleaved across channels.
+        const n_per: usize = 4000;
+        const ch: usize = channels;
+        const data = try a.alloc(u8, n_per * ch * 2 + 3); // +3 ragged tail
+        defer a.free(data);
+        var k: usize = 0;
+        while (k < n_per) : (k += 1) {
+            var c: usize = 0;
+            while (c < ch) : (c += 1) {
+                const phase = @as(f32, @floatFromInt(k)) * 0.05 + @as(f32, @floatFromInt(c));
+                const s: i16 = @intFromFloat(@sin(phase) * 8000.0 + @as(f32, @floatFromInt(rng.nextByte() & 7)));
+                std.mem.writeInt(u16, data[(k * ch + c) * 2 ..][0..2], @bitCast(s), .little);
+            }
+        }
+        for (data[n_per * ch * 2 ..]) |*p| p.* = rng.nextByte();
+        for ([_]u8{ 0, 1, 2, 3 }) |order| {
+            const res = try lpcForward(data, channels, order, a);
+            defer a.free(res);
+            const back = try lpcInverse(res, channels, order, a);
+            defer a.free(back);
+            try testing.expectEqualSlices(u8, data, back);
+        }
+    }
 }
 
 test "2D MED predictor is an exact involution" {
