@@ -660,6 +660,7 @@ fn parse_fat_header_and_rows(header: &[u8; 12], fat_buf: &[u8]) -> Option<std::c
             0x06 => "LINK",
             0x07 => "BLOCKS",
             0x08 => "FILTERED",
+            0x09 => "COLUMNAR",
             _    => "UNKNOWN",
         };
         // FAT layout: [248..256] data_offset, [256..264] original_size,

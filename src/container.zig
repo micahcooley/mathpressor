@@ -120,6 +120,7 @@ pub const CompressionType = enum(u8) {
     symlink         = 0x06, // symbolic link — data block is the raw target path
     math_blocks     = 0x07, // per-block decomposition: equations + literal stream
     math_filtered   = 0x08, // reversible math filter applied, then compressed
+    math_columnar   = 0x09, // AoS->SoA transpose (record arrays), then compressed
 };
 
 /// Per-entry compression codec (FAT byte 245). gzip = 0 is the legacy default,
@@ -127,6 +128,7 @@ pub const CompressionType = enum(u8) {
 pub const Codec = enum(u8) {
     gzip = 0x00,
     zstd = 0x01,
+    lzma = 0x02, // xz/LZMA backend (full mode) — stronger model than zstd
 };
 
 // ---------------------------------------------------------------------------
@@ -1226,6 +1228,9 @@ pub fn decompressSolidBlock(block_gz: []const u8, codec: Codec, a: std.mem.Alloc
             try std.compress.gzip.decompress(fbs.reader(), all.writer());
             return all.toOwnedSlice();
         },
+        // Solid blocks are only ever built with gzip/zstd (full mode, which
+        // uses LZMA, doesn't bucket into solid blocks). Unreachable in practice.
+        .lzma => return error.LzmaDecompressFailed,
     }
 }
 
@@ -1368,6 +1373,7 @@ pub const Reader = struct {
             .math_residual   => extractResidual(block, entry.original_size, entry.codec, a),
             .math_blocks     => extractMathBlocks(block, entry.original_size, entry.codec, a),
             .math_filtered   => extractFiltered(block, entry.original_size, entry.codec, a),
+            .math_columnar   => extractColumnar(block, entry.original_size, entry.codec, a),
             // A symlink's "contents" are its target path, stored verbatim.
             .symlink         => extractStore(block, entry.original_size, a),
             .solid_block     => extractSolidEntry(
@@ -1653,6 +1659,93 @@ fn extractFiltered(block: []const u8, original_size: u64, codec: Codec, a: std.m
     return filtered;
 }
 
+// ---------------------------------------------------------------------------
+// Columnar (AoS -> SoA) transform
+//
+// Record arrays — vertex/index buffers, float tables, sensor logs — store
+// fields interleaved per record (array-of-structs). Transposing to put every
+// record's field-k together (struct-of-arrays) groups like-typed, slowly-
+// varying bytes so the codec's matches and contexts line up across records.
+// This is genuinely absent from LZ streams (xz/zstd/brotli don't transpose),
+// so it's net-new ground vs every general-purpose archiver. Pure index
+// permutation -> exact involution, no verify step needed.
+//
+// Layout: R = len / stride records, tail = len % stride bytes kept verbatim.
+//   out = [col 0 of every record][col 1 ...]...[col stride-1 ...][tail bytes]
+// ---------------------------------------------------------------------------
+
+pub fn columnarForward(data: []const u8, stride: usize, a: std.mem.Allocator) ![]u8 {
+    const out = try a.alloc(u8, data.len);
+    errdefer a.free(out);
+    const rows = data.len / stride;
+    const body = rows * stride;
+    var o: usize = 0;
+    var c: usize = 0;
+    while (c < stride) : (c += 1) {
+        var r: usize = 0;
+        var src = c;
+        while (r < rows) : (r += 1) {
+            out[o] = data[src];
+            o += 1;
+            src += stride;
+        }
+    }
+    // Tail (leftover bytes that don't fill a record) verbatim.
+    @memcpy(out[body..], data[body..]);
+    return out;
+}
+
+fn columnarInverse(t: []const u8, stride: usize, a: std.mem.Allocator) ![]u8 {
+    const out = try a.alloc(u8, t.len);
+    errdefer a.free(out);
+    const rows = t.len / stride;
+    const body = rows * stride;
+    var o: usize = 0;
+    var c: usize = 0;
+    while (c < stride) : (c += 1) {
+        var r: usize = 0;
+        var dst = c;
+        while (r < rows) : (r += 1) {
+            out[dst] = t[o];
+            o += 1;
+            dst += stride;
+        }
+    }
+    @memcpy(out[body..], t[body..]);
+    return out;
+}
+
+/// MATH_COLUMNAR: [u16 le stride][codec-compressed transposed bytes].
+/// Decompress to original_size, then inverse-transpose — bit-perfect.
+fn extractColumnar(block: []const u8, original_size: u64, codec: Codec, a: std.mem.Allocator) ![]u8 {
+    if (block.len < 2) return error.TruncatedContainer;
+    const stride: usize = std.mem.readInt(u16, block[0..2], .little);
+    if (stride == 0) return error.TruncatedContainer;
+    const transposed = try inflateBlock(block[2..], original_size, codec, a);
+    defer a.free(transposed);
+    if (transposed.len != original_size) return error.SizeMismatch;
+    return columnarInverse(transposed, stride, a);
+}
+
+test "columnar transform is an exact involution" {
+    const a = testing.allocator;
+    var rng = @import("math_gen.zig").XorShift32.init(0xC0FF);
+    // Fake 12-byte vertex records: 3 floats-ish fields with slow variation.
+    const recs = 5000;
+    const stride = 12;
+    const data = try a.alloc(u8, recs * stride + 7); // +7 tail
+    defer a.free(data);
+    for (0..recs) |r| {
+        for (0..stride) |c| data[r * stride + c] = @truncate(r / (c + 1) +% c * 7);
+    }
+    for (data[recs * stride ..]) |*p| p.* = rng.nextByte();
+    const fwd = try columnarForward(data, stride, a);
+    defer a.free(fwd);
+    const back = try columnarInverse(fwd, stride, a);
+    defer a.free(back);
+    try testing.expectEqualSlices(u8, data, back);
+}
+
 test "filters are exact involutions" {
     const a = testing.allocator;
     var rng = @import("math_gen.zig").XorShift32.init(0x5151);
@@ -1761,19 +1854,101 @@ pub fn zstdDecompressUnknown(data: []const u8, a: std.mem.Allocator) ![]u8 {
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// LZMA / xz backend (liblzma) — stronger model than zstd (range coder +
+// adaptive bit-contexts + match model). Used by full mode where the extra
+// ratio is worth the slower, heavier compression. One-shot buffer API only:
+// no lzma_stream struct (ABI-fragile) crosses the boundary, just three stable
+// C functions. Full-mode decode already loads the whole tar into memory, so
+// one-shot decode fits the existing memory profile.
+// ---------------------------------------------------------------------------
+
+extern fn lzma_stream_buffer_bound(uncompressed_size: usize) usize;
+extern fn lzma_easy_buffer_encode(
+    preset: u32,
+    check: c_int,
+    allocator: ?*const anyopaque,
+    in: [*]const u8,
+    in_size: usize,
+    out: [*]u8,
+    out_pos: *usize,
+    out_size: usize,
+) c_int;
+extern fn lzma_stream_buffer_decode(
+    memlimit: *u64,
+    flags: u32,
+    allocator: ?*const anyopaque,
+    in: [*]const u8,
+    in_pos: *usize,
+    in_size: usize,
+    out: [*]u8,
+    out_pos: *usize,
+    out_size: usize,
+) c_int;
+
+const LZMA_OK: c_int = 0;
+const LZMA_PRESET_EXTREME: u32 = 0x8000_0000;
+const LZMA_CHECK_NONE: c_int = 0; // container carries its own FNV-1a checksum
+
+/// LZMA preset for an effort tier: 6 balanced, 9|extreme for Max.
+pub fn lzmaPreset(tier: u8) u32 {
+    return switch (tier) {
+        0 => 2,
+        2 => 9 | LZMA_PRESET_EXTREME,
+        else => 6,
+    };
+}
+
+pub fn lzmaCompress(data: []const u8, a: std.mem.Allocator, preset: u32) ![]u8 {
+    const bound = lzma_stream_buffer_bound(data.len);
+    const buf = try a.alloc(u8, bound);
+    defer a.free(buf);
+    var out_pos: usize = 0;
+    const rc = lzma_easy_buffer_encode(
+        preset, LZMA_CHECK_NONE, null,
+        data.ptr, data.len, buf.ptr, &out_pos, buf.len,
+    );
+    if (rc != LZMA_OK) return error.LzmaCompressFailed;
+    return a.dupe(u8, buf[0..out_pos]);
+}
+
+pub fn lzmaDecompress(block: []const u8, original_size: u64, a: std.mem.Allocator) ![]u8 {
+    const out = try a.alloc(u8, @intCast(original_size));
+    errdefer a.free(out);
+    var memlimit: u64 = std.math.maxInt(u64);
+    var in_pos: usize = 0;
+    var out_pos: usize = 0;
+    const rc = lzma_stream_buffer_decode(
+        &memlimit, 0, null,
+        block.ptr, &in_pos, block.len,
+        out.ptr, &out_pos, out.len,
+    );
+    if (rc != LZMA_OK) return error.LzmaDecompressFailed;
+    if (out_pos != original_size) return error.SizeMismatch;
+    return out;
+}
+
 /// Compression config carried by each builder: which codec + its level.
 /// `from` maps an effort tier (0/1/2) to concrete levels.
 pub const Compressor = struct {
     codec: Codec = .zstd,
     gzip_level: GzipLevel = .fast, // used only for the streaming huge-file path
     zstd_level: c_int = 12,
+    lzma_preset: u32 = 6,
 
     pub fn fromTier(tier: u8) Compressor {
         return switch (tier) {
-            0 => .{ .codec = .zstd, .gzip_level = .fast, .zstd_level = 3 },
-            2 => .{ .codec = .zstd, .gzip_level = .best, .zstd_level = 19 },
-            else => .{ .codec = .zstd, .gzip_level = .default, .zstd_level = 12 },
+            0 => .{ .codec = .zstd, .gzip_level = .fast, .zstd_level = 3, .lzma_preset = lzmaPreset(0) },
+            2 => .{ .codec = .zstd, .gzip_level = .best, .zstd_level = 19, .lzma_preset = lzmaPreset(2) },
+            else => .{ .codec = .zstd, .gzip_level = .default, .zstd_level = 12, .lzma_preset = lzmaPreset(1) },
         };
+    }
+
+    /// Full-mode codec config: same effort tier, but routed through LZMA/xz.
+    pub fn lzmaFromTier(tier: u8) Compressor {
+        var c = fromTier(tier);
+        c.codec = .lzma;
+        return c;
     }
 
     /// Compress one in-memory block with the chosen codec.
@@ -1781,6 +1956,7 @@ pub const Compressor = struct {
         return switch (self.codec) {
             .gzip => gzipCompress(data, a, self.gzip_level),
             .zstd => zstdCompress(data, a, self.zstd_level),
+            .lzma => lzmaCompress(data, a, self.lzma_preset),
         };
     }
 };
@@ -1790,7 +1966,36 @@ fn inflateBlock(block: []const u8, original_size: u64, codec: Codec, a: std.mem.
     return switch (codec) {
         .gzip => extractFallback(block, original_size, a),
         .zstd => zstdDecompress(block, original_size, a),
+        .lzma => lzmaDecompress(block, original_size, a),
     };
+}
+
+test "lzma backend round-trips exactly across content types" {
+    const a = testing.allocator;
+    var rng = @import("math_gen.zig").XorShift32.init(0x1234);
+    // Mixed: repetitive text, a gradient, and a random tail — round-trip is the
+    // load-bearing property. (The size win over zstd is verified on real tars in
+    // the bake-off; on tiny inputs xz's ~60B container overhead makes it lose.)
+    var buf = std.ArrayList(u8).init(a);
+    defer buf.deinit();
+    try buf.appendSlice("the quick brown fox jumps over the lazy dog. " ** 300);
+    var i: usize = 0;
+    while (i < 4000) : (i += 1) try buf.append(@truncate(i / 4));
+    i = 0;
+    while (i < 4000) : (i += 1) try buf.append(rng.nextByte());
+
+    const data = buf.items;
+    for ([_]u32{ lzmaPreset(0), lzmaPreset(1), lzmaPreset(2) }) |preset| {
+        const lz = try lzmaCompress(data, a, preset);
+        defer a.free(lz);
+        const back = try lzmaDecompress(lz, data.len, a);
+        defer a.free(back);
+        try testing.expectEqualSlices(u8, data, back);
+    }
+    // On the highly-compressible prefix LZMA clearly compresses.
+    const lz = try lzmaCompress(data, a, lzmaPreset(2));
+    defer a.free(lz);
+    try testing.expect(lz.len < data.len);
 }
 
 // ---------------------------------------------------------------------------

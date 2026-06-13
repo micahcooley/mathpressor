@@ -30,6 +30,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true, // for libzstd
     });
     exe_mod.linkSystemLibrary("zstd", .{}); // modern entropy coder (beats DEFLATE)
+    exe_mod.linkSystemLibrary("lzma", .{}); // LZMA/xz backend for full mode
     // Find a bundled libzstd next to the binary so the shipped tarball is
     // self-contained and doesn't require zstd installed system-wide.
     exe_mod.addRPathSpecial("$ORIGIN");
@@ -53,6 +54,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     lib_mod.linkSystemLibrary("zstd", .{});
+    lib_mod.linkSystemLibrary("lzma", .{});
     // RUNPATH=$ORIGIN: when the GUI dlopens libmathpressor.so, its libzstd
     // dependency resolves from the .so's own directory (the bundled copy).
     lib_mod.addRPathSpecial("$ORIGIN");
@@ -78,6 +80,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     test_mod.linkSystemLibrary("zstd", .{});
+    test_mod.linkSystemLibrary("lzma", .{});
     const tests = b.addTest(.{ .root_module = test_mod });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run all unit tests");

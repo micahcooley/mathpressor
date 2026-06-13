@@ -710,7 +710,7 @@ fn packFileParallel(ctx: *PackCtx, rel_path: []u8) !void {
 
     // Math translation (CPU-intensive, runs outside the lock).
     const canvas = canvasForLen(data.len);
-    var prog_info = translator.TranslateProgress{ .cancel_flag = ctx.cancel_flag, .max_iters = ctx.effort.math_iters };
+    var prog_info = translator.TranslateProgress{ .cancel_flag = ctx.cancel_flag, .max_iters = if (data.len > 256 * 1024) 0 else ctx.effort.math_iters };
     const result = try translator.translate(data, canvas.w, canvas.h, alloc, &prog_info);
 
     // Gzip compression also runs outside the lock — this is the hot path for
@@ -1055,6 +1055,63 @@ fn bestFilteredBlock(data: []const u8, effort: Effort, alloc: std.mem.Allocator)
     return payload;
 }
 
+/// True if a sample of the data is mostly printable text. The AoS->SoA
+/// transpose helps binary record arrays, never prose, so this skips the trials
+/// on text cheaply.
+fn looksTexty(data: []const u8) bool {
+    const step = @max(@as(usize, 1), data.len / 4096);
+    var printable: usize = 0;
+    var seen: usize = 0;
+    var i: usize = 0;
+    while (i < data.len) : (i += step) {
+        const c = data[i];
+        if ((c >= 0x20 and c < 0x7F) or c == '\t' or c == '\n' or c == '\r') printable += 1;
+        seen += 1;
+    }
+    return seen > 0 and printable * 100 >= seen * 90;
+}
+
+/// Detect a record-array stride and return the columnar (AoS->SoA) payload
+/// `[u16 stride][compressed transposed]` if transposing genuinely shrinks the
+/// data, else null. The win on record data (vertex/index buffers, float tables)
+/// is distribution *separation* — grouping each field's bytes into compressible
+/// runs — which a similarity probe can't see, so we instead RANK candidate
+/// strides with a fast compression pass and commit the winner at full effort.
+/// The honesty guard at the call site still discards it unless it actually wins.
+fn bestColumnarBlock(data: []const u8, effort: Effort, alloc: std.mem.Allocator) !?[]u8 {
+    // Gate: skip Fast tier, tiny files, oversized files (cost), and text.
+    if (effort.tier == 0 or data.len < 8192 or data.len > 16 * 1024 * 1024) return null;
+    if (looksTexty(data)) return null;
+
+    const STRIDES = [_]usize{ 2, 3, 4, 6, 8, 12, 16, 20, 24, 32, 48, 64 };
+    // Fast-level baseline: only bother if a transpose beats plain at this level.
+    const plain_rank = (try container.zstdCompress(data, alloc, 1)).len;
+
+    var best_stride: usize = 0;
+    var best_rank: usize = plain_rank;
+    for (STRIDES) |s| {
+        if (data.len < s * 8) continue;
+        const t = try container.columnarForward(data, s, alloc);
+        defer alloc.free(t);
+        const rank = (try container.zstdCompress(t, alloc, 1)).len;
+        if (rank < best_rank) {
+            best_rank = rank;
+            best_stride = s;
+        }
+    }
+    if (best_stride == 0) return null; // no stride beat plain even at fast level
+
+    // Commit the winning stride at the real effort codec.
+    const t = try container.columnarForward(data, best_stride, alloc);
+    defer alloc.free(t);
+    const comp = try effort.comp.compress(t, alloc);
+    defer alloc.free(comp);
+    const payload = try alloc.alloc(u8, 2 + comp.len);
+    std.mem.writeInt(u16, payload[0..2], @intCast(best_stride), .little);
+    @memcpy(payload[2..], comp);
+    return payload;
+}
+
 /// Pick the cheapest reversible representation for a file the translator routed
 /// to fallback: STORE (raw), plain compression, per-block math, or a filtered
 /// stream. Returns the chosen comp_type and the bytes to append (`payload` is
@@ -1098,6 +1155,15 @@ fn chooseFallbackRep(data: []const u8, effort: Effort, alloc: std.mem.Allocator)
         } else alloc.free(payload);
     }
 
+    if (try bestColumnarBlock(data, effort, alloc)) |payload| {
+        if (payload.len < best_len) {
+            if (best_payload) |b| alloc.free(b);
+            best_type = .math_columnar;
+            best_len = payload.len;
+            best_payload = payload;
+        } else alloc.free(payload);
+    }
+
     return .{ .comp_type = best_type, .payload = best_payload };
 }
 
@@ -1107,6 +1173,7 @@ fn fallbackLabel(ct: container.CompressionType) []const u8 {
         .fallback_stream => "FALLBACK",
         .math_blocks => "BLOCKS  ",
         .math_filtered => "FILTERED",
+        .math_columnar => "COLUMNAR",
         else => "STORE   ",
     };
 }
@@ -1832,6 +1899,62 @@ test "math_blocks: mixed analytic/literal file round-trips through the container
     try std.testing.expectEqualSlices(u8, data, back);
 }
 
+// MATH_COLUMNAR: a record-array file (here, fake 16-byte vertices) is detected,
+// transposed AoS->SoA, compressed, and reconstructs bit-perfectly through the
+// container — and the columnar form must be smaller than plain compression.
+test "math_columnar: record-array file routes columnar and round-trips" {
+    const a = std.testing.allocator;
+    const math_gen = @import("math_gen.zig");
+    const stride = 16;
+    const recs = 6000;
+    const data = try a.alloc(u8, recs * stride);
+    defer a.free(data);
+    // Each record: a few slowly-varying fields + one noisy field — the shape
+    // where AoS->SoA wins (fields correlate across records, neighbors don't).
+    var rng = math_gen.XorShift32.init(0xBEEF);
+    for (0..recs) |r| {
+        const base = r * stride;
+        std.mem.writeInt(u32, data[base..][0..4], @intCast(r), .little);       // counter
+        std.mem.writeInt(u32, data[base + 4 ..][0..4], @intCast(r * 3), .little); // counter
+        std.mem.writeInt(u32, data[base + 8 ..][0..4], @intCast(1000 + r / 2), .little);
+        std.mem.writeInt(u32, data[base + 12 ..][0..4], rng.next(), .little);   // noise
+    }
+
+    const effort = Effort.fromTier(1);
+    const colp = (try bestColumnarBlock(data, effort, a)) orelse return error.TestUnexpectedResult;
+    defer a.free(colp);
+    const plain = try effort.comp.compress(data, a);
+    defer a.free(plain);
+    try std.testing.expect(colp.len < plain.len); // transpose genuinely helps
+
+    // Round-trip through the container.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cb = try container.StreamingBuilder.init(a);
+    defer cb.deinit();
+    var fat = container.FatEntry{
+        .comp_type = .math_columnar,
+        .data_offset = 0,
+        .original_size = data.len,
+        .compressed_size = colp.len,
+        .checksum = container.fnv1a(data),
+        .codec = effort.comp.codec,
+    };
+    try fat.setPath("verts.bin");
+    try cb.appendBlock(fat, colp);
+    const arc_file = try tmp.dir.createFile("c.math", .{ .read = true });
+    defer arc_file.close();
+    try cb.finish(arc_file);
+    try arc_file.seekTo(0);
+    const arc = try arc_file.readToEndAlloc(a, 1 << 24);
+    defer a.free(arc);
+    var rdr = try container.Reader.parse(arc, a);
+    defer rdr.deinit();
+    const back = try rdr.extract("verts.bin", a);
+    defer a.free(back);
+    try std.testing.expectEqualSlices(u8, data, back);
+}
+
 // ---------------------------------------------------------------------------
 // Auto-Sensing Hybrid Pack (Parallel + Solid grouping)
 // ---------------------------------------------------------------------------
@@ -2007,7 +2130,7 @@ fn packFileAutoParallel(ctx: *PackCtxAuto, rel_path: []u8) !void {
     const orig_size = data.len;
 
     const canvas = canvasForLen(data.len);
-    var prog_info = translator.TranslateProgress{ .cancel_flag = ctx.cancel_flag, .max_iters = ctx.effort.math_iters };
+    var prog_info = translator.TranslateProgress{ .cancel_flag = ctx.cancel_flag, .max_iters = if (data.len > 256 * 1024) 0 else ctx.effort.math_iters };
     const result = translator.translate(data, canvas.w, canvas.h, alloc, &prog_info) catch translator.TranslateResult{ .fallback = .{ .reason = .high_entropy, .entropy = 100.0 } };
 
     var line_buf: [std.fs.max_path_bytes + 128]u8 = undefined;
@@ -2299,7 +2422,7 @@ fn packFileSolidParallel(ctx: *PackCtxAuto, rel_path: []u8) !void {
 
     // Math translation runs outside the lock.
     const canvas = canvasForLen(data.len);
-    var prog_info = translator.TranslateProgress{ .cancel_flag = ctx.cancel_flag, .max_iters = ctx.effort.math_iters };
+    var prog_info = translator.TranslateProgress{ .cancel_flag = ctx.cancel_flag, .max_iters = if (data.len > 256 * 1024) 0 else ctx.effort.math_iters };
     const result = translator.translate(data, canvas.w, canvas.h, alloc, &prog_info) catch
         translator.TranslateResult{ .fallback = .{ .reason = .high_entropy, .entropy = 100.0 } };
 
@@ -2685,10 +2808,10 @@ pub fn packTarFullAbi(
     // Everything else stays in the solid tar, where cross-file context helps.
     // -----------------------------------------------------------------------
     const effort = Effort.fromTier(effort_tier);
-    // Lifted entries use the strongest codec — these are the files where the
-    // extra effort is concentrated and most worth it.
-    var lift_comp = effort.comp;
-    if (effort_tier == 2) lift_comp.zstd_level = 22;
+    // Full mode runs the LZMA/xz backend (stronger model than zstd). Lifted
+    // executables ride this too — the files where the extra effort is most
+    // worth it.
+    const lift_comp = container.Compressor.lzmaFromTier(effort_tier);
 
     const Lifted = struct {
         comp_type: container.CompressionType,
@@ -2737,7 +2860,10 @@ pub fn packTarFullAbi(
                 // (a) Whole-file math program (only for canvas-sized inputs).
                 if (size <= @as(u64, vm.MAX_DIM) * vm.MAX_DIM and size >= 64) {
                     const canvas = canvasForLen(data.len);
-                    var pi = translator.TranslateProgress{ .cancel_flag = cancel, .max_iters = eff.math_iters };
+                    // Noise search can only match small procedural textures; cap
+                    // budget to 0 above 256KB so it never grinds large files.
+                    const iters: u32 = if (data.len > 256 * 1024) 0 else eff.math_iters;
+                    var pi = translator.TranslateProgress{ .cancel_flag = cancel, .max_iters = iters };
                     if (translator.translate(data, canvas.w, canvas.h, aa, &pi)) |res| {
                         switch (res) {
                             .math_bytecode => |code| {
@@ -2830,16 +2956,12 @@ pub fn packTarFullAbi(
 
     if (cancel_flag.load(.monotonic) == 1) return error.Cancelled;
     progress_ptr.store(0.55, .monotonic);
-    setTickerRaw(ticker_ptr, "Mathpressing the tar (solid zstd)…");
+    setTickerRaw(ticker_ptr, "Mathpressing the tar (solid LZMA/xz)…");
 
-    // Phase 2 — stream the tar through the container's zstd codec.
+    // Phase 2 — compress the tar through the LZMA/xz backend.
     var cb = try container.StreamingBuilder.init(root);
     cb.flags = container.FLAG_FULL_TAR;
-    cb.comp = Effort.fromTier(effort_tier).comp;
-    // Max tier: one multithreaded stream can afford zstd's ultra ceiling
-    // (level 22) — unlike the per-file pack paths, where 22 would multiply
-    // across thousands of small calls for no cross-file gain.
-    if (effort_tier == 2) cb.comp.zstd_level = 22;
+    cb.comp = container.Compressor.lzmaFromTier(effort_tier);
     defer cb.deinit();
 
     // Lifted entries first (tiny programs + filtered executables), then the
@@ -2867,7 +2989,45 @@ pub fn packTarFullAbi(
     const tf = try std.fs.cwd().openFile(tmp_tar, .{});
     defer tf.close();
     const tsize = try tf.getEndPos();
-    _ = try cb.addZstdStreamingFile("archive.tar", tf, tsize);
+
+    // LZMA is one-shot (whole tar in RAM). Full-mode unpack already loads the
+    // whole tar in memory, so this matches the existing profile — but cap it so
+    // an enormous selection can't blow up RAM; above the cap, fall back to the
+    // streaming zstd path (its FAT codec byte records zstd, so decode is correct).
+    const LZMA_TAR_CAP: u64 = 3 * 1024 * 1024 * 1024;
+    if (tsize <= LZMA_TAR_CAP) {
+        const tar_data = try tf.readToEndAlloc(root, @intCast(tsize));
+        defer root.free(tar_data);
+        const csum = container.fnv1a(tar_data);
+        const comp = try container.lzmaCompress(tar_data, root, container.lzmaPreset(effort_tier));
+        defer root.free(comp);
+        // STORE guard: never let the wrapper inflate the tar.
+        if (comp.len < tar_data.len) {
+            var fat = container.FatEntry{
+                .comp_type = .fallback_stream,
+                .data_offset = 0,
+                .original_size = tsize,
+                .compressed_size = comp.len,
+                .checksum = csum,
+                .codec = .lzma,
+            };
+            try fat.setPath("archive.tar");
+            try cb.appendBlock(fat, comp);
+        } else {
+            var fat = container.FatEntry{
+                .comp_type = .store,
+                .data_offset = 0,
+                .original_size = tsize,
+                .compressed_size = tsize,
+                .checksum = csum,
+                .codec = .lzma,
+            };
+            try fat.setPath("archive.tar");
+            try cb.appendBlock(fat, tar_data);
+        }
+    } else {
+        _ = try cb.addZstdStreamingFile("archive.tar", tf, tsize);
+    }
 
     const out_file = try std.fs.cwd().createFile(out_path, .{});
     defer out_file.close();

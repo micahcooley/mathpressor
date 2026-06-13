@@ -45,6 +45,7 @@ When you pack a directory, Mathpressor automatically routes each file:
 | `MATH_RESIDUAL` | `0x04` | ≥70% match found | program + gzip'd delta |
 | `MATH_BLOCKS` | `0x07` | Pages part-equation, part-data | per-block descriptors + literal stream |
 | `MATH_FILTERED` | `0x08` | Reversible transform helps the codec | filter id + compressed filtered stream |
+| `MATH_COLUMNAR` | `0x09` | Record array (vertex/float tables) | AoS→SoA transpose + compressed |
 
 All four routes reconstruct to bit-identical original bytes. To the caller, they are invisible.
 
@@ -275,25 +276,32 @@ zig build run                      # synthesis demo (96×96 ASCII preview)
 
 Full mode trades per-file random access for the best ratio on file trees: the
 selection is written as one solid uncompressed tar (`std.tar.writer` — pure
-Zig, no system tools), then the whole stream is zstd-compressed into the
-`.math` container at the effort tier (`FLAG_FULL_TAR`). The tar is ordered by
-(extension, path) so similar files sit adjacent in the stream, and the codec
-runs with long-distance matching over a 128 MB window — together these beat a
-stock `tar | zstd -19 -T0` on size at every tier measured, while keeping the
+Zig, no system tools), then the whole stream is compressed into the `.math`
+container at the effort tier (`FLAG_FULL_TAR`). The tar is ordered by
+(extension, path) so similar files sit adjacent in the stream, keeping the
 `.math` header, FAT checksum, and GUI integration. Unpack detects the flag and
 expands the inner tar with `std.tar.pipeToFileSystem`, preserving symlinks and
-executable bits. Effort tiers map to zstd 3 / 12 / 22 (multithreaded).
+executable bits.
+
+The full-mode backend is **LZMA/xz** (`liblzma`, the same kind of system C
+dependency already used for libzstd), at preset 6 / 6 / 9-extreme by tier —
+a stronger entropy model than zstd (range coder + adaptive bit-contexts +
+match model). On real Steam binaries this turns the one case that used to lose
+to xz into a win: `linux64` (47 MB) packs to **10.84 MB vs 11.31 MB for stock
+`tar | xz -9e`** (and 12.81 MB for `tar | zstd -19`). Only `xz -9e --x86` —
+xz's own x86 filter, which the user must know to enable — edges it out, by ~2%.
 
 Before the tar is built, a **parallel math pre-pass** runs the translator over
 every file: anything expressible as a bit-perfect program (sparse/zeroed files,
 byte ramps, tiled patterns — and at Max, procedural noise) is lifted out of the
-tar into a `MATH_BYTECODE` entry, so full mode genuinely combines mathematical
-synthesis with solid traditional compression. A real Chrome profile's 4 MB
-zeroed metrics file becomes an **8-byte program** (524,288×). A program is only
-accepted when it is strictly smaller than the file — the math route must earn
-its place. The iterative noise search runs at Max only; benchmarked across
-real corpora it matches nothing the analytic detectors miss, while the
-detectors are O(n) and effectively free at every tier.
+tar into a `MATH_BYTECODE` entry, and x86 executables are lifted out as
+individual BCJ-filtered LZMA entries — so full mode genuinely combines
+mathematical synthesis and reversible transforms with solid traditional
+compression. A real Chrome profile's 4 MB zeroed metrics file becomes an
+**8-byte program** (524,288×). A program is only accepted when it is strictly
+smaller than the file — the math route must earn its place. The iterative noise
+search runs at Max only; benchmarked across real corpora it matches nothing the
+analytic detectors miss, while the detectors are O(n) and effectively free.
 
 ### Steam folder real-world test
 
