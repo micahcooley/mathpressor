@@ -43,6 +43,18 @@ pub const Opcode = enum(u8) {
     /// 0x0B — u8 src_slot, u8 alpha.
     /// Alpha-blend: cur = cur*(255−alpha)/255 + src*alpha/255.
     mix = 0x0B,
+    /// 0x0C — u8 dst, u16 w, u16 h, u8 value.
+    /// Fill slot `dst` with a constant byte; makes it current. Matches real-
+    /// world padding/sparse sections (zero pages, 0xFF flash images).
+    const_fill = 0x0C,
+    /// 0x0D — u8 dst, u16 w, u16 h, u8 start, u8 step.
+    /// Linear byte ramp over the flat buffer: buf[i] = start + step·i (mod 256).
+    /// Matches lookup tables and index ramps common in binary formats.
+    ramp = 0x0D,
+    /// 0x0E — u8 dst, u16 w, u16 h, u8 plen, then plen literal bytes.
+    /// Tile a short literal pattern over the flat buffer: buf[i] = pat[i % plen].
+    /// Matches repeated structs / fixed-stride records.
+    repeat = 0x0E,
     /// 0xFF — no payload. Ends execution and locks the current buffer.
     halt = 0xFF,
     _,
@@ -162,6 +174,36 @@ pub const Vm = struct {
                     const alpha = try readU8(code, &ip);
                     try self.opMix(src, alpha);
                 },
+                .const_fill => {
+                    const dst = try readU8(code, &ip);
+                    const w = try readU16(code, &ip);
+                    const h = try readU16(code, &ip);
+                    const value = try readU8(code, &ip);
+                    const buf = try self.initCanvasSlot(dst, w, h);
+                    @memset(buf, value);
+                },
+                .ramp => {
+                    const dst = try readU8(code, &ip);
+                    const w = try readU16(code, &ip);
+                    const h = try readU16(code, &ip);
+                    const start = try readU8(code, &ip);
+                    const step = try readU8(code, &ip);
+                    const buf = try self.initCanvasSlot(dst, w, h);
+                    // (step·i) mod 256 == (step ·% (i mod 256)) — u8 wrap is exact.
+                    for (buf, 0..) |*p, i| p.* = start +% (step *% @as(u8, @truncate(i)));
+                },
+                .repeat => {
+                    const dst = try readU8(code, &ip);
+                    const w = try readU16(code, &ip);
+                    const h = try readU16(code, &ip);
+                    const plen = try readU8(code, &ip);
+                    if (plen == 0) return VmError.InvalidDimensions;
+                    if (ip + plen > code.len) return VmError.UnexpectedEnd;
+                    const pat = code[ip..][0..plen];
+                    ip += plen;
+                    const buf = try self.initCanvasSlot(dst, w, h);
+                    for (buf, 0..) |*p, i| p.* = pat[i % plen];
+                },
                 .halt => {
                     self.halted = true;
                     return self.curBuf();
@@ -172,7 +214,9 @@ pub const Vm = struct {
         return VmError.NoOutput;
     }
 
-    fn opIntNoise(self: *Vm, dst: u8, w: u16, h: u16, freq: u8) VmError!void {
+    /// Shared canvas-establishing prologue for buffer-producing ops: validates
+    /// dims, locks the canvas size, allocates the slot, and selects it.
+    fn initCanvasSlot(self: *Vm, dst: u8, w: u16, h: u16) VmError![]u8 {
         if (dst >= SLOT_COUNT) return VmError.SlotOutOfRange;
         if (w == 0 or h == 0 or w > MAX_DIM or h > MAX_DIM) return VmError.InvalidDimensions;
         if (self.width == 0) {
@@ -182,9 +226,14 @@ pub const Vm = struct {
             return VmError.DimensionMismatch;
         }
         const buf = try self.ensureSlot(dst);
+        self.cur = dst;
+        return buf;
+    }
+
+    fn opIntNoise(self: *Vm, dst: u8, w: u16, h: u16, freq: u8) VmError!void {
+        const buf = try self.initCanvasSlot(dst, w, h);
         const noise_seed = self.prng.next();
         math_gen.fillFractalNoise(buf, self.width, self.height, noise_seed, freq);
-        self.cur = dst;
     }
 
     fn opBlendMult(self: *Vm, src: u8) VmError!void {
@@ -348,6 +397,30 @@ pub const Builder = struct {
         try self.list.append(src_slot);
         try self.list.append(alpha);
     }
+    pub fn constFill(self: *Builder, dst: u8, w: u16, h: u16, value: u8) !void {
+        try self.list.append(@intFromEnum(Opcode.const_fill));
+        try self.list.append(dst);
+        try self.appendInt(u16, w);
+        try self.appendInt(u16, h);
+        try self.list.append(value);
+    }
+    pub fn ramp(self: *Builder, dst: u8, w: u16, h: u16, start: u8, step: u8) !void {
+        try self.list.append(@intFromEnum(Opcode.ramp));
+        try self.list.append(dst);
+        try self.appendInt(u16, w);
+        try self.appendInt(u16, h);
+        try self.list.append(start);
+        try self.list.append(step);
+    }
+    pub fn repeat(self: *Builder, dst: u8, w: u16, h: u16, pattern: []const u8) !void {
+        std.debug.assert(pattern.len >= 1 and pattern.len <= 255);
+        try self.list.append(@intFromEnum(Opcode.repeat));
+        try self.list.append(dst);
+        try self.appendInt(u16, w);
+        try self.appendInt(u16, h);
+        try self.list.append(@intCast(pattern.len));
+        try self.list.appendSlice(pattern);
+    }
     pub fn halt(self: *Builder) !void {
         try self.list.append(@intFromEnum(Opcode.halt));
     }
@@ -510,6 +583,45 @@ test "errors: missing HALT, bad opcode, truncation, slot range" {
         try b.halt();
         var m = Vm.init(arena.allocator());
         try testing.expectError(VmError.SlotOutOfRange, m.execute(b.bytes()));
+    }
+}
+
+test "OP_CONST_FILL, OP_RAMP, OP_REPEAT synthesize exactly" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    {
+        var b = Builder.init(testing.allocator);
+        defer b.deinit();
+        try b.constFill(0, 16, 16, 0xAB);
+        try b.halt();
+        const px = try buildAndRun(&arena, b.bytes());
+        for (px) |p| try testing.expectEqual(@as(u8, 0xAB), p);
+    }
+    {
+        var b = Builder.init(testing.allocator);
+        defer b.deinit();
+        try b.ramp(0, 32, 32, 5, 3);
+        try b.halt();
+        const px = try buildAndRun(&arena, b.bytes());
+        for (px, 0..) |p, i| {
+            const expect: u8 = 5 +% (3 *% @as(u8, @truncate(i)));
+            try testing.expectEqual(expect, p);
+        }
+    }
+    {
+        var b = Builder.init(testing.allocator);
+        defer b.deinit();
+        const pat = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0x01 };
+        try b.repeat(0, 30, 30, &pat);
+        try b.halt();
+        const px = try buildAndRun(&arena, b.bytes());
+        for (px, 0..) |p, i| try testing.expectEqual(pat[i % pat.len], p);
+    }
+    // Truncated REPEAT payload errors instead of reading past the program.
+    {
+        var m = Vm.init(arena.allocator());
+        const code = [_]u8{ 0x0E, 0, 4, 0, 4, 0, 9, 1, 2 }; // plen=9, only 2 bytes
+        try testing.expectError(VmError.UnexpectedEnd, m.execute(&code));
     }
 }
 

@@ -1,0 +1,1082 @@
+// ui/appwindow.slint — Mathpressor GUI
+//
+// Clean, professional, high-readability UI with light + dark themes.
+// Default theme follows the system; if the system scheme is unknown it
+// falls back to dark. One restrained blue accent, muted semantic route colors.
+
+import { ScrollView, Palette, CheckBox } from "std-widgets.slint";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Theme — light/dark palette switched by a single `dark` flag.
+// Default: system scheme, falling back to dark when unknown.
+// ─────────────────────────────────────────────────────────────────────────────
+export global Theme {
+    in-out property <bool> dark: Palette.color-scheme != ColorScheme.light;
+
+    out property <color> bg:            dark ? #0f1115 : #f4f5f7;
+    out property <color> surface:       dark ? #171a21 : #ffffff;
+    out property <color> surface-alt:   dark ? #1d212b : #fafbfc;
+    out property <color> border:        dark ? #2a2f3a : #e5e7eb;
+    out property <color> border-strong: dark ? #3a4150 : #d1d5db;
+
+    out property <color> text:          dark ? #e6e8ec : #111827;
+    out property <color> text-2:        dark ? #9aa1ad : #4b5563;
+    out property <color> text-muted:    dark ? #6b7280 : #9ca3af;
+    out property <color> header:        dark ? #7c8493 : #6b7280;
+
+    out property <color> accent:        dark ? #3b82f6 : #2563eb;
+    out property <color> accent-hover:  dark ? #60a5fa : #1d4ed8;
+    out property <color> accent-press:  dark ? #2563eb : #1e3a8a;
+    out property <color> accent-soft:   dark ? #16233a : #eff6ff;
+    out property <color> accent-soft-bd:dark ? #2f456e : #bfdbfe;
+
+    out property <color> danger:        dark ? #ef4444 : #dc2626;
+    out property <color> danger-soft:   dark ? #2a1518 : #fef2f2;
+    out property <color> danger-soft-bd:dark ? #5a2a2e : #fca5a5;
+
+    out property <color> row-hover:     dark ? #1f2430 : #f3f4f6;
+    out property <color> on-accent:     #ffffff;
+
+    // Semantic route colors (text + border on a neutral chip)
+    out property <color> r-math:     dark ? #60a5fa : #1d4ed8;
+    out property <color> r-residual: dark ? #22d3ee : #0e7490;
+    out property <color> r-solid:    dark ? #fbbf24 : #b45309;
+    out property <color> r-fallback: dark ? #4ade80 : #15803d;
+    out property <color> r-store:    dark ? #f87171 : #b91c1c;
+    out property <color> r-default:  dark ? #9ca3af : #4b5563;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MpButton — variants: "default" | "primary" | "danger"
+// ─────────────────────────────────────────────────────────────────────────────
+component MpButton {
+    in property <string> label;
+    in property <bool>   enabled: true;
+    in property <string> variant: "default";
+    in property <length> min-w: 64px;
+    callback clicked;
+
+    height: 30px;
+    min-width: root.min-w;
+
+    ta := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+        mouse-cursor: root.enabled ? pointer : default;
+    }
+
+    Rectangle {
+        border-radius: 6px;
+        border-width: 1px;
+        background:
+            !root.enabled             ? (root.variant == "primary" ? Theme.border : Theme.surface) :
+            root.variant == "primary" ? (ta.pressed ? Theme.accent-press : ta.has-hover ? Theme.accent-hover : Theme.accent) :
+            root.variant == "danger"  ? (ta.pressed || ta.has-hover ? Theme.danger-soft : Theme.surface) :
+                                        (ta.pressed || ta.has-hover ? Theme.surface-alt : Theme.surface);
+        border-color:
+            !root.enabled             ? Theme.border :
+            root.variant == "primary" ? (ta.pressed ? Theme.accent-press : ta.has-hover ? Theme.accent-hover : Theme.accent) :
+            root.variant == "danger"  ? (ta.has-hover ? Theme.danger : Theme.danger-soft-bd) :
+                                        Theme.border-strong;
+
+        HorizontalLayout {
+            padding-left: 14px; padding-right: 14px;
+            alignment: center;
+            Text {
+                text: root.label;
+                font-size: 13px;
+                font-weight: root.variant == "primary" ? 600 : 500;
+                horizontal-alignment: center; vertical-alignment: center;
+                color:
+                    !root.enabled             ? Theme.text-muted :
+                    root.variant == "primary" ? Theme.on-accent :
+                    root.variant == "danger"  ? Theme.danger :
+                                                Theme.text;
+            }
+        }
+    }
+}
+
+component MpSep {
+    width: 13px;
+    Rectangle { x: 6px; y: 5px; width: 1px; height: 20px; background: Theme.border; }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MpMenuItem — one row of a context / dropdown menu
+// ─────────────────────────────────────────────────────────────────────────────
+component MpMenuItem {
+    in property <string> label;
+    in property <string> shortcut: "";
+    in property <bool>   danger: false;
+    in property <bool>   checked: false;
+    callback clicked;
+    height: 28px;
+    Rectangle {
+        border-radius: 4px;
+        background: ta.has-hover ? (root.danger ? Theme.danger-soft : Theme.row-hover) : transparent;
+        ta := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+        HorizontalLayout {
+            padding-left: 10px; padding-right: 12px; spacing: 18px;
+            Text {
+                text: (root.checked ? "✓  " : "") + root.label;
+                color: root.danger ? Theme.danger : Theme.text;
+                font-size: 12px; vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            Text {
+                text: root.shortcut;
+                color: Theme.text-muted;
+                font-size: 11px; vertical-alignment: center;
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MpSortDropdown — custom theme-aware dropdown
+// ─────────────────────────────────────────────────────────────────────────────
+component MpSortDropdown {
+    in property <[string]> model;
+    // Display value — driven by the parent (so it reflects external state and
+    // never resets when this component is recreated). The dropdown does not
+    // mutate it; it only reports selection via `selected`.
+    in property <string> current-value;
+    callback selected(string);
+
+    width: 160px;
+    height: 30px;
+
+    Rectangle {
+        border-radius: 6px;
+        border-width: 1px;
+        border-color: ta.has-hover ? Theme.border-strong : Theme.border;
+        background: ta.pressed || ta.has-hover ? Theme.surface-alt : Theme.surface;
+
+        HorizontalLayout {
+            padding-left: 10px; padding-right: 10px;
+            Text {
+                text: root.current-value;
+                font-size: 13px;
+                color: Theme.text;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            Text {
+                text: "▼";
+                font-size: 10px;
+                color: Theme.text-muted;
+                vertical-alignment: center;
+            }
+        }
+
+        ta := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { popup.show(); }
+        }
+    }
+
+    popup := PopupWindow {
+        x: 0; y: root.height + 4px;
+        width: root.width;
+        Rectangle {
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: Theme.border;
+            background: Theme.surface;
+            drop-shadow-color: Theme.dark ? #00000066 : #00000022;
+            drop-shadow-blur: 8px;
+            drop-shadow-offset-y: 4px;
+
+            VerticalLayout {
+                padding: 4px;
+                for item in root.model : Rectangle {
+                    height: 28px;
+                    border-radius: 4px;
+                    background: item-ta.has-hover ? Theme.row-hover : transparent;
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        Text {
+                            text: item;
+                            font-size: 13px;
+                            color: item == root.current-value ? Theme.accent : Theme.text;
+                            vertical-alignment: center;
+                        }
+                    }
+                    item-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.selected(item); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+export struct FileEntry {
+    name: string,
+    size_str: string,
+    modified_str: string,
+    route_tag: string,
+    ratio_str: string,
+    is_directory: bool,
+    full_rel_path: string,
+    checked: bool,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+export component AppWindow inherits Window {
+    title: "Mathpressor — Pack Utility";
+    min-width: 1100px;
+    min-height: 650px;
+    preferred-width: 1400px;
+    preferred-height: 800px;
+    background: Theme.bg;
+
+    // ── Properties ────────────────────────────────────────────────────────
+    in-out property <string>      current-path:          "/";
+    in     property <bool>        is-processing:         false;
+    in     property <bool>        is-paused:             false;
+    in     property <bool>        cancel-requested:      false;
+    in     property <string>      status-text:           "Ready";
+    in     property <[FileEntry]> file-entries:          [];
+    in-out property <int>         selected-folder-count: 0;
+    in-out property <int>         selected-regular-count: 0;
+    in-out property <int>         selected-math-count: 0;
+    // True only when every visible row is checked — drives the "Check All" box
+    // so it doesn't light up just because one item is individually selected.
+    in-out property <bool>        all-checked: false;
+    // Default packing is smart auto. Full mode (optional) builds a solid TAR
+    // then mathpresses it (zstd over one stream — best ratio on file trees).
+    in-out property <bool>        solid-archive:         false;
+    // Mathpressor effort: 0=Fast, 1=Balanced, 2=Max. Scales codec + math search,
+    // and (full mode) the zstd level applied to the solid tar.
+    in-out property <int>         effort-tier:           1;
+    in     property <bool>        has-math-selected:     false;
+
+    in-out property <bool>   show-opcode-panel:  false;
+    in     property <string> opcode-panel-title: "Blueprint Viewer";
+    in     property <string> opcode-text:        "";
+
+    in property <string> active-file-ticker:  "";
+    in property <float>  progress-percentage: 0.0;
+    in property <string> time-remaining:      "";
+
+    in property <bool> can-go-back:    false;
+    in property <bool> can-go-forward: false;
+
+    in-out property <bool>  show-context-menu: false;
+    in-out property <float> context-menu-x:    0.0;
+    in-out property <float> context-menu-y:    0.0;
+    in-out property <bool>  is-math-file-context: false;
+
+    // ── File-operation state ───────────────────────────────────────────────
+    in-out property <bool>   show-name-dialog: false;
+    in     property <string> name-dialog-title: "New folder";
+    in-out property <string> name-dialog-text:  "";
+    in     property <bool>   can-paste: false;      // clipboard has items
+    callback new-folder();
+    callback new-file();
+    callback paste-items();
+    callback name-dialog-ok();
+    callback name-dialog-cancel();
+
+    // ── Tabs & windows ─────────────────────────────────────────────────────
+    in property <[string]> tab-titles: [];
+    in-out property <int>  active-tab: 0;
+    callback tab-selected(int);
+    callback tab-closed(int);
+    callback tab-rename-requested(int);  // double-click a tab to rename it
+    callback new-tab();
+    callback new-os-window();   // open a real separate OS window
+    // key (lowercase char / digit) + whether Shift was held.
+    callback shortcut(string, bool);
+
+    // ── Search ─────────────────────────────────────────────────────────────
+    in-out property <string> search-text: "";
+    callback search-changed(string);
+
+    // ── Callbacks ─────────────────────────────────────────────────────────
+    callback trigger-pack();
+    callback pack-selected();
+    callback trigger-unpack();
+    callback trigger-test-integrity();
+    callback trigger-cancel();
+    callback toggle-pause();
+    callback navigate-up();
+    callback navigate-back();
+    callback navigate-forward();
+    callback path-changed(string);
+    callback file-double-clicked(string);
+    callback file-right-clicked(string, float, float);
+    callback browse-folder();
+    callback close-opcode-panel();
+    callback context-menu-action(int);
+    callback toggle-entry-check(int);
+    callback shift-click-entry(int);
+    callback select-all-folders();
+    callback clear-selection();
+    callback trigger-refresh();
+    callback sort-changed(string);
+    in-out property <bool> folders-first: true;
+    callback folders-first-changed(bool);
+    callback solid-archive-changed(bool);
+
+    // ── Menu bar ───────────────────────────────────────────────────────────
+    in-out property <int>    open-menu: -1;   // -1 none, 0 File, 1 View, 2 Sort
+    in-out property <string> current-sort: "Sort: Name (A-Z)";
+    callback quit();
+
+    // Behind everything: a click on any inert area (not a button/row/field)
+    // ends path editing and restores keyboard focus to the shortcut handler.
+    TouchArea { clicked => { focus-sink.focus(); } }
+
+    // The whole content lives inside this FocusScope so keyboard shortcuts work
+    // globally: keys from a focused child (search/path field) that the child
+    // doesn't consume bubble up to here. Ctrl+digit = tab, Ctrl+Shift+digit =
+    // window, Ctrl+T/W/N = new tab / close tab / new window, Ctrl+F = search.
+    focus-sink := FocusScope {
+        width: 100%; height: 100%;
+        init => { self.focus(); }
+        key-pressed(event) => {
+            if (event.modifiers.control) {
+                if (event.text == "f") { search-input.focus(); return accept; }
+                if (event.text == "t") { root.new-tab(); return accept; }
+                if (event.text == "n") { root.new-os-window(); return accept; }
+                // Everything else with Ctrl (w, digits, and Shift+digit symbols
+                // like @ # $) goes to Rust, which maps it. Text edits keep their
+                // own Ctrl+C/V/A/X because the focused field consumes those before
+                // they bubble here.
+                root.shortcut(event.text, event.modifiers.shift);
+                return accept;
+            }
+            return reject;
+        }
+    VerticalLayout {
+        padding: 0px; spacing: 0px;
+
+        // ── 1. MENU BAR (File / View / Sort with dropdowns) ───────────────
+        Rectangle {
+            height: 30px;
+            background: Theme.surface;
+            HorizontalLayout {
+                padding-left: 6px; spacing: 0px; alignment: start;
+                for m[i] in ["File", "View", "Sort"] : Rectangle {
+                    width: 52px; height: 30px;
+                    background: root.open-menu == i ? Theme.row-hover : (mta.has-hover ? Theme.row-hover : transparent);
+                    mta := TouchArea {
+                        mouse-cursor: pointer;
+                        // Click toggles; hovering while any menu is open switches to this one.
+                        clicked => { root.open-menu = root.open-menu == i ? -1 : i; }
+                        changed has-hover => { if (self.has-hover && root.open-menu != -1) { root.open-menu = i; } }
+                    }
+                    Text {
+                        text: m; color: Theme.text; font-size: 13px;
+                        horizontal-alignment: center; vertical-alignment: center;
+                    }
+                }
+                Rectangle { horizontal-stretch: 1; }
+            }
+            Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
+        }
+
+        // ── 1.5 TAB STRIP (Explorer-style) ────────────────────────────────
+        Rectangle {
+            height: 34px; background: Theme.surface-alt;
+            HorizontalLayout {
+                padding-left: 8px; padding-top: 4px; spacing: 4px; alignment: start;
+                for title[i] in root.tab-titles : Rectangle {
+                    width: 156px; height: 28px;
+                    border-radius: 6px;
+                    background: i == root.active-tab ? Theme.surface : transparent;
+                    border-width: 1px;
+                    border-color: i == root.active-tab ? Theme.border-strong : transparent;
+                    tab-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.tab-selected(i); }
+                        double-clicked => { root.tab-rename-requested(i); }
+                    }
+                    HorizontalLayout {
+                        padding-left: 10px; padding-right: 6px; spacing: 4px;
+                        Text {
+                            text: title;
+                            color: i == root.active-tab ? Theme.text : Theme.text-2;
+                            font-size: 12px; font-weight: i == root.active-tab ? 600 : 400;
+                            vertical-alignment: center; horizontal-stretch: 1;
+                            overflow: elide;
+                        }
+                        // Close button (hidden when only one tab remains).
+                        if root.tab-titles.length > 1 : Rectangle {
+                            width: 18px; height: 18px; y: 5px;
+                            border-radius: 4px;
+                            background: close-ta.has-hover ? Theme.danger-soft : transparent;
+                            close-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.tab-closed(i); }
+                            }
+                            Text {
+                                text: "✕"; font-size: 10px;
+                                color: close-ta.has-hover ? Theme.danger : Theme.text-muted;
+                                horizontal-alignment: center; vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+                // New-tab button.
+                Rectangle {
+                    width: 28px; height: 28px; border-radius: 6px;
+                    background: newtab-ta.has-hover ? Theme.row-hover : transparent;
+                    newtab-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.new-tab(); }
+                    }
+                    Text { text: "+"; font-size: 17px; color: Theme.text-2;
+                           horizontal-alignment: center; vertical-alignment: center; }
+                }
+                Rectangle { horizontal-stretch: 1; }
+
+                // New OS window (a real separate window, like the File menu's).
+                Rectangle {
+                    width: 34px; height: 28px; border-radius: 6px;
+                    background: neww-ta.has-hover ? Theme.row-hover : transparent;
+                    neww-ta := TouchArea { mouse-cursor: pointer; clicked => { root.new-os-window(); } }
+                    Text { text: "⧉"; font-size: 15px; color: Theme.text-2;
+                           horizontal-alignment: center; vertical-alignment: center; }
+                }
+                Rectangle { width: 6px; }
+            }
+            Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
+        }
+
+        // ── 2. TOOLBAR ────────────────────────────────────────────────────
+        Rectangle {
+            height: 52px; background: Theme.surface;
+
+            if !root.is-processing : HorizontalLayout {
+                y: 8px; height: parent.height - 12px;
+                padding-left: 14px; padding-right: 14px;
+                spacing: 7px; alignment: center;
+
+                MpButton { label: "Pack Folder"; variant: "primary"; clicked => { root.trigger-pack(); } }
+                if root.selected-regular-count > 0 : MpButton {
+                    label: "Pack Selected (" + root.selected-regular-count + ")";
+                    variant: "primary";
+                    clicked => { root.pack-selected(); }
+                }
+                if root.selected-folder-count > 0 : MpButton {
+                    label: "Clear"; variant: "danger";
+                    clicked => { root.clear-selection(); }
+                }
+                MpSep {}
+                if root.selected-math-count > 0 : MpButton { 
+                    label: "Unpack Selected (.math) (" + root.selected-math-count + ")"; 
+                    clicked => { root.trigger-unpack(); } 
+                }
+                MpButton { label: "Test Integrity"; clicked => { root.trigger-test-integrity(); } }
+                if root.can-paste : MpButton { label: "Paste"; clicked => { root.paste-items(); } }
+                MpSep {}
+                MpButton { label: "Browse…"; clicked => { root.browse-folder(); } }
+                Rectangle { horizontal-stretch: 1; }
+                // ── Full mode toggle (optional; default is smart auto) ───────
+                Rectangle {
+                    height: 30px;
+                    solid-archive-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.solid-archive = !root.solid-archive;
+                            root.solid-archive-changed(root.solid-archive);
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            HorizontalLayout {
+                                spacing: 6px;
+                                Rectangle {
+                                    width: 16px; height: 16px;
+                                    border-radius: 4px; border-width: 1px;
+                                    border-color: root.solid-archive ? Theme.accent : Theme.border-strong;
+                                    background: root.solid-archive ? Theme.accent : Theme.surface;
+                                    if root.solid-archive : Text {
+                                        text: "✓"; font-size: 11px; color: Theme.on-accent;
+                                        horizontal-alignment: center; vertical-alignment: center;
+                                    }
+                                }
+                                Text {
+                                    text: "Full mode (TAR → MATH)";
+                                    color: Theme.text;
+                                    font-size: 13px; font-weight: 500;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+                }
+                // ── Mathpressor effort dropdown (always shown) ───────────────
+                Rectangle {
+                    height: 30px;
+                    HorizontalLayout {
+                        alignment: center;
+                        spacing: 6px;
+                        Text {
+                            text: "Mathpressor effort:";
+                            color: Theme.text-2;
+                            font-size: 12px; font-weight: 500;
+                            vertical-alignment: center;
+                        }
+                        MpSortDropdown {
+                            width: 120px;
+                            model: ["Fast", "Balanced", "Max"];
+                            // Reflects the persisted tier, so it never resets.
+                            current-value: root.effort-tier == 0 ? "Fast" : root.effort-tier == 2 ? "Max" : "Balanced";
+                            selected(v) => {
+                                root.effort-tier = v == "Fast" ? 0 : v == "Max" ? 2 : 1;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if root.is-processing : HorizontalLayout {
+                y: 8px; height: parent.height - 12px;
+                padding-left: 16px; padding-right: 14px;
+                spacing: 9px; alignment: center;
+                Text {
+                    text: root.is-paused ? "Paused" : "Compressing…";
+                    color: Theme.text-2; font-size: 13px; font-weight: 500;
+                    vertical-alignment: center;
+                }
+            }
+            Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
+        }
+
+        // ── 3. NAVIGATION BAR ─────────────────────────────────────────────
+        Rectangle {
+            height: 42px; background: Theme.surface-alt;
+            HorizontalLayout {
+                padding-left: 12px; padding-right: 12px; padding-top: 4px; padding-bottom: 4px;
+                spacing: 6px; alignment: center;
+
+                MpButton {
+                    label: "←"; min-w: 40px;
+                    enabled: root.can-go-back && !root.is-processing;
+                    clicked => { root.navigate-back(); }
+                }
+                MpButton {
+                    label: "→"; min-w: 40px;
+                    enabled: root.can-go-forward && !root.is-processing;
+                    clicked => { root.navigate-forward(); }
+                }
+                MpButton {
+                    label: "↑  Up"; enabled: !root.is-processing;
+                    clicked => { root.navigate-up(); }
+                }
+                MpButton {
+                    label: "⟳"; min-w: 40px; enabled: !root.is-processing;
+                    clicked => { root.trigger-refresh(); }
+                }
+
+                // Location field — a clearly bordered, focusable input.
+                Rectangle {
+                    horizontal-stretch: 1; height: 32px;
+                    background: Theme.surface;
+                    border-radius: 6px; border-width: 1px;
+                    border-color: pin.has-focus ? Theme.accent : Theme.border-strong;
+
+                    HorizontalLayout {
+                        padding-left: 10px; padding-right: 10px;
+                        pin := TextInput {
+                            text: root.current-path;
+                            horizontal-stretch: 1;
+                            font-size: 13px;
+                            color: Theme.text;
+                            selection-background-color: Theme.accent;
+                            single-line: true;
+                            vertical-alignment: center;
+                            // Enter applies the path AND leaves the field.
+                            accepted => { root.path-changed(self.text); focus-sink.focus(); }
+                        }
+                    }
+                }
+
+                // Search field — filters the current listing live (Ctrl+F).
+                Rectangle {
+                    width: 240px; height: 32px;
+                    background: Theme.surface;
+                    border-radius: 6px; border-width: 1px;
+                    border-color: search-input.has-focus ? Theme.accent : Theme.border-strong;
+                    HorizontalLayout {
+                        padding-left: 10px; padding-right: 8px; spacing: 6px;
+                        Text { text: "🔍"; font-size: 12px; color: Theme.text-muted; vertical-alignment: center; }
+                        search-input := TextInput {
+                            text <=> root.search-text;
+                            horizontal-stretch: 1;
+                            font-size: 13px; color: Theme.text;
+                            selection-background-color: Theme.accent;
+                            single-line: true; vertical-alignment: center;
+                            edited => { root.search-changed(self.text); }
+                            // Esc clears the filter and drops focus.
+                            key-pressed(e) => {
+                                if (e.text == Key.Escape) {
+                                    root.search-text = "";
+                                    root.search-changed("");
+                                    focus-sink.focus();
+                                    return accept;
+                                }
+                                return reject;
+                            }
+                        }
+                        if root.search-text != "" : Rectangle {
+                            width: 16px;
+                            clear-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.search-text = ""; root.search-changed(""); }
+                            }
+                            Text {
+                                text: "✕"; font-size: 11px; color: Theme.text-muted;
+                                horizontal-alignment: center; vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+            }
+            Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
+        }
+
+        // ── 4. COLUMN HEADER ──────────────────────────────────────────────
+        Rectangle {
+            height: 30px; background: Theme.surface-alt;
+            HorizontalLayout {
+                padding-left: 10px; padding-right: 12px;
+                Rectangle {
+                    width: 24px;
+                    hdr-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            // Pure "select all / clear all" — reflects only the
+                            // all-checked state, never a partial selection.
+                            if root.all-checked { root.clear-selection(); }
+                            else { root.select-all-folders(); }
+                        }
+                        Rectangle {
+                            x: 4px; y: 7px; width: 16px; height: 16px;
+                            border-radius: 4px; border-width: 1px;
+                            border-color: root.all-checked ? Theme.accent : Theme.border-strong;
+                            background: root.all-checked ? Theme.accent : Theme.surface;
+                            if root.all-checked : Text {
+                                text: "✓"; font-size: 11px; color: Theme.on-accent;
+                                horizontal-alignment: center; vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+                Text { text: "Check All";  width: 32%; font-size: 11px; font-weight: 600; color: Theme.header; vertical-alignment: center; }
+                Text { text: "Modified";   width: 16%; font-size: 11px; font-weight: 600; color: Theme.header; vertical-alignment: center; }
+                Text { text: "Size";       width: 14%; font-size: 11px; font-weight: 600; color: Theme.header; vertical-alignment: center; }
+                Text { text: "Route";      width: 20%; font-size: 11px; font-weight: 600; color: Theme.header; vertical-alignment: center; }
+                Text { text: "Saved";      width: 18%; font-size: 11px; font-weight: 600; color: Theme.header; vertical-alignment: center; }
+            }
+            Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
+        }
+
+        // ── 5. CONTENT AREA ───────────────────────────────────────────────
+        HorizontalLayout {
+            vertical-stretch: 1; spacing: 0px;
+
+            Rectangle {
+                horizontal-stretch: 1; background: Theme.surface;
+                ScrollView {
+                    width: parent.width; height: parent.height;
+                    VerticalLayout {
+                        alignment: start; spacing: 0px;
+
+                        for entry[idx] in root.file-entries : Rectangle {
+                            height: 30px;
+                            background: entry.checked
+                                ? Theme.accent-soft
+                                : mod(idx, 2) == 0 ? Theme.surface : Theme.surface-alt;
+
+                            ta := TouchArea {
+                                mouse-cursor: pointer;
+                                double-clicked => { root.file-double-clicked(entry.full-rel-path); }
+                                pointer-event(ev) => {
+                                    if (ev.button == PointerEventButton.right && ev.kind == PointerEventKind.down) {
+                                        root.file-right-clicked(
+                                            entry.full-rel-path,
+                                            (ta.absolute-position.x + ta.mouse-x) / 1px,
+                                            (ta.absolute-position.y + ta.mouse-y) / 1px);
+                                    }
+                                    if (ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down) {
+                                        focus-sink.focus();
+                                        if (ev.modifiers.shift) {
+                                            root.shift-click-entry(idx);
+                                        } else {
+                                            root.toggle-entry-check(idx);
+                                        }
+                                    }
+                                }
+                            }
+                            Rectangle {
+                                background: ta.has-hover && !entry.checked ? Theme.row-hover : transparent;
+                                x: 0; y: 0; width: parent.width; height: parent.height;
+                            }
+                            // Left accent for directories
+                            Rectangle {
+                                x: 0; y: 0; width: 3px; height: parent.height;
+                                background: !entry.is-directory ? transparent
+                                          : entry.checked       ? Theme.accent
+                                          :                       Theme.accent-soft-bd;
+                            }
+
+                            HorizontalLayout {
+                                padding-left: 10px; padding-right: 12px; spacing: 0px;
+
+                                // Checkbox for EVERY entry (files + folders)
+                                Rectangle {
+                                    width: 24px;
+                                    Rectangle {
+                                        x: 4px; y: 7px; width: 16px; height: 16px;
+                                        border-radius: 4px; border-width: 1px;
+                                        border-color: entry.checked ? Theme.accent
+                                                    : ta.has-hover  ? Theme.border-strong
+                                                    :                 Theme.border-strong;
+                                        background: entry.checked ? Theme.accent : Theme.surface;
+                                        if entry.checked : Text {
+                                            text: "✓"; font-size: 11px; color: Theme.on-accent;
+                                            horizontal-alignment: center; vertical-alignment: center;
+                                        }
+                                    }
+                                }
+
+                                // Name text
+                                Rectangle {
+                                    width: 32%;
+                                    Text {
+                                        text: entry.name;
+                                        width: 100%;
+                                        font-size: 13px; overflow: elide; vertical-alignment: center;
+                                        font-weight: entry.is-directory ? 600 : 400;
+                                        color: entry.is-directory ? Theme.text : Theme.text-2;
+                                    }
+                                }
+                                Text {
+                                    text: entry.modified-str; width: 16%;
+                                    font-size: 12px; color: Theme.text-2; vertical-alignment: center;
+                                }
+                                Text {
+                                    text: entry.size-str; width: 14%;
+                                    font-size: 12px; color: Theme.text-2; vertical-alignment: center;
+                                }
+
+                                HorizontalLayout {
+                                    width: 20%; alignment: start;
+                                    if entry.route-tag != "" && entry.route-tag != "—" : HorizontalLayout {
+                                        padding-top: 5px; padding-bottom: 5px; alignment: start;
+                                        Rectangle {
+                                            border-radius: 4px; border-width: 1px;
+                                            background: Theme.surface;
+                                            border-color:
+                                                entry.route-tag == "MATH"     ? Theme.r-math :
+                                                entry.route-tag == "RESIDUAL" ? Theme.r-residual :
+                                                entry.route-tag == "SOLID"    ? Theme.r-solid :
+                                                entry.route-tag == "FALLBACK" ? Theme.r-fallback :
+                                                entry.route-tag == "STORE"    ? Theme.r-store :
+                                                                                Theme.r-default;
+                                            HorizontalLayout {
+                                                padding-left: 7px; padding-right: 7px;
+                                                Text {
+                                                    text: entry.route-tag;
+                                                    font-size: 10px; font-weight: 700;
+                                                    vertical-alignment: center; horizontal-alignment: center;
+                                                    color:
+                                                        entry.route-tag == "MATH"     ? Theme.r-math :
+                                                        entry.route-tag == "RESIDUAL" ? Theme.r-residual :
+                                                        entry.route-tag == "SOLID"    ? Theme.r-solid :
+                                                        entry.route-tag == "FALLBACK" ? Theme.r-fallback :
+                                                        entry.route-tag == "STORE"    ? Theme.r-store :
+                                                                                        Theme.r-default;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                Text {
+                                    text: entry.ratio-str; width: 18%;
+                                    font-size: 12px; font-weight: 600;
+                                    color: entry.ratio-str == "—" ? Theme.text-muted : Theme.r-fallback;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Blueprint / opcode viewer
+            if root.show-opcode-panel : Rectangle {
+                width: 400px; background: Theme.surface;
+                Rectangle { x: 0; y: 0; width: 1px; height: parent.height; background: Theme.border; }
+                VerticalLayout {
+                    padding: 0px; spacing: 0px;
+                    Rectangle {
+                        height: 44px; background: Theme.surface-alt;
+                        HorizontalLayout {
+                            padding-left: 16px; padding-right: 10px; alignment: center;
+                            Text {
+                                text: root.opcode-panel-title; color: Theme.text;
+                                font-size: 13px; font-weight: 600;
+                                vertical-alignment: center; horizontal-stretch: 1;
+                            }
+                            MpButton { label: "Close"; clicked => { root.close-opcode-panel(); } }
+                        }
+                        Rectangle { y: parent.height - 1px; height: 1px; background: Theme.border; }
+                    }
+                    Rectangle {
+                        vertical-stretch: 1; background: Theme.surface-alt;
+                        ScrollView {
+                            width: parent.width; height: parent.height;
+                            Text {
+                                x: 16px; y: 14px; text: root.opcode-text;
+                                font-size: 12px; font-family: "monospace"; color: Theme.text-2;
+                                wrap: word-wrap; width: parent.width - 32px;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 5.5 PROGRESS BAR (prominent, while processing) ────────────────
+        if root.is-processing : Rectangle {
+            height: 72px; background: Theme.surface;
+            Rectangle { y: 0; height: 1px; background: Theme.border; }
+            VerticalLayout {
+                padding-left: 18px; padding-right: 18px;
+                padding-top: 12px; padding-bottom: 12px;
+                spacing: 8px;
+
+                // Top line: percent + ETA (center) · buttons (right)
+                HorizontalLayout {
+                    // Left spacer
+                    Rectangle { horizontal-stretch: 1; }
+                    
+                    // Center: Percent + ETA
+                    HorizontalLayout {
+                        spacing: 8px; alignment: center;
+                        Text {
+                            text: round(root.progress-percentage * 100) + "%";
+                            font-size: 14px; font-weight: 700; color: Theme.accent;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: root.time-remaining;
+                            font-size: 12px; color: Theme.text-muted; vertical-alignment: center;
+                        }
+                    }
+
+                    // Right: Spacer + Buttons
+                    HorizontalLayout {
+                        horizontal-stretch: 1;
+                        alignment: end;
+                        spacing: 12px;
+                        MpButton {
+                            label: root.is-paused ? "▶ Resume" : "⏸ Pause";
+                            enabled: !root.cancel-requested;
+                            clicked => { root.toggle-pause(); }
+                        }
+                        MpButton {
+                            label: root.cancel-requested ? "Cancelling…" : "Cancel";
+                            variant: "danger";
+                            enabled: !root.cancel-requested;
+                            clicked => { root.trigger-cancel(); }
+                        }
+                    }
+                }
+                // The bar
+                Rectangle {
+                    height: 10px; border-radius: 5px; background: Theme.surface-alt;
+                    border-width: 1px; border-color: Theme.border;
+                    Rectangle {
+                        x: 0; y: 0; height: parent.height; border-radius: 5px;
+                        width: max(0px, parent.width * root.progress-percentage);
+                        background: Theme.accent;
+                    }
+                }
+            }
+        }
+
+        // ── 6. STATUS FOOTER ──────────────────────────────────────────────
+        Rectangle {
+            height: 26px; background: Theme.surface-alt;
+            Rectangle { y: 0; height: 1px; background: Theme.border; }
+            HorizontalLayout {
+                padding-left: 16px; padding-right: 16px; spacing: 8px; alignment: start;
+                Text {
+                    text: root.status-text; font-size: 12px; color: Theme.text-2;
+                    vertical-alignment: center;
+                }
+                if root.is-processing && root.active-file-ticker != "" : Text {
+                    text: "— " + root.active-file-ticker; font-size: 12px; color: Theme.text-muted;
+                    vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
+                }
+                if !root.is-processing || root.active-file-ticker == "" : Rectangle {
+                    horizontal-stretch: 1;
+                }
+            }
+        }
+    }
+    }  // end focus-sink FocusScope
+
+    // ── MENU-BAR DROPDOWNS ─────────────────────────────────────────────────────
+    if root.open-menu != -1 : Rectangle {
+        x: 0; y: 0; width: root.width; height: root.height;
+        background: transparent;
+        TouchArea { clicked => { root.open-menu = -1; } }
+
+        // File
+        if root.open-menu == 0 : Rectangle {
+            x: 6px; y: 30px; width: 230px;
+            height: file-menu.preferred-height + 8px;
+            background: Theme.surface; border-radius: 6px;
+            border-width: 1px; border-color: Theme.border-strong;
+            drop-shadow-blur: 16px; drop-shadow-color: #00000028; drop-shadow-offset-y: 4px;
+            file-menu := VerticalLayout {
+                padding: 4px; spacing: 0px;
+                MpMenuItem { label: "New tab"; shortcut: "Ctrl+T"; clicked => { root.open-menu = -1; root.new-tab(); } }
+                MpMenuItem { label: "New window"; shortcut: "Ctrl+N"; clicked => { root.open-menu = -1; root.new-os-window(); } }
+                MpMenuItem { label: "New folder…"; clicked => { root.open-menu = -1; root.new-folder(); } }
+                MpMenuItem { label: "New file…"; clicked => { root.open-menu = -1; root.new-file(); } }
+                Rectangle { height: 1px; background: Theme.border; }
+                MpMenuItem { label: "Reload folder"; shortcut: "F5"; clicked => { root.open-menu = -1; root.trigger-refresh(); } }
+                MpMenuItem { label: "Close tab"; shortcut: "Ctrl+W"; clicked => { root.open-menu = -1; root.tab-closed(root.active-tab); } }
+                Rectangle { height: 1px; background: Theme.border; }
+                MpMenuItem { label: "Quit"; shortcut: "Ctrl+Q"; clicked => { root.open-menu = -1; root.quit(); } }
+            }
+        }
+
+        // View
+        if root.open-menu == 1 : Rectangle {
+            x: 58px; y: 30px; width: 200px;
+            height: view-menu.preferred-height + 8px;
+            background: Theme.surface; border-radius: 6px;
+            border-width: 1px; border-color: Theme.border-strong;
+            drop-shadow-blur: 16px; drop-shadow-color: #00000028; drop-shadow-offset-y: 4px;
+            view-menu := VerticalLayout {
+                padding: 4px; spacing: 0px;
+                MpMenuItem {
+                    label: Theme.dark ? "Light theme" : "Dark theme";
+                    clicked => { root.open-menu = -1; Theme.dark = !Theme.dark; }
+                }
+                MpMenuItem {
+                    label: "Folders first"; checked: root.folders-first;
+                    clicked => {
+                        root.open-menu = -1;
+                        root.folders-first = !root.folders-first;
+                        root.folders-first-changed(root.folders-first);
+                    }
+                }
+            }
+        }
+
+        // Sort
+        if root.open-menu == 2 : Rectangle {
+            x: 110px; y: 30px; width: 220px;
+            height: sort-menu.preferred-height + 8px;
+            background: Theme.surface; border-radius: 6px;
+            border-width: 1px; border-color: Theme.border-strong;
+            drop-shadow-blur: 16px; drop-shadow-color: #00000028; drop-shadow-offset-y: 4px;
+            sort-menu := VerticalLayout {
+                padding: 4px; spacing: 0px;
+                for s in ["Sort: Name (A-Z)", "Sort: Name (Z-A)", "Sort: Recent", "Sort: Oldest", "Sort: Size (Big-Small)", "Sort: Size (Small-Big)"] : MpMenuItem {
+                    label: s; checked: root.current-sort == s;
+                    clicked => { root.open-menu = -1; root.current-sort = s; root.sort-changed(s); }
+                }
+            }
+        }
+    }
+
+    // ── CONTEXT MENU ──────────────────────────────────────────────────────────
+    if root.show-context-menu : Rectangle {
+        x: 0; y: 0; width: root.width; height: root.height;
+        background: transparent;
+        TouchArea {
+            x: 0; y: 0; width: parent.width; height: parent.height;
+            clicked => { root.show-context-menu = false; }
+        }
+        Rectangle {
+            x: min(root.context-menu-x * 1px, root.width  - 196px);
+            y: min(root.context-menu-y * 1px, root.height - ctx-menu.preferred-height - 12px);
+            width: 192px; height: ctx-menu.preferred-height + 8px;
+            background: Theme.surface;
+            border-radius: 6px; border-width: 1px; border-color: Theme.border-strong;
+            drop-shadow-blur: 16px; drop-shadow-color: #00000028; drop-shadow-offset-y: 4px;
+
+            ctx-menu := VerticalLayout {
+                padding: 4px; spacing: 0px;
+
+                // 0 = Pack (Auto)  /  3 = Unpack Archive (.math only)
+                if !root.is-math-file-context : MpMenuItem {
+                    label: "Pack (Auto)";
+                    clicked => { root.show-context-menu = false; root.context-menu-action(0); }
+                }
+                if root.is-math-file-context : MpMenuItem {
+                    label: "Unpack Archive";
+                    clicked => { root.show-context-menu = false; root.context-menu-action(3); }
+                }
+                MpMenuItem { label: "View Blueprint"; clicked => { root.show-context-menu = false; root.context-menu-action(1); } }
+                MpMenuItem { label: "Verify Checksum"; clicked => { root.show-context-menu = false; root.context-menu-action(2); } }
+
+                Rectangle { height: 1px; background: Theme.border; }
+
+                MpMenuItem { label: "Rename"; clicked => { root.show-context-menu = false; root.context-menu-action(4); } }
+                MpMenuItem { label: "Copy";   clicked => { root.show-context-menu = false; root.context-menu-action(6); } }
+                MpMenuItem { label: "Cut";    clicked => { root.show-context-menu = false; root.context-menu-action(7); } }
+
+                Rectangle { height: 1px; background: Theme.border; }
+
+                MpMenuItem { label: "Delete"; danger: true; clicked => { root.show-context-menu = false; root.context-menu-action(5); } }
+            }
+        }
+    }
+
+    // ── NAME-INPUT MODAL (new folder / new file / rename) ──────────────────────
+    if root.show-name-dialog : Rectangle {
+        x: 0; y: 0; width: root.width; height: root.height;
+        background: #00000066;
+        TouchArea { clicked => { root.name-dialog-cancel(); } }
+        Rectangle {
+            width: 340px; height: 150px;
+            background: Theme.surface;
+            border-radius: 8px; border-width: 1px; border-color: Theme.border-strong;
+            drop-shadow-blur: 24px; drop-shadow-color: #00000040; drop-shadow-offset-y: 6px;
+            // Swallow clicks so they don't hit the backdrop dismiss area.
+            TouchArea {}
+            VerticalLayout {
+                padding: 18px; spacing: 12px;
+                Text { text: root.name-dialog-title; color: Theme.text; font-size: 15px; font-weight: 600; }
+                Rectangle {
+                    height: 34px;
+                    background: Theme.bg; border-radius: 6px;
+                    border-width: 1px; border-color: Theme.accent;
+                    HorizontalLayout {
+                        padding-left: 10px; padding-right: 10px;
+                        name-input := TextInput {
+                            text <=> root.name-dialog-text;
+                            color: Theme.text; font-size: 13px;
+                            vertical-alignment: center;
+                            single-line: true;
+                            accepted => { root.name-dialog-ok(); }
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px; alignment: end;
+                    MpButton { label: "Cancel"; clicked => { root.name-dialog-cancel(); } }
+                    MpButton { label: "OK"; variant: "primary"; clicked => { root.name-dialog-ok(); } }
+                }
+            }
+            // Focus the field whenever the dialog appears.
+            init => { name-input.focus(); }
+        }
+    }
+}

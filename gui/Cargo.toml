@@ -1,0 +1,33 @@
+[package]
+name = "mathpressor-gui"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mathpressor-gui"
+path = "src/main.rs"
+
+[dependencies]
+# Slint UI toolkit — declarative, native-speed, cross-platform.
+# unstable-winit-030 exposes the underlying winit window so we can raise/focus
+# a specific OS window (Ctrl+Shift+N) on platforms that allow it (X11/Win/macOS).
+slint        = { version = "1.9", features = ["unstable-winit-030"] }
+# Native file dialog (open/save folder pickers)
+rfd          = "0.15"
+# Dynamic library loading for the Zig libmathpressor C-ABI bridge
+libloading   = "0.8"
+# Walk directory trees for the explorer pane
+walkdir      = "2"
+chrono = "0.4.45"
+rayon = "1.12.0"
+# gunzip the (now compressed) FAT when reading archives for display/metrics
+flate2 = "1"
+
+[build-dependencies]
+slint-build  = "1.9"
+
+[profile.release]
+opt-level   = 3
+lto         = true
+codegen-units = 1
+strip       = true

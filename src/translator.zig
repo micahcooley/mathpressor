@@ -74,9 +74,14 @@ pub const MAX_ITERATIONS: u32 = 5_000;
 /// be bit-identical between the candidate program's output and the target.
 pub const APPROX_MIN_EXACT_PCT: u64 = 70;
 
-/// Upper bound on bytecode length for any built-in template.
+/// Upper bound on bytecode length for any built-in template or analytic
+/// program (REPEAT carries up to MAX_REPEAT_PERIOD literal bytes).
 /// Used to pre-size the best-candidate buffer without per-iteration allocation.
-const MAX_TEMPLATE_CODE_BYTES: usize = 64;
+const MAX_TEMPLATE_CODE_BYTES: usize = 256;
+
+/// Longest literal pattern the REPEAT detector will emit. Must keep the whole
+/// program ≤ 255 bytes so it fits the residual block's u8 bytecode_len field.
+const MAX_REPEAT_PERIOD: usize = 192;
 
 // ---------------------------------------------------------------------------
 // Shannon entropy  (floats OK — offline analysis tool, not the VM)
@@ -186,12 +191,137 @@ const TEMPLATES = [_]Template{
 const FREQ_SWEEP = [_]u8{ 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20 };
 
 // ---------------------------------------------------------------------------
+// Analytical detectors — O(n) pattern recognition, no search.
+//
+// Unlike the iterative noise search (which can only ever match content that
+// was *generated* by the template family), these detect structures that occur
+// in real-world files — padding/sparse sections (constant), lookup-table
+// ramps (arithmetic mod 256), and fixed-stride repeated records (repeat) —
+// and construct the exact program directly. They run before the entropy gate
+// because a perfect byte ramp has a uniform histogram (8.0 bits/byte) and the
+// entropy heuristic would wrongly reject it.
+// ---------------------------------------------------------------------------
+
+const AnalyticKind = enum { constant, ramp, repeat };
+
+const AnalyticCandidate = struct {
+    kind: AnalyticKind,
+    value: u8 = 0, // constant: the fill byte
+    start: u8 = 0, // ramp: data[i] = start + step·i (mod 256)
+    step: u8 = 0,
+    period: u8 = 0, // repeat: pattern = data[0..period]
+    exact: u64, // bytes matched exactly over data.len
+};
+
+/// One linear histogram pass: the modal byte is the best constant candidate.
+fn detectConstant(data: []const u8) AnalyticCandidate {
+    var freq = [_]u64{0} ** 256;
+    for (data) |b| freq[b] += 1;
+    var best_v: usize = 0;
+    for (freq, 0..) |f, v| {
+        if (f > freq[best_v]) best_v = v;
+    }
+    return .{ .kind = .constant, .value = @intCast(best_v), .exact = freq[best_v] };
+}
+
+/// Candidate ramp from the first two bytes; one pass counts exact positions.
+fn detectRamp(data: []const u8) AnalyticCandidate {
+    if (data.len < 2) return .{ .kind = .ramp, .exact = 0 };
+    const start = data[0];
+    const step = data[1] -% data[0];
+    var exact: u64 = 0;
+    for (data, 0..) |b, i| {
+        if (b == start +% (step *% @as(u8, @truncate(i)))) exact += 1;
+    }
+    return .{ .kind = .ramp, .start = start, .step = step, .exact = exact };
+}
+
+/// Sampled prescreen over candidate periods, then one full count for the
+/// winner: O(P·S + n) instead of O(P·n).
+fn detectRepeat(data: []const u8) AnalyticCandidate {
+    const max_p = @min(MAX_REPEAT_PERIOD, data.len / 2);
+    if (max_p < 1) return .{ .kind = .repeat, .exact = 0 };
+
+    const SAMPLES: usize = 512;
+    var best_p: usize = 0;
+    var best_score: u64 = 0;
+    var p: usize = 1;
+    while (p <= max_p) : (p += 1) {
+        const stride = @max(1, (data.len - p) / SAMPLES);
+        var hits: u64 = 0;
+        var trials: u64 = 0;
+        var i: usize = p;
+        while (i < data.len) : (i += stride) {
+            trials += 1;
+            if (data[i] == data[i % p]) hits += 1;
+        }
+        if (trials == 0) continue;
+        const score = hits * 1000 / trials;
+        // Prefer the *shortest* period at equal score (strictly-greater test):
+        // period 4 data also matches at 8, 12, …, but 4 is the smaller program.
+        if (score > best_score) {
+            best_score = score;
+            best_p = p;
+        }
+    }
+    if (best_p == 0 or best_score < 600) return .{ .kind = .repeat, .exact = 0 };
+
+    var exact: u64 = 0;
+    for (data, 0..) |b, i| {
+        if (b == data[i % best_p]) exact += 1;
+    }
+    return .{ .kind = .repeat, .period = @intCast(best_p), .exact = exact };
+}
+
+/// Run all detectors and keep the candidate with the most exact bytes.
+fn detectAnalytic(data: []const u8) AnalyticCandidate {
+    var best = detectConstant(data);
+    const r = detectRamp(data);
+    if (r.exact > best.exact) best = r;
+    const rep = detectRepeat(data);
+    if (rep.exact > best.exact) best = rep;
+    return best;
+}
+
+/// Emit the bytecode program for an analytic candidate.
+fn buildAnalyticInto(
+    b: *vm_mod.Builder,
+    cand: AnalyticCandidate,
+    w: u16,
+    h: u16,
+    data: []const u8,
+) !void {
+    switch (cand.kind) {
+        .constant => try b.constFill(0, w, h, cand.value),
+        .ramp => try b.ramp(0, w, h, cand.start, cand.step),
+        .repeat => try b.repeat(0, w, h, data[0..cand.period]),
+    }
+    try b.halt();
+}
+
+/// Synthesize the candidate's output directly into `out` (same formula the VM
+/// applies, restricted to the first data.len bytes — the canvas tail beyond
+/// the file length never participates in the delta).
+fn synthesizeAnalytic(cand: AnalyticCandidate, data: []const u8, out: []u8) void {
+    switch (cand.kind) {
+        .constant => @memset(out, cand.value),
+        .ramp => for (out, 0..) |*o, i| {
+            o.* = cand.start +% (cand.step *% @as(u8, @truncate(i)));
+        },
+        .repeat => for (out, 0..) |*o, i| {
+            o.* = data[i % cand.period];
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
 
 /// Analyse `data` and attempt to find a Mathpressor representation.
 ///
-/// `width` × `height` must equal `data.len` exactly.
+/// `width` × `height` must be ≥ `data.len` (the canvas covers the file; any
+/// tail beyond the file length is padding that extraction truncates away).
 /// All returned slices are allocated with `alloc`; the caller is responsible
 /// for freeing them (see `TranslateResult` for which fields to free).
 /// `progress` may be null; if provided it is updated continuously.
@@ -204,25 +334,63 @@ pub fn translate(
 ) !TranslateResult {
 
     // -----------------------------------------------------------------------
-    // Phase 1 — Entropy gate
+    // Phase 1 — Structural gate (O(1)). The canvas must cover the file
+    // (width × height ≥ data.len; the tail beyond the file length is padding
+    // that extraction truncates away) and fit the VM's dimension limits.
+    // Constant-time, so it runs before any O(n) scan: an oversized input
+    // (side > MAX_DIM) is rejected without reading a byte.
     // -----------------------------------------------------------------------
-    const ent = shannonEntropy(data);
-    if (progress) |p| p.entropy = ent;
-
-    if (ent >= ENTROPY_GATE) {
-        return .{ .fallback = .{ .reason = .high_entropy, .entropy = ent } };
-    }
-
-    // Canvas size guard: width × height must exactly match the buffer length.
     const canvas_len: usize = @as(usize, width) * @as(usize, height);
-    if (canvas_len != data.len or canvas_len == 0 or
+    if (canvas_len < data.len or data.len == 0 or
+        width == 0 or height == 0 or
         width > vm_mod.MAX_DIM or height > vm_mod.MAX_DIM)
     {
-        return .{ .fallback = .{ .reason = .search_failed, .entropy = ent } };
+        // entropy is unused for fallback files in the pack path; skip the scan.
+        return .{ .fallback = .{ .reason = .search_failed, .entropy = 0 } };
     }
 
     const w: u16 = @intCast(width);
     const h: u16 = @intCast(height);
+
+    // -----------------------------------------------------------------------
+    // Phase 2 — Analytical detectors (O(n), no search). These run BEFORE the
+    // entropy gate on purpose: a perfect byte ramp has a uniform histogram
+    // (8.0 bits/byte) and the entropy heuristic would wrongly reject it.
+    // An exact analytic hit is bit-perfect by construction; verify once
+    // against the VM and return immediately.
+    // -----------------------------------------------------------------------
+    const analytic = detectAnalytic(data);
+    const analytic_qualifies = analytic.exact * 100 >= @as(u64, data.len) * APPROX_MIN_EXACT_PCT;
+
+    if (analytic.exact == data.len) {
+        var bb = vm_mod.Builder.init(alloc);
+        defer bb.deinit();
+        try buildAnalyticInto(&bb, analytic, w, h, data);
+        const code_out = try alloc.dupe(u8, bb.bytes());
+        errdefer alloc.free(code_out);
+        // Belt-and-braces: the program must reproduce the bytes through the
+        // real VM before we commit to storing it.
+        if (try vmReproduces(code_out, data, alloc)) {
+            if (progress) |p| {
+                p.iterations = 0;
+                p.match_template = @tagName(analytic.kind);
+            }
+            return .{ .math_bytecode = code_out };
+        }
+        alloc.free(code_out); // unreachable in practice; fall through to search
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3 — Entropy gate (O(n) scan already paid above). High-entropy data
+    // can't be matched by the noise search, so skip it — but keep a qualifying
+    // analytic approximation alive (its delta may still be worth storing).
+    // -----------------------------------------------------------------------
+    const ent = shannonEntropy(data);
+    if (progress) |p| p.entropy = ent;
+
+    if (ent >= ENTROPY_GATE and !analytic_qualifies) {
+        return .{ .fallback = .{ .reason = .high_entropy, .entropy = ent } };
+    }
 
     // -----------------------------------------------------------------------
     // Phase 2 — Iterative search with best-candidate tracking
@@ -250,15 +418,61 @@ pub fn translate(
     var best_seed: u32 = 0;
     var best_freq: u8 = 0;
 
+    // Seed the best candidate with a qualifying analytic approximation so the
+    // iterative search only has to beat it, never rediscover it.
+    if (analytic_qualifies) {
+        var bb = vm_mod.Builder.init(alloc);
+        defer bb.deinit();
+        if (buildAnalyticInto(&bb, analytic, w, h, data)) |_| {
+            const cb = bb.bytes();
+            if (cb.len <= MAX_TEMPLATE_CODE_BYTES) {
+                @memcpy(best_code_buf[0..cb.len], cb);
+                best_code_len = cb.len;
+                synthesizeAnalytic(analytic, data, best_gen_buf);
+                best_error = computeL1(best_gen_buf, data);
+                has_best = true;
+                best_tmpl_name = @tagName(analytic.kind);
+            }
+        } else |_| {}
+    }
+
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
 
+    // Effort-tier search budget (defaults to MAX_ITERATIONS if no progress
+    // struct supplied). High-entropy data skips the noise search entirely —
+    // it only reaches this point to carry an analytic approximation through.
+    //
+    // The budget is a *byte budget*, not an iteration count: every iteration
+    // synthesizes a full canvas, so N iterations on a 4 MB file cost 64× more
+    // than on a 64 KB file. The tier's max_iters is interpreted as "iterations
+    // at a 64 KB reference size" and scaled down proportionally for larger
+    // files — without this, one big low-entropy file stalls a whole pack
+    // (5 000 × 4 MB = 20 GB of synthesis for a single file).
+    const raw_budget: u32 = if (ent >= ENTROPY_GATE)
+        0
+    else if (progress) |p| p.max_iters else MAX_ITERATIONS;
+    const REF_SIZE: u64 = 64 * 1024;
+    const bytes_budget: u64 = @as(u64, raw_budget) * REF_SIZE;
+    const budget: u32 = if (data.len <= REF_SIZE)
+        raw_budget
+    else
+        @intCast(@min(raw_budget, @max(1, bytes_budget / data.len)));
+
     var iters: u32 = 0;
     var seed: u32 = 1;
-    outer: while (iters < MAX_ITERATIONS) {
+    outer: while (iters < budget) {
         for (TEMPLATES) |tmpl| {
             for (FREQ_SWEEP) |freq| {
-                if (iters >= MAX_ITERATIONS) break :outer;
+                if (iters >= budget) break :outer;
+                if (progress) |p| {
+                    if (p.cancel_flag) |cf| {
+                        while (cf.load(.monotonic) == 2) {
+                            std.time.sleep(100 * std.time.ns_per_ms);
+                        }
+                        if (cf.load(.monotonic) == 1) return error.Cancelled;
+                    }
+                }
                 iters += 1;
 
                 // Fresh slate for this candidate: reset but keep backing memory.
@@ -268,10 +482,12 @@ pub fn translate(
                 tmpl.buildFn(&b, w, h, seed, freq) catch continue;
 
                 var machine = vm_mod.Vm.init(scratch.allocator());
-                const result = machine.execute(b.bytes()) catch continue;
+                const full = machine.execute(b.bytes()) catch continue;
 
-                // Paranoia: VM must produce exactly the expected canvas size.
-                if (result.len != data.len) continue;
+                // The canvas may exceed the file (padded last row); compare
+                // only the bytes the file actually occupies.
+                if (full.len < data.len) continue;
+                const result = full[0..data.len];
 
                 if (progress) |p| {
                     p.iterations = iters;
@@ -367,6 +583,10 @@ pub fn translate(
 // ---------------------------------------------------------------------------
 
 pub const TranslateProgress = struct {
+    cancel_flag: ?*const std.atomic.Value(u8) = null,
+    /// Search budget for the iterative math match (effort tier). Defaults to
+    /// the balanced budget; Fast lowers it, Max raises it.
+    max_iters: u32 = MAX_ITERATIONS,
     // Phase 1
     entropy: f64 = 0,
     // Phase 2 — general
@@ -421,6 +641,148 @@ pub fn synthesiseKnown(
 /// Quick entropy pre-check before calling translate.
 pub fn isCandidate(data: []const u8) bool {
     return shannonEntropy(data) < ENTROPY_GATE;
+}
+
+// ---------------------------------------------------------------------------
+// Per-block analytic decomposition (MATH_BLOCKS route)
+//
+// Real files are rarely math-expressible whole, but their *pages* often are:
+// database files carry runs of zeroed pages with islands of data, binaries
+// carry padding sections between code. analyzeBlocks chunks the file into
+// fixed-size blocks and runs the exact analytic detectors on each — blocks
+// with equations become 1-3 byte descriptors, the rest concatenate into one
+// literal stream the pack path compresses conventionally. Detection only,
+// O(n) total, no search. The pack-side honesty guard stores the decomposition
+// only when it beats compressing the whole file.
+// ---------------------------------------------------------------------------
+
+pub const BLOCK_SIZE: usize = 4096;
+
+pub const BlockKind = enum(u8) { literal = 0, constant = 1, ramp = 2, repeat = 3 };
+
+pub const BlockPlan = struct {
+    /// One BlockKind byte per block.
+    kinds: []u8,
+    /// Param stream, one record per non-literal block in block order:
+    /// constant → u8 value; ramp → u8 start, u8 step; repeat → u8 plen, plen bytes.
+    params: []u8,
+    /// Concatenation of all literal blocks (caller compresses this).
+    literals: []u8,
+    /// Bytes covered by analytic blocks (coverage metric).
+    analytic_bytes: u64,
+
+    pub fn deinit(self: *BlockPlan, a: std.mem.Allocator) void {
+        a.free(self.kinds);
+        a.free(self.params);
+        a.free(self.literals);
+    }
+};
+
+/// All bytes equal → the value.
+fn blockConst(blk: []const u8) ?u8 {
+    const v = blk[0];
+    for (blk[1..]) |b| if (b != v) return null;
+    return v;
+}
+
+/// Exact arithmetic ramp from the first two bytes (step 0 is blockConst's job).
+fn blockRamp(blk: []const u8) ?struct { start: u8, step: u8 } {
+    if (blk.len < 3) return null;
+    const start = blk[0];
+    const step = blk[1] -% blk[0];
+    if (step == 0) return null;
+    for (blk, 0..) |b, i| {
+        if (b != start +% (step *% @as(u8, @truncate(i)))) return null;
+    }
+    return .{ .start = start, .step = step };
+}
+
+/// Exact short-period tiling. Early exit makes the average cost a few bytes
+/// per failing candidate, so a fixed candidate ladder stays O(block) overall.
+fn blockRepeat(blk: []const u8) ?u8 {
+    const PERIODS = [_]u8{ 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64 };
+    outer: for (PERIODS) |p| {
+        if (blk.len < @as(usize, p) * 2) break;
+        var j: usize = p;
+        while (j < blk.len) : (j += 1) {
+            if (blk[j] != blk[j % p]) continue :outer;
+        }
+        return p;
+    }
+    return null;
+}
+
+/// Chunk `data` into BLOCK_SIZE blocks and detect an exact equation per block.
+/// Returns null when the file is too small to decompose (whole-file analysis
+/// already covered it) or analytic coverage is under 25% (not worth the
+/// honesty-guard compression attempt). All plan slices are owned by `alloc`.
+pub fn analyzeBlocks(data: []const u8, alloc: std.mem.Allocator) !?BlockPlan {
+    if (data.len < BLOCK_SIZE * 2) return null;
+    const n_blocks = (data.len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    const kinds = try alloc.alloc(u8, n_blocks);
+    errdefer alloc.free(kinds);
+    var params = std.ArrayList(u8).init(alloc);
+    errdefer params.deinit();
+    var literals = std.ArrayList(u8).init(alloc);
+    errdefer literals.deinit();
+
+    var analytic_bytes: u64 = 0;
+    var i: usize = 0;
+    while (i < n_blocks) : (i += 1) {
+        const start = i * BLOCK_SIZE;
+        const blk = data[start..@min(start + BLOCK_SIZE, data.len)];
+
+        if (blockConst(blk)) |v| {
+            kinds[i] = @intFromEnum(BlockKind.constant);
+            try params.append(v);
+            analytic_bytes += blk.len;
+            continue;
+        }
+        if (blockRamp(blk)) |r| {
+            kinds[i] = @intFromEnum(BlockKind.ramp);
+            try params.append(r.start);
+            try params.append(r.step);
+            analytic_bytes += blk.len;
+            continue;
+        }
+        if (blockRepeat(blk)) |p| {
+            kinds[i] = @intFromEnum(BlockKind.repeat);
+            try params.append(p);
+            try params.appendSlice(blk[0..p]);
+            analytic_bytes += blk.len;
+            continue;
+        }
+        kinds[i] = @intFromEnum(BlockKind.literal);
+        try literals.appendSlice(blk);
+    }
+
+    // Coverage prefilter: below 25% analytic bytes the decomposition almost
+    // never beats whole-file compression — skip the guard's compression cost.
+    if (analytic_bytes * 4 < data.len) {
+        alloc.free(kinds);
+        params.deinit();
+        literals.deinit();
+        return null;
+    }
+
+    return .{
+        .kinds = kinds,
+        .params = try params.toOwnedSlice(),
+        .literals = try literals.toOwnedSlice(),
+        .analytic_bytes = analytic_bytes,
+    };
+}
+
+/// Execute `code` through the real VM and check it reproduces `data` exactly
+/// (over the first data.len bytes — the canvas tail is padding).
+fn vmReproduces(code: []const u8, data: []const u8, alloc: std.mem.Allocator) !bool {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var machine = vm_mod.Vm.init(arena.allocator());
+    const px = machine.execute(code) catch return false;
+    if (px.len < data.len) return false;
+    return std.mem.eql(u8, px[0..data.len], data);
 }
 
 /// Apply a delta buffer to a VM-generated approximation, recovering the
@@ -540,19 +902,103 @@ test "exact match: single-layer noise texture" {
     }
 }
 
-test "fallback: pattern with no template match" {
+test "analytic: alternating pattern becomes an exact REPEAT program" {
     const a = testing.allocator;
-    // Alternating 0/128: entropy ≈ 1 bit/byte (passes gate) but no template
-    // produces this pattern, so < 70% of bytes ever match exactly → fallback.
+    // Alternating 0/128: the REPEAT detector finds period 2 and constructs a
+    // bit-perfect program directly (this used to fall back — the noise search
+    // could never produce it).
     const buf = try a.alloc(u8, 8 * 8);
     defer a.free(buf);
     for (buf, 0..) |*b, i| b.* = if (i % 2 == 0) @as(u8, 0) else @as(u8, 128);
 
     const result = try translate(buf, 8, 8, a, null);
     switch (result) {
-        .fallback => {},
-        .math_bytecode => |b| { a.free(b);               try testing.expect(false); },
+        .math_bytecode => |code| {
+            defer a.free(code);
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            var m = vm_mod.Vm.init(arena.allocator());
+            try testing.expectEqualSlices(u8, buf, try m.execute(code));
+        },
+        .fallback      => try testing.expect(false),
         .approximate   => |r| { a.free(r.bytecode); a.free(r.delta); try testing.expect(false); },
+    }
+}
+
+test "analytic: constant file of non-square length is exact" {
+    const a = testing.allocator;
+    // 1000 bytes of 0xFF — not a perfect square; the padded canvas covers it.
+    const buf = try a.alloc(u8, 1000);
+    defer a.free(buf);
+    @memset(buf, 0xFF);
+
+    // side = ceil(sqrt(1000)) = 32, h = ceil(1000/32) = 32 → canvas 1024 ≥ 1000
+    const result = try translate(buf, 32, 32, a, null);
+    switch (result) {
+        .math_bytecode => |code| {
+            defer a.free(code);
+            try testing.expect(code.len < 16); // tiny program
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            var m = vm_mod.Vm.init(arena.allocator());
+            const px = try m.execute(code);
+            try testing.expect(px.len >= buf.len);
+            try testing.expectEqualSlices(u8, buf, px[0..buf.len]);
+        },
+        else => try testing.expect(false),
+    }
+}
+
+test "analytic: byte ramp passes despite 8.0 bits/byte entropy" {
+    const a = testing.allocator;
+    // data[i] = 3 + 5·i mod 256 over 4096 bytes: uniform histogram → entropy
+    // 8.0, which the old gate rejected before any analysis could run.
+    const buf = try a.alloc(u8, 4096);
+    defer a.free(buf);
+    for (buf, 0..) |*b, i| b.* = 3 +% (5 *% @as(u8, @truncate(i)));
+    try testing.expect(shannonEntropy(buf) >= ENTROPY_GATE);
+
+    const result = try translate(buf, 64, 64, a, null);
+    switch (result) {
+        .math_bytecode => |code| {
+            defer a.free(code);
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            var m = vm_mod.Vm.init(arena.allocator());
+            try testing.expectEqualSlices(u8, buf, (try m.execute(code))[0..buf.len]);
+        },
+        else => try testing.expect(false),
+    }
+}
+
+test "analytic: mostly-constant file qualifies as residual approximation" {
+    const a = testing.allocator;
+    // 80% zeros, 20% scattered values: constant(0) gives an 80%-exact base.
+    const buf = try a.alloc(u8, 2500);
+    defer a.free(buf);
+    @memset(buf, 0);
+    var rng = @import("math_gen.zig").XorShift32.init(77);
+    var i: usize = 0;
+    while (i < 500) : (i += 1) buf[rng.nextBelow(2500)] = rng.nextByte();
+
+    const result = try translate(buf, 50, 50, a, null);
+    switch (result) {
+        .approximate => |r| {
+            defer a.free(r.bytecode);
+            defer a.free(r.delta);
+            try testing.expect(r.exact_pct >= APPROX_MIN_EXACT_PCT);
+            // Reconstruction invariant over the truncated canvas.
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            var m = vm_mod.Vm.init(arena.allocator());
+            const approx_px = try m.execute(r.bytecode);
+            const out = try a.alloc(u8, buf.len);
+            defer a.free(out);
+            applyDelta(approx_px[0..buf.len], r.delta, out);
+            try testing.expectEqualSlices(u8, buf, out);
+        },
+        .math_bytecode => |b| a.free(b), // acceptable if the corruption landed on zeros
+        .fallback => try testing.expect(false),
     }
 }
 
