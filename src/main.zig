@@ -497,6 +497,17 @@ const Effort = struct {
             },
         };
     }
+
+    /// Effort for the live per-entry (regular) modes. Identical to fromTier
+    /// except Max swaps the per-entry codec to LZMA: at Max the user is after
+    /// best ratio (ship/cold), and per-entry LZMA keeps random access (each
+    /// asset independently decodable) while closing most of the backend gap to
+    /// xz. Fast/Balanced stay on zstd so the live-hot path keeps fast decode.
+    fn fromTierRegular(tier: u8) Effort {
+        var e = fromTier(tier);
+        if (tier == 2) e.comp = container.Compressor.lzmaFromTier(2);
+        return e;
+    }
 };
 
 // Shared host-progress channel for the C-ABI pack paths. All fields are
@@ -2412,7 +2423,7 @@ pub fn packDirectoryVfsAbi(
     progress_ptr: *std.atomic.Value(f32),
     ticker_ptr: [*]u8,
 ) !void {
-    const effort = Effort.fromTier(effort_tier);
+    const effort = Effort.fromTierRegular(effort_tier);
     var cb = try container.StreamingBuilder.init(root);
     cb.comp = effort.comp;
     defer cb.deinit();
@@ -2596,9 +2607,12 @@ pub fn packDirectoryAutoAbi(
     progress_ptr: *std.atomic.Value(f32),
     ticker_ptr: [*]u8,
 ) !void {
-    const effort = Effort.fromTier(effort_tier);
+    const effort = Effort.fromTierRegular(effort_tier);
     var cb = try container.SolidContainerBuilder.init(root);
-    cb.setCompressor(effort.comp);
+    // Solid blocks stay on zstd even at Max: decompressSolidBlock only decodes
+    // gzip/zstd, and solid blocks are the anti-live part anyway (whole-block
+    // decode). The LZMA win goes to the live per-file entries via ctx.effort.
+    cb.setCompressor(container.Compressor.fromTier(effort_tier));
     defer cb.deinit();
 
     var jobs = std.ArrayList([]u8).init(root);
@@ -2641,9 +2655,10 @@ pub fn packSelectionAbi(
     progress_ptr: *std.atomic.Value(f32),
     ticker_ptr: [*]u8,
 ) !void {
-    const effort = Effort.fromTier(effort_tier);
+    const effort = Effort.fromTierRegular(effort_tier);
     var cb = try container.SolidContainerBuilder.init(root);
-    cb.setCompressor(effort.comp);
+    // Solid blocks stay zstd (decodable + anti-live); per-file entries get LZMA.
+    cb.setCompressor(container.Compressor.fromTier(effort_tier));
     defer cb.deinit();
 
     var jobs = std.ArrayList([]u8).init(root);
