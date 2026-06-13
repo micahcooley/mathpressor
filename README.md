@@ -223,6 +223,31 @@ Built-in templates: `single_noise`, `noise_invert`, `noise_bright`, `blend_mult`
 
 ---
 
+## Two modes: live (regular) vs cold (full)
+
+Mathpressor has two packing modes with different *purposes*, not just different
+ratios:
+
+- **Regular mode — live-runnable.** Every asset is an independent, randomly
+  accessible entry. The design goal is that a host (e.g. a game) loads the
+  `.math` and **synthesizes or extracts only the assets it needs, the moment it
+  needs them** — a virtual filesystem where a procedural asset effectively
+  doesn't exist until it's requested, then is generated on the spot. This is why
+  regular mode never uses solid blocks (which would force decompressing a whole
+  block to read one file) and why decode/synthesis *latency* matters as much as
+  size. `MATH_BYTECODE` entries are the ideal live primitive: near-zero storage
+  and no decompression — pure on-demand VM synthesis.
+
+- **Full mode — cold archive.** The whole selection becomes one solid tar →
+  LZMA(+x86 BCJ), with a math/transform pre-pass. Maximum ratio, but it must be
+  fully expanded to use — *not* live-runnable. Always the smaller of the two.
+
+The intended hierarchy: full mode is #1 on ratio; regular mode is #2 (aiming to
+beat every general-purpose compressor) while staying live. The two constraints —
+"beat everyone on size" and "run live" — are in genuine tension (a stronger but
+slower backend helps the first and hurts the second), which is why regular mode
+keeps a fast path and treats heavier backends as a ship/cold option.
+
 ## The C-ABI
 
 A host application loads `libmathpressor.so` and drives the engine through a plain
