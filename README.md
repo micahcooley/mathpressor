@@ -46,7 +46,7 @@ When you pack a directory, Mathpressor automatically routes each file:
 | `MATH_BLOCKS` | `0x07` | Pages part-equation, part-data | per-block descriptors + literal stream |
 | `MATH_FILTERED` | `0x08` | Reversible transform helps the codec | filter id + compressed filtered stream |
 | `MATH_COLUMNAR` | `0x09` | Record array (vertex/float tables) | AoS→SoA transpose + compressed |
-| `MATH_IMAGE2D` | `0x0A` | Raw raster (TGA/PGM/PPM) | 2D MED predictor + compressed |
+| `MATH_IMAGE2D` | `0x0A` | Raw raster (TGA/PGM/PPM) | reversible subtract-green + planar + 2D MED predictor, compressed |
 | `MATH_DICT` | `0x0B` | Many similar small files (JSON/strings/shaders) | zstd frame primed with a shared trained dictionary |
 | `MATH_AUDIO` | `0x0C` | 16-bit PCM WAV | fixed-order LPC (per-channel sample predictor) + compressed |
 | `MATH_BCJ2` | `0x0D` | Full mode's solid tar (x86 code) | 4-stream range-coded BCJ2, each LZMA'd |
