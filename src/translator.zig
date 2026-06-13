@@ -444,20 +444,20 @@ pub fn translate(
     // it only reaches this point to carry an analytic approximation through.
     //
     // The budget is a *byte budget*, not an iteration count: every iteration
-    // synthesizes a full canvas, so N iterations on a 4 MB file cost 64× more
-    // than on a 64 KB file. The tier's max_iters is interpreted as "iterations
-    // at a 64 KB reference size" and scaled down proportionally for larger
-    // files — without this, one big low-entropy file stalls a whole pack
-    // (5 000 × 4 MB = 20 GB of synthesis for a single file).
+    // synthesizes a full canvas, so N iterations on a big file cost far more
+    // than on a small one. Total synthesis work is hard-capped at TOTAL_SYNTH
+    // bytes per file, so the noise search can never dominate pack time on a
+    // low-entropy file (a 102 KB image used to cost ~190s at Max; now bounded
+    // to a few seconds). Tiny procedural textures still get the full iteration
+    // count, which is where the search actually finds matches.
     const raw_budget: u32 = if (ent >= ENTROPY_GATE)
         0
     else if (progress) |p| p.max_iters else MAX_ITERATIONS;
-    const REF_SIZE: u64 = 64 * 1024;
-    const bytes_budget: u64 = @as(u64, raw_budget) * REF_SIZE;
-    const budget: u32 = if (data.len <= REF_SIZE)
+    const TOTAL_SYNTH: u64 = 128 * 1024 * 1024; // ≤128 MB of synthesis per file
+    const budget: u32 = if (data.len == 0)
         raw_budget
     else
-        @intCast(@min(raw_budget, @max(1, bytes_budget / data.len)));
+        @intCast(@min(raw_budget, @max(1, TOTAL_SYNTH / data.len)));
 
     var iters: u32 = 0;
     var seed: u32 = 1;

@@ -710,7 +710,7 @@ fn packFileParallel(ctx: *PackCtx, rel_path: []u8) !void {
 
     // Math translation (CPU-intensive, runs outside the lock).
     const canvas = canvasForLen(data.len);
-    var prog_info = translator.TranslateProgress{ .cancel_flag = ctx.cancel_flag, .max_iters = if (data.len > 256 * 1024) 0 else ctx.effort.math_iters };
+    var prog_info = translator.TranslateProgress{ .cancel_flag = ctx.cancel_flag, .max_iters = if (data.len > 16 * 1024) 0 else ctx.effort.math_iters };
     const result = try translator.translate(data, canvas.w, canvas.h, alloc, &prog_info);
 
     // Gzip compression also runs outside the lock — this is the hot path for
@@ -1112,12 +1112,103 @@ fn bestColumnarBlock(data: []const u8, effort: Effort, alloc: std.mem.Allocator)
     return payload;
 }
 
+const ImageInfo = struct { header_len: usize, footer_len: usize, width: u32, height: u32, channels: u8 };
+
+/// Parse known uncompressed raster headers to get geometry for the 2D
+/// predictor: TGA (uncompressed truecolor/grayscale, optional 26-byte TGA-2.0
+/// footer) and binary PGM/PPM (P5/P6). Returns null for anything else (RLE,
+/// odd maxval, size mismatch). header + width*height*channels + footer must
+/// exactly cover the file.
+fn detectImage(data: []const u8) ?ImageInfo {
+    // --- TGA ---
+    if (data.len >= 18 and data[1] == 0 and (data[2] == 2 or data[2] == 3)) {
+        const idlen: usize = data[0];
+        const w: u32 = std.mem.readInt(u16, data[12..14], .little);
+        const h: u32 = std.mem.readInt(u16, data[14..16], .little);
+        const ch: u8 = switch (data[16]) { 8 => 1, 24 => 3, 32 => 4, else => 0 };
+        if (ch != 0 and w > 0 and h > 0) {
+            const hl = 18 + idlen;
+            const pix = @as(u64, w) * h * ch;
+            if (hl + pix == data.len)
+                return .{ .header_len = hl, .footer_len = 0, .width = w, .height = h, .channels = ch };
+            // TGA 2.0 footer (26 bytes ending in "TRUEVISION-XFILE.\0").
+            if (hl + pix + 26 == data.len and
+                std.mem.indexOf(u8, data[data.len - 26 ..], "TRUEVISION") != null)
+                return .{ .header_len = hl, .footer_len = 26, .width = w, .height = h, .channels = ch };
+        }
+    }
+    // --- Binary PGM (P5, gray) / PPM (P6, RGB) ---
+    if (data.len >= 2 and data[0] == 'P' and (data[1] == '5' or data[1] == '6')) {
+        const ch: u8 = if (data[1] == '5') 1 else 3;
+        var i: usize = 2;
+        var vals: [3]u32 = .{ 0, 0, 0 }; // width, height, maxval
+        var got: usize = 0;
+        while (got < 3 and i < data.len) {
+            // skip whitespace and #-comments
+            while (i < data.len and (data[i] == ' ' or data[i] == '\t' or data[i] == '\n' or data[i] == '\r')) i += 1;
+            if (i < data.len and data[i] == '#') {
+                while (i < data.len and data[i] != '\n') i += 1;
+                continue;
+            }
+            var v: u32 = 0;
+            var any = false;
+            while (i < data.len and data[i] >= '0' and data[i] <= '9') {
+                v = v * 10 + (data[i] - '0');
+                i += 1;
+                any = true;
+            }
+            if (!any) break;
+            vals[got] = v;
+            got += 1;
+        }
+        // One whitespace byte separates the header from binary pixel data.
+        if (got == 3 and vals[2] == 255 and i < data.len) {
+            const hl = i + 1;
+            const w = vals[0];
+            const h = vals[1];
+            if (w > 0 and h > 0 and hl + @as(u64, w) * h * ch == data.len)
+                return .{ .header_len = hl, .footer_len = 0, .width = w, .height = h, .channels = ch };
+        }
+    }
+    return null;
+}
+
+/// 2D-predict a detected raster and return the MATH_IMAGE2D payload
+/// `[u32 header_len][u32 w][u32 h][u8 ch][compressed (header ++ residual)]`,
+/// or null if the file isn't a recognized raw image. Honesty-guarded at the
+/// call site. xz/zstd/brotli have no 2D predictor, so this is net-new ground.
+fn bestImage2DBlock(data: []const u8, effort: Effort, alloc: std.mem.Allocator) !?[]u8 {
+    if (effort.tier == 0 or data.len < 256) return null;
+    const info = detectImage(data) orelse return null;
+
+    const pix_end = data.len - info.footer_len;
+    const residual = try container.medForward(data[info.header_len..pix_end], info.width, info.height, info.channels, alloc);
+    defer alloc.free(residual);
+    // transformed = header ++ residual ++ footer (verbatim ends), len == data.len
+    const transformed = try alloc.alloc(u8, data.len);
+    defer alloc.free(transformed);
+    @memcpy(transformed[0..info.header_len], data[0..info.header_len]);
+    @memcpy(transformed[info.header_len..pix_end], residual);
+    @memcpy(transformed[pix_end..], data[pix_end..]);
+
+    const comp = try effort.comp.compress(transformed, alloc);
+    defer alloc.free(comp);
+    const payload = try alloc.alloc(u8, 17 + comp.len);
+    std.mem.writeInt(u32, payload[0..4], @intCast(info.header_len), .little);
+    std.mem.writeInt(u32, payload[4..8], @intCast(info.footer_len), .little);
+    std.mem.writeInt(u32, payload[8..12], info.width, .little);
+    std.mem.writeInt(u32, payload[12..16], info.height, .little);
+    payload[16] = info.channels;
+    @memcpy(payload[17..], comp);
+    return payload;
+}
+
 /// Pick the cheapest reversible representation for a file the translator routed
-/// to fallback: STORE (raw), plain compression, per-block math, or a filtered
-/// stream. Returns the chosen comp_type and the bytes to append (`payload` is
-/// null for STORE — append the raw `data`). Every candidate reconstructs the
-/// exact original; this just keeps whichever is smallest. This is the unified
-/// "math earns its place or it isn't used" decision point.
+/// to fallback: STORE (raw), plain compression, per-block math, a filtered
+/// stream, a columnar transpose, or a 2D image predictor. Returns the chosen
+/// comp_type and the bytes to append (`payload` is null for STORE — append the
+/// raw `data`). Every candidate reconstructs the exact original; this just keeps
+/// whichever is smallest. The unified "math earns its place or it isn't used".
 const FallbackRep = struct { comp_type: container.CompressionType, payload: ?[]u8 };
 
 fn chooseFallbackRep(data: []const u8, effort: Effort, alloc: std.mem.Allocator) !FallbackRep {
@@ -1164,6 +1255,15 @@ fn chooseFallbackRep(data: []const u8, effort: Effort, alloc: std.mem.Allocator)
         } else alloc.free(payload);
     }
 
+    if (try bestImage2DBlock(data, effort, alloc)) |payload| {
+        if (payload.len < best_len) {
+            if (best_payload) |b| alloc.free(b);
+            best_type = .math_image2d;
+            best_len = payload.len;
+            best_payload = payload;
+        } else alloc.free(payload);
+    }
+
     return .{ .comp_type = best_type, .payload = best_payload };
 }
 
@@ -1174,6 +1274,7 @@ fn fallbackLabel(ct: container.CompressionType) []const u8 {
         .math_blocks => "BLOCKS  ",
         .math_filtered => "FILTERED",
         .math_columnar => "COLUMNAR",
+        .math_image2d => "IMAGE2D ",
         else => "STORE   ",
     };
 }
@@ -2130,7 +2231,7 @@ fn packFileAutoParallel(ctx: *PackCtxAuto, rel_path: []u8) !void {
     const orig_size = data.len;
 
     const canvas = canvasForLen(data.len);
-    var prog_info = translator.TranslateProgress{ .cancel_flag = ctx.cancel_flag, .max_iters = if (data.len > 256 * 1024) 0 else ctx.effort.math_iters };
+    var prog_info = translator.TranslateProgress{ .cancel_flag = ctx.cancel_flag, .max_iters = if (data.len > 16 * 1024) 0 else ctx.effort.math_iters };
     const result = translator.translate(data, canvas.w, canvas.h, alloc, &prog_info) catch translator.TranslateResult{ .fallback = .{ .reason = .high_entropy, .entropy = 100.0 } };
 
     var line_buf: [std.fs.max_path_bytes + 128]u8 = undefined;
@@ -2422,7 +2523,7 @@ fn packFileSolidParallel(ctx: *PackCtxAuto, rel_path: []u8) !void {
 
     // Math translation runs outside the lock.
     const canvas = canvasForLen(data.len);
-    var prog_info = translator.TranslateProgress{ .cancel_flag = ctx.cancel_flag, .max_iters = if (data.len > 256 * 1024) 0 else ctx.effort.math_iters };
+    var prog_info = translator.TranslateProgress{ .cancel_flag = ctx.cancel_flag, .max_iters = if (data.len > 16 * 1024) 0 else ctx.effort.math_iters };
     const result = translator.translate(data, canvas.w, canvas.h, alloc, &prog_info) catch
         translator.TranslateResult{ .fallback = .{ .reason = .high_entropy, .entropy = 100.0 } };
 
@@ -2861,7 +2962,7 @@ pub fn packTarFullAbi(
                     const canvas = canvasForLen(data.len);
                     // Noise search can only match small procedural textures; cap
                     // budget to 0 above 256KB so it never grinds large files.
-                    const iters: u32 = if (data.len > 256 * 1024) 0 else eff.math_iters;
+                    const iters: u32 = if (data.len > 16 * 1024) 0 else eff.math_iters;
                     var pi = translator.TranslateProgress{ .cancel_flag = cancel, .max_iters = iters };
                     if (translator.translate(data, canvas.w, canvas.h, aa, &pi)) |res| {
                         switch (res) {
@@ -2986,9 +3087,39 @@ pub fn packTarFullAbi(
         const tar_data = try tf.readToEndAlloc(root, @intCast(tsize));
         defer root.free(tar_data);
         const csum = container.fnv1a(tar_data);
-        // x86 BCJ filter chain (xz --x86 grade) in front of LZMA — the .xz
-        // stream self-describes the chain, so decode needs no special case.
-        const comp = try container.lzmaCompressX86(tar_data, root, container.lzmaPreset(effort_tier));
+        const preset = container.lzmaPreset(effort_tier);
+
+        // The x86 BCJ chain (xz --x86 grade) wins on code-heavy data but can
+        // LOSE to plain LZMA on data-heavy content (false E8/E9 conversions).
+        // At Max, compress both ways in parallel and keep the smaller — this
+        // guarantees full mode never loses to either `xz -9e` or `-9e --x86`.
+        // Both are codec=lzma and the .xz header self-describes the filter, so
+        // decode is identical either way.
+        const Job = struct {
+            data: []const u8,
+            preset: u32,
+            alloc: std.mem.Allocator,
+            out: ?[]u8 = null,
+            fn runPlain(self: *@This()) void {
+                self.out = container.lzmaCompress(self.data, self.alloc, self.preset) catch null;
+            }
+        };
+        var plain_job = Job{ .data = tar_data, .preset = preset, .alloc = root };
+        const plain_thread: ?std.Thread = if (effort_tier == 2)
+            (std.Thread.spawn(.{}, Job.runPlain, .{&plain_job}) catch null)
+        else
+            null;
+
+        var comp = try container.lzmaCompressX86(tar_data, root, preset);
+        if (plain_thread) |th| {
+            th.join();
+            if (plain_job.out) |plain| {
+                if (plain.len < comp.len) {
+                    root.free(comp);
+                    comp = plain;
+                } else root.free(plain);
+            }
+        }
         defer root.free(comp);
         // STORE guard: never let the wrapper inflate the tar.
         if (comp.len < tar_data.len) {

@@ -121,6 +121,7 @@ pub const CompressionType = enum(u8) {
     math_blocks     = 0x07, // per-block decomposition: equations + literal stream
     math_filtered   = 0x08, // reversible math filter applied, then compressed
     math_columnar   = 0x09, // AoS->SoA transpose (record arrays), then compressed
+    math_image2d    = 0x0A, // 2D MED predictor over raw raster, then compressed
 };
 
 /// Per-entry compression codec (FAT byte 245). gzip = 0 is the legacy default,
@@ -1374,6 +1375,7 @@ pub const Reader = struct {
             .math_blocks     => extractMathBlocks(block, entry.original_size, entry.codec, a),
             .math_filtered   => extractFiltered(block, entry.original_size, entry.codec, a),
             .math_columnar   => extractColumnar(block, entry.original_size, entry.codec, a),
+            .math_image2d    => extractImage2D(block, entry.original_size, entry.codec, a),
             // A symlink's "contents" are its target path, stored verbatim.
             .symlink         => extractStore(block, entry.original_size, a),
             .solid_block     => extractSolidEntry(
@@ -1744,6 +1746,122 @@ test "columnar transform is an exact involution" {
     const back = try columnarInverse(fwd, stride, a);
     defer a.free(back);
     try testing.expectEqualSlices(u8, data, back);
+}
+
+// ---------------------------------------------------------------------------
+// 2D MED image predictor (LOCO-I / JPEG-LS, also PNG's "Paeth"-family idea)
+//
+// Raw raster (TGA/PGM/PPM/uncompressed textures) is 2D-correlated: a pixel is
+// close to its left, up, and up-left neighbors. The Median Edge Detector picks
+// min/max/gradient based on those three, and we store the residual
+// (pixel -% prediction). On smooth images the residuals collapse to near-zero
+// runs the codec crushes — and crucially, general compressors (xz/zstd/brotli)
+// have NO 2D predictor, only 1D delta, so this is net-new ground on raster.
+// Per-channel (stride = channels); exact involution (raster order, neighbors
+// are always already-known).
+// ---------------------------------------------------------------------------
+
+fn medPredict(a: u8, b: u8, c: u8) u8 {
+    const mx = @max(a, b);
+    const mn = @min(a, b);
+    if (c >= mx) return mn;
+    if (c <= mn) return mx;
+    // Gradient predictor a+b-c, clamped to [0,255] (standard MED; clamping
+    // predicts better than wrapping and is equally reversible — deterministic).
+    const p: i32 = @as(i32, a) + @as(i32, b) - @as(i32, c);
+    if (p < 0) return 0;
+    if (p > 255) return 255;
+    return @intCast(p);
+}
+
+pub fn medForward(src: []const u8, w: u32, h: u32, ch: u8, a: std.mem.Allocator) ![]u8 {
+    const out = try a.alloc(u8, src.len);
+    errdefer a.free(out);
+    const c: usize = ch;
+    const row = @as(usize, w) * c;
+    var y: usize = 0;
+    while (y < h) : (y += 1) {
+        var x: usize = 0;
+        while (x < w) : (x += 1) {
+            var k: usize = 0;
+            while (k < c) : (k += 1) {
+                const idx = y * row + x * c + k;
+                const left = if (x > 0) src[idx - c] else 0;
+                const up = if (y > 0) src[idx - row] else 0;
+                const ul = if (x > 0 and y > 0) src[idx - row - c] else 0;
+                out[idx] = src[idx] -% medPredict(left, up, ul);
+            }
+        }
+    }
+    return out;
+}
+
+/// Inverse MED, in place: `buf` enters as residuals, leaves as pixels.
+fn medInverse(buf: []u8, w: u32, h: u32, ch: u8) void {
+    const c: usize = ch;
+    const row = @as(usize, w) * c;
+    var y: usize = 0;
+    while (y < h) : (y += 1) {
+        var x: usize = 0;
+        while (x < w) : (x += 1) {
+            var k: usize = 0;
+            while (k < c) : (k += 1) {
+                const idx = y * row + x * c + k;
+                const left = if (x > 0) buf[idx - c] else 0;
+                const up = if (y > 0) buf[idx - row] else 0;
+                const ul = if (x > 0 and y > 0) buf[idx - row - c] else 0;
+                buf[idx] = buf[idx] +% medPredict(left, up, ul);
+            }
+        }
+    }
+}
+
+/// MATH_IMAGE2D block layout:
+///   [u32 header_len][u32 footer_len][u32 width][u32 height][u8 channels][T]
+/// where T (length == original_size, codec-compressed) is
+///   raw header ++ medForward(pixels) ++ raw footer.
+/// Header and footer (e.g. a TGA 2.0 footer) stay verbatim; only the pixel
+/// region is predicted.
+fn extractImage2D(block: []const u8, original_size: u64, codec: Codec, a: std.mem.Allocator) ![]u8 {
+    if (block.len < 17) return error.TruncatedContainer;
+    const header_len: usize = std.mem.readInt(u32, block[0..4], .little);
+    const footer_len: usize = std.mem.readInt(u32, block[4..8], .little);
+    const w = std.mem.readInt(u32, block[8..12], .little);
+    const h = std.mem.readInt(u32, block[12..16], .little);
+    const ch = block[16];
+    if (ch == 0 or w == 0 or h == 0) return error.TruncatedContainer;
+    const pixels = @as(u64, w) * h * ch;
+    if (header_len + pixels + footer_len != original_size) return error.SizeMismatch;
+
+    const t = try inflateBlock(block[17..], original_size, codec, a);
+    errdefer a.free(t);
+    if (t.len != original_size) return error.SizeMismatch;
+    // Header (front) and footer (back) are verbatim; invert MED over the pixels.
+    medInverse(t[header_len .. header_len + @as(usize, @intCast(pixels))], w, h, ch);
+    return t;
+}
+
+test "2D MED predictor is an exact involution" {
+    const a = testing.allocator;
+    var rng = @import("math_gen.zig").XorShift32.init(0x2D2D);
+    const w: u32 = 64;
+    const h: u32 = 48;
+    const ch: u8 = 3;
+    const pixels = try a.alloc(u8, w * h * ch);
+    defer a.free(pixels);
+    // Smooth gradient + a little noise (a plausible image).
+    for (0..h) |y| {
+        for (0..w) |x| {
+            for (0..ch) |k| {
+                const v = (x * 3 + y * 2 + k * 40) & 0xFF;
+                pixels[(y * w + x) * ch + k] = @truncate(v +% (rng.nextByte() & 3));
+            }
+        }
+    }
+    const res = try medForward(pixels, w, h, ch, a);
+    defer a.free(res);
+    medInverse(res, w, h, ch);
+    try testing.expectEqualSlices(u8, pixels, res);
 }
 
 test "filters are exact involutions" {

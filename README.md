@@ -46,6 +46,7 @@ When you pack a directory, Mathpressor automatically routes each file:
 | `MATH_BLOCKS` | `0x07` | Pages part-equation, part-data | per-block descriptors + literal stream |
 | `MATH_FILTERED` | `0x08` | Reversible transform helps the codec | filter id + compressed filtered stream |
 | `MATH_COLUMNAR` | `0x09` | Record array (vertex/float tables) | AoS→SoA transpose + compressed |
+| `MATH_IMAGE2D` | `0x0A` | Raw raster (TGA/PGM/PPM) | 2D MED predictor + compressed |
 
 All four routes reconstruct to bit-identical original bytes. To the caller, they are invisible.
 
