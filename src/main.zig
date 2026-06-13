@@ -1403,27 +1403,59 @@ fn detectImage(data: []const u8) ?ImageInfo {
 fn bestImage2DBlock(data: []const u8, effort: Effort, final_comp: container.Compressor, alloc: std.mem.Allocator) !?[]u8 {
     if (effort.tier == 0 or data.len < 256) return null;
     const info = detectImage(data) orelse return null;
-
     const pix_end = data.len - info.footer_len;
-    const residual = try container.medForward(data[info.header_len..pix_end], info.width, info.height, info.channels, alloc);
-    defer alloc.free(residual);
-    // transformed = header ++ residual ++ footer (verbatim ends), len == data.len
-    const transformed = try alloc.alloc(u8, data.len);
-    defer alloc.free(transformed);
-    @memcpy(transformed[0..info.header_len], data[0..info.header_len]);
-    @memcpy(transformed[info.header_len..pix_end], residual);
-    @memcpy(transformed[pix_end..], data[pix_end..]);
 
-    const comp = try final_comp.compress(transformed, alloc);
-    defer alloc.free(comp);
-    const payload = try alloc.alloc(u8, 17 + comp.len);
-    std.mem.writeInt(u32, payload[0..4], @intCast(info.header_len), .little);
-    std.mem.writeInt(u32, payload[4..8], @intCast(info.footer_len), .little);
-    std.mem.writeInt(u32, payload[8..12], info.width, .little);
-    std.mem.writeInt(u32, payload[12..16], info.height, .little);
-    payload[16] = info.channels;
-    @memcpy(payload[17..], comp);
-    return payload;
+    // Keep-smaller over {interleaved, planar} × {plain, subtract-green}. Planar
+    // (per-plane MED) groups same-channel residuals; subtract-green decorrelates
+    // colour. Both are reversible; the choices are recorded in the channels byte
+    // (bit6 planar, bit7 subtract-green) so decode reverses them.
+    const ch: usize = info.channels;
+    const n: usize = @as(usize, info.width) * info.height;
+    var best: ?[]u8 = null;
+    for ([_]bool{ false, true }) |planar| {
+        for ([_]bool{ false, true }) |sg| {
+            if (sg and ch < 3) continue; // colour transform needs RGB(A)
+            if (planar and ch < 2) continue; // planar pointless for 1 channel
+            const px = try alloc.dupe(u8, data[info.header_len..pix_end]);
+            defer alloc.free(px);
+            if (sg) container.subtractGreen(px, ch);
+            // residual = MED (interleaved, or per-plane after deinterleave)
+            var residual: []u8 = undefined;
+            if (planar) {
+                const pl = try container.deinterleavePlanes(px, ch, alloc);
+                defer alloc.free(pl);
+                residual = try alloc.alloc(u8, px.len);
+                var c: usize = 0;
+                while (c < ch) : (c += 1) {
+                    const r = try container.medForward(pl[c * n .. c * n + n], info.width, info.height, 1, alloc);
+                    defer alloc.free(r);
+                    @memcpy(residual[c * n .. c * n + n], r);
+                }
+            } else {
+                residual = try container.medForward(px, info.width, info.height, info.channels, alloc);
+            }
+            defer alloc.free(residual);
+            const transformed = try alloc.alloc(u8, data.len);
+            defer alloc.free(transformed);
+            @memcpy(transformed[0..info.header_len], data[0..info.header_len]);
+            @memcpy(transformed[info.header_len..pix_end], residual);
+            @memcpy(transformed[pix_end..], data[pix_end..]);
+            const comp = try final_comp.compress(transformed, alloc);
+            defer alloc.free(comp);
+            const payload = try alloc.alloc(u8, 17 + comp.len);
+            std.mem.writeInt(u32, payload[0..4], @intCast(info.header_len), .little);
+            std.mem.writeInt(u32, payload[4..8], @intCast(info.footer_len), .little);
+            std.mem.writeInt(u32, payload[8..12], info.width, .little);
+            std.mem.writeInt(u32, payload[12..16], info.height, .little);
+            payload[16] = info.channels | (if (sg) @as(u8, 0x80) else 0) | (if (planar) @as(u8, 0x40) else 0);
+            @memcpy(payload[17..], comp);
+            if (best == null or payload.len < best.?.len) {
+                if (best) |b| alloc.free(b);
+                best = payload;
+            } else alloc.free(payload);
+        }
+    }
+    return best;
 }
 
 const AudioInfo = struct { header_len: usize, data_len: usize, channels: u8 };

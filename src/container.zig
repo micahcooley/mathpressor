@@ -1862,6 +1862,56 @@ fn medPredict(a: u8, b: u8, c: u8) u8 {
     return @intCast(p);
 }
 
+// Reversible "subtract green" colour decorrelation (lossless WebP / JPEG-XL):
+// for RGB(A) pixels, replace R,B with (R-G),(B-G) mod 256, leaving G (luma proxy)
+// and A untouched. Natural images have R≈G≈B, so R-G and B-G collapse toward
+// zero — a big win before the 2D predictor — and it's exactly reversible in 8
+// bits. Applied to the interleaved pixel stream in place.
+pub fn subtractGreen(buf: []u8, ch: usize) void {
+    if (ch < 3) return;
+    var p: usize = 0;
+    while (p + ch <= buf.len) : (p += ch) {
+        const g = buf[p + 1];
+        buf[p + 0] = buf[p + 0] -% g;
+        buf[p + 2] = buf[p + 2] -% g;
+    }
+}
+pub fn addGreen(buf: []u8, ch: usize) void {
+    if (ch < 3) return;
+    var p: usize = 0;
+    while (p + ch <= buf.len) : (p += ch) {
+        const g = buf[p + 1];
+        buf[p + 0] = buf[p + 0] +% g;
+        buf[p + 2] = buf[p + 2] +% g;
+    }
+}
+
+// Deinterleave an interleaved pixel stream (R0G0B0 R1G1B1 …) into planes
+// (R0R1… G0G1… B0B1…) and back. Planar layout groups each channel's MED
+// residuals together, which the LZ/CM stage models far better than interleaved.
+pub fn deinterleavePlanes(px: []const u8, ch: usize, a: std.mem.Allocator) ![]u8 {
+    const out = try a.alloc(u8, px.len);
+    errdefer a.free(out);
+    const n = px.len / ch;
+    var c: usize = 0;
+    while (c < ch) : (c += 1) {
+        var i: usize = 0;
+        while (i < n) : (i += 1) out[c * n + i] = px[i * ch + c];
+    }
+    return out;
+}
+pub fn interleavePlanes(planar: []const u8, ch: usize, a: std.mem.Allocator) ![]u8 {
+    const out = try a.alloc(u8, planar.len);
+    errdefer a.free(out);
+    const n = planar.len / ch;
+    var c: usize = 0;
+    while (c < ch) : (c += 1) {
+        var i: usize = 0;
+        while (i < n) : (i += 1) out[i * ch + c] = planar[c * n + i];
+    }
+    return out;
+}
+
 pub fn medForward(src: []const u8, w: u32, h: u32, ch: u8, a: std.mem.Allocator) ![]u8 {
     const out = try a.alloc(u8, src.len);
     errdefer a.free(out);
@@ -1905,18 +1955,22 @@ fn medInverse(buf: []u8, w: u32, h: u32, ch: u8) void {
 }
 
 /// MATH_IMAGE2D block layout:
-///   [u32 header_len][u32 footer_len][u32 width][u32 height][u8 channels][T]
+///   [u32 header_len][u32 footer_len][u32 width][u32 height][u8 chflags][T]
 /// where T (length == original_size, codec-compressed) is
-///   raw header ++ medForward(pixels) ++ raw footer.
-/// Header and footer (e.g. a TGA 2.0 footer) stay verbatim; only the pixel
-/// region is predicted.
+///   raw header ++ medForward(maybe subtractGreen(pixels)) ++ raw footer.
+/// chflags: low 6 bits = channels (1-4); bit 7 = subtract-green applied;
+/// bit 6 = planar layout (per-plane MED). channels is always ≤4, so old archives
+/// (bits 6-7 clear) decode as interleaved MED with no colour step — unchanged.
 fn extractImage2D(block: []const u8, original_size: u64, codec: Codec, a: std.mem.Allocator) ![]u8 {
     if (block.len < 17) return error.TruncatedContainer;
     const header_len: usize = std.mem.readInt(u32, block[0..4], .little);
     const footer_len: usize = std.mem.readInt(u32, block[4..8], .little);
     const w = std.mem.readInt(u32, block[8..12], .little);
     const h = std.mem.readInt(u32, block[12..16], .little);
-    const ch = block[16];
+    const chflags = block[16];
+    const sg = (chflags & 0x80) != 0;
+    const planar = (chflags & 0x40) != 0;
+    const ch: u8 = chflags & 0x3F;
     if (ch == 0 or w == 0 or h == 0) return error.TruncatedContainer;
     const pixels = @as(u64, w) * h * ch;
     if (header_len + pixels + footer_len != original_size) return error.SizeMismatch;
@@ -1924,8 +1978,19 @@ fn extractImage2D(block: []const u8, original_size: u64, codec: Codec, a: std.me
     const t = try inflateBlock(block[17..], original_size, codec, a);
     errdefer a.free(t);
     if (t.len != original_size) return error.SizeMismatch;
-    // Header (front) and footer (back) are verbatim; invert MED over the pixels.
-    medInverse(t[header_len .. header_len + @as(usize, @intCast(pixels))], w, h, ch);
+    const px = t[header_len .. header_len + @as(usize, @intCast(pixels))];
+    if (planar) {
+        // Per-plane MED inverse, then reinterleave back to interleaved pixels.
+        const n: usize = @as(usize, w) * h;
+        var c: usize = 0;
+        while (c < ch) : (c += 1) medInverse(px[c * n .. c * n + n], w, h, 1);
+        const inter = try interleavePlanes(px, ch, a);
+        defer a.free(inter);
+        @memcpy(px, inter);
+    } else {
+        medInverse(px, w, h, ch);
+    }
+    if (sg) addGreen(px, ch);
     return t;
 }
 
