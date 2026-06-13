@@ -1520,44 +1520,58 @@ fn detectAudio(data: []const u8) ?AudioInfo {
 fn bestAudioBlock(data: []const u8, effort: Effort, final_comp: container.Compressor, alloc: std.mem.Allocator) !?[]u8 {
     if (effort.tier == 0 or data.len < 256) return null;
     const info = detectAudio(data) orelse return null;
-    const region = data[info.header_len .. info.header_len + info.data_len];
-
-    var best_order: u8 = 0;
-    var best_cost: u64 = std.math.maxInt(u64);
-    var ord: u8 = 0;
-    while (ord <= 3) : (ord += 1) {
-        const res = try container.lpcForward(region, info.channels, ord, alloc);
-        defer alloc.free(res);
-        var cost: u64 = 0;
-        var j: usize = 0;
-        while (j + 1 < res.len) : (j += 2) {
-            const v: i32 = @as(i16, @bitCast(std.mem.readInt(u16, res[j..][0..2], .little)));
-            cost += @abs(v);
-        }
-        if (cost < best_cost) {
-            best_cost = cost;
-            best_order = ord;
-        }
-    }
-
-    const residual = try container.lpcForward(region, info.channels, best_order, alloc);
-    defer alloc.free(residual);
-    const transformed = try alloc.alloc(u8, data.len);
-    defer alloc.free(transformed);
     const dend = info.header_len + info.data_len;
-    @memcpy(transformed[0..info.header_len], data[0..info.header_len]);
-    @memcpy(transformed[info.header_len..dend], residual);
-    @memcpy(transformed[dend..], data[dend..]);
 
-    const comp = try final_comp.compress(transformed, alloc);
-    defer alloc.free(comp);
-    const payload = try alloc.alloc(u8, 10 + comp.len);
-    std.mem.writeInt(u32, payload[0..4], @intCast(info.header_len), .little);
-    std.mem.writeInt(u32, payload[4..8], @intCast(info.data_len), .little);
-    payload[8] = info.channels;
-    payload[9] = best_order;
-    @memcpy(payload[10..], comp);
-    return payload;
+    // Keep-smaller over {plain, mid/side} (stereo decorrelation, reversible +
+    // fast → live-safe), each with the best fixed-predictor order. Recorded in
+    // the channels byte's high bit so decode reverses mid/side.
+    var best: ?[]u8 = null;
+    for ([_]bool{ false, true }) |ms| {
+        if (ms and info.channels != 2) continue;
+        const region = try alloc.dupe(u8, data[info.header_len..dend]);
+        defer alloc.free(region);
+        if (ms) container.midSideForward(region);
+
+        var best_order: u8 = 0;
+        var best_cost: u64 = std.math.maxInt(u64);
+        var ord: u8 = 0;
+        while (ord <= 3) : (ord += 1) {
+            const res = try container.lpcForward(region, info.channels, ord, alloc);
+            defer alloc.free(res);
+            var cost: u64 = 0;
+            var j: usize = 0;
+            while (j + 1 < res.len) : (j += 2) {
+                const v: i32 = @as(i16, @bitCast(std.mem.readInt(u16, res[j..][0..2], .little)));
+                cost += @abs(v);
+            }
+            if (cost < best_cost) {
+                best_cost = cost;
+                best_order = ord;
+            }
+        }
+
+        const residual = try container.lpcForward(region, info.channels, best_order, alloc);
+        defer alloc.free(residual);
+        const transformed = try alloc.alloc(u8, data.len);
+        defer alloc.free(transformed);
+        @memcpy(transformed[0..info.header_len], data[0..info.header_len]);
+        @memcpy(transformed[info.header_len..dend], residual);
+        @memcpy(transformed[dend..], data[dend..]);
+
+        const comp = try final_comp.compress(transformed, alloc);
+        defer alloc.free(comp);
+        const payload = try alloc.alloc(u8, 10 + comp.len);
+        std.mem.writeInt(u32, payload[0..4], @intCast(info.header_len), .little);
+        std.mem.writeInt(u32, payload[4..8], @intCast(info.data_len), .little);
+        payload[8] = info.channels | (if (ms) @as(u8, 0x80) else 0);
+        payload[9] = best_order;
+        @memcpy(payload[10..], comp);
+        if (best == null or payload.len < best.?.len) {
+            if (best) |b| alloc.free(b);
+            best = payload;
+        } else alloc.free(payload);
+    }
+    return best;
 }
 
 /// Per-file BCJ2 for regular mode: an x86 binary gets the same 4-stream

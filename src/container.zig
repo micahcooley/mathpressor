@@ -2123,11 +2123,42 @@ fn lpcInverse(res: []const u8, channels: u8, order: u8, a: std.mem.Allocator) ![
 ///   raw header ++ lpcForward(samples) ++ raw trailer.
 /// The WAV header and any post-data chunks stay verbatim; only the PCM sample
 /// region is predicted.
+// Reversible lossless mid/side for 16-bit stereo (FLAC-style lifting): L/R are
+// usually highly correlated, so S=L-R collapses. In place over interleaved L R.
+//   forward: S = L - R; M = R + (S>>1)   inverse: R = M - (S>>1); L = R + S
+// (>>1 is an arithmetic shift on the stored i16, identical both ways.)
+pub fn midSideForward(region: []u8) void {
+    var i: usize = 0;
+    while (i + 4 <= region.len) : (i += 4) {
+        const l: i16 = @bitCast(std.mem.readInt(u16, region[i..][0..2], .little));
+        const r: i16 = @bitCast(std.mem.readInt(u16, region[i + 2 ..][0..2], .little));
+        const s: i16 = l -% r;
+        const m: i16 = r +% (s >> 1);
+        std.mem.writeInt(u16, region[i..][0..2], @bitCast(m), .little);
+        std.mem.writeInt(u16, region[i + 2 ..][0..2], @bitCast(s), .little);
+    }
+}
+pub fn midSideInverse(region: []u8) void {
+    var i: usize = 0;
+    while (i + 4 <= region.len) : (i += 4) {
+        const m: i16 = @bitCast(std.mem.readInt(u16, region[i..][0..2], .little));
+        const s: i16 = @bitCast(std.mem.readInt(u16, region[i + 2 ..][0..2], .little));
+        const r: i16 = m -% (s >> 1);
+        const l: i16 = r +% s;
+        std.mem.writeInt(u16, region[i..][0..2], @bitCast(l), .little);
+        std.mem.writeInt(u16, region[i + 2 ..][0..2], @bitCast(r), .little);
+    }
+}
+
+/// MATH_AUDIO block: [u32 header_len][u32 data_len][u8 chflags][u8 order][T].
+/// chflags: low 7 bits = channels; bit 7 = mid/side stereo decorrelation applied.
 fn extractAudio(block: []const u8, original_size: u64, codec: Codec, a: std.mem.Allocator) ![]u8 {
     if (block.len < 10) return error.TruncatedContainer;
     const header_len: usize = std.mem.readInt(u32, block[0..4], .little);
     const data_len: usize = std.mem.readInt(u32, block[4..8], .little);
-    const channels = block[8];
+    const chflags = block[8];
+    const ms = (chflags & 0x80) != 0;
+    const channels = chflags & 0x7F;
     const order = block[9];
     if (channels == 0) return error.TruncatedContainer;
     if (@as(u64, header_len) + data_len > original_size) return error.SizeMismatch;
@@ -2135,9 +2166,11 @@ fn extractAudio(block: []const u8, original_size: u64, codec: Codec, a: std.mem.
     const t = try inflateBlock(block[10..], original_size, codec, a);
     errdefer a.free(t);
     if (t.len != original_size) return error.SizeMismatch;
-    const samples = try lpcInverse(t[header_len .. header_len + data_len], channels, order, a);
+    const region = t[header_len .. header_len + data_len];
+    const samples = try lpcInverse(region, channels, order, a);
     defer a.free(samples);
-    @memcpy(t[header_len .. header_len + data_len], samples);
+    @memcpy(region, samples);
+    if (ms) midSideInverse(region); // reverse stereo decorrelation last
     return t;
 }
 
