@@ -570,6 +570,25 @@ fn jobShouldStop(cancel_flag: ?*const std.atomic.Value(u8)) bool {
     return cf.load(.monotonic) == 1;
 }
 
+// Whole-file dedup: SHA-256 of raw content -> the shared blob's location/meta,
+// so exact-duplicate files cost one blob. SHA-256 (not the FNV-1a u32 checksum)
+// because a dedup collision would corrupt data; 256-bit makes that impossible
+// in practice. Shared across the parallel pack under a mutex.
+const DedupVal = struct {
+    offset: u64,
+    csize: u64,
+    ctype: container.CompressionType,
+    codec: container.Codec,
+    solid_index: u32,
+};
+const DedupMap = std.AutoHashMap([32]u8, DedupVal);
+
+fn sha256(data: []const u8) [32]u8 {
+    var out: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &out, .{});
+    return out;
+}
+
 const PackCtx = struct {
     alloc: std.mem.Allocator,
     base_dir: []const u8,
@@ -2437,19 +2456,115 @@ pub fn packDirectoryVfsAbi(
     try collectWalk(root, dir_path, "", &path_buf, &jobs, cancel_flag);
     removeOutputJob(&jobs, root, dir_path, out_path);
 
+    // Whole-file dedup pre-pass (serial): SHA-256 each file, split into unique
+    // representatives and exact duplicates. Done before the parallel pass to
+    // avoid the TOCTOU where concurrent copies all miss an empty map. Symlinks,
+    // huge (streamed), and over-long-path files are never deduped.
+    const DupRef = struct { rel: []const u8, sha: [32]u8, csum: u32, orig: u64 };
+    var reps = std.ArrayList([]u8).init(root);
+    defer reps.deinit();
+    var dups = std.ArrayList(DupRef).init(root);
+    defer dups.deinit();
+    var rep_path_to_sha = std.StringHashMap([32]u8).init(root);
+    defer rep_path_to_sha.deinit();
+    {
+        var seen = std.AutoHashMap([32]u8, void).init(root);
+        defer seen.deinit();
+        var pb: [std.fs.max_path_bytes]u8 = undefined;
+        for (jobs.items) |rel| {
+            const full = std.fmt.bufPrint(&pb, "{s}/{s}", .{ dir_path, rel }) catch {
+                reps.append(rel) catch {};
+                continue;
+            };
+            var lb: [std.fs.max_path_bytes]u8 = undefined;
+            if (std.fs.cwd().readLink(full, &lb)) |_| {
+                reps.append(rel) catch {};
+                continue;
+            } else |_| {}
+            const st = std.fs.cwd().statFile(full) catch {
+                reps.append(rel) catch {};
+                continue;
+            };
+            if (st.kind != .file or st.size == 0 or st.size > STREAM_THRESHOLD or rel.len >= container.MAX_PATH_LEN) {
+                reps.append(rel) catch {};
+                continue;
+            }
+            const f = std.fs.cwd().openFile(full, .{}) catch {
+                reps.append(rel) catch {};
+                continue;
+            };
+            defer f.close();
+            const fdata = f.readToEndAlloc(root, STREAM_THRESHOLD) catch {
+                reps.append(rel) catch {};
+                continue;
+            };
+            defer root.free(fdata);
+            const sh = sha256(fdata);
+            if (seen.contains(sh)) {
+                try dups.append(.{ .rel = rel, .sha = sh, .csum = container.fnv1a(fdata), .orig = fdata.len });
+            } else {
+                try seen.put(sh, {});
+                try rep_path_to_sha.put(rel, sh);
+                try reps.append(rel);
+            }
+        }
+    }
+
     var ctx = PackCtx{
-        .alloc    = root,
+        .alloc = root,
         .base_dir = dir_path,
-        .cb       = &cb,
-        .out      = std.io.getStdOut().writer().any(),
+        .cb = &cb,
+        .out = std.io.getStdOut().writer().any(),
         .cancel_flag = cancel_flag,
-        .effort   = effort,
+        .effort = effort,
     };
 
-    // Parallel across all cores (libc is linked, so pthread-backed thread
-    // spawning works inside the dlopened .so). Per-file workers serialise only
-    // the cheap tmp-file append; compression runs lock-free.
-    try runStreamJobsParallel(root, &ctx, jobs.items, cancel_flag, progress_ptr, ticker_ptr);
+    // Parallel pass over representatives only.
+    try runStreamJobsParallel(root, &ctx, reps.items, cancel_flag, progress_ptr, ticker_ptr);
+
+    // Dedup post-pass: map each rep's content hash to the blob it was packed
+    // into (by value, so appending below can't dangle it), then append a FAT
+    // row per duplicate pointing at that shared blob — zero extra data bytes.
+    if (dups.items.len > 0) {
+        var meta = DedupMap.init(root);
+        defer meta.deinit();
+        for (cb.fat.items) |e| {
+            if (rep_path_to_sha.get(e.getPath())) |sh| {
+                meta.put(sh, .{ .offset = e.data_offset, .csize = e.compressed_size, .ctype = e.comp_type, .codec = e.codec, .solid_index = e.solid_index }) catch {};
+            }
+        }
+        var deduped: u32 = 0;
+        for (dups.items) |d| {
+            if (meta.get(d.sha)) |v| {
+                var fat = container.FatEntry{
+                    .comp_type = v.ctype,
+                    .solid_index = v.solid_index,
+                    .data_offset = v.offset,
+                    .original_size = d.orig,
+                    .compressed_size = v.csize,
+                    .checksum = d.csum,
+                    .codec = v.codec,
+                };
+                fat.setPath(d.rel) catch continue;
+                cb.appendDedup(fat) catch continue;
+                deduped += 1;
+            } else {
+                // Rep wasn't packed (worker skip): pack the duplicate normally.
+                var pb2: [std.fs.max_path_bytes]u8 = undefined;
+                const full = std.fmt.bufPrint(&pb2, "{s}/{s}", .{ dir_path, d.rel }) catch continue;
+                const f = std.fs.cwd().openFile(full, .{}) catch continue;
+                defer f.close();
+                const fdata = f.readToEndAlloc(root, STREAM_THRESHOLD) catch continue;
+                defer root.free(fdata);
+                _ = cb.addBinary(d.rel, fdata) catch continue;
+            }
+        }
+        if (deduped > 0) {
+            var mbuf: [64]u8 = undefined;
+            const ml = std.fmt.bufPrint(&mbuf, "  DEDUP     {d} duplicate file(s) share blobs\n", .{deduped}) catch "";
+            std.io.getStdOut().writeAll(ml) catch {};
+        }
+    }
 
     const out_file = try std.fs.cwd().createFile(out_path, .{});
     defer out_file.close();

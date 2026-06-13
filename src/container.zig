@@ -434,6 +434,16 @@ pub const StreamingBuilder = struct {
         try self.fat.append(entry);
     }
 
+    /// Register a FAT entry that REUSES an already-written blob (whole-file
+    /// dedup): caller sets fat.data_offset / compressed_size / comp_type / codec
+    /// to the shared blob's, plus its own path / checksum / original_size. No
+    /// bytes are written and the cursor doesn't advance — two identical files
+    /// cost one blob. Extract is offset-based and stateless, so this stays fully
+    /// live (random access) with zero added decode cost.
+    pub fn appendDedup(self: *StreamingBuilder, fat: FatEntry) !void {
+        try self.fat.append(fat);
+    }
+
     pub fn addMath(
         self: *StreamingBuilder,
         path: []const u8,
