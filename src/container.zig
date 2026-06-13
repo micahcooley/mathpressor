@@ -48,6 +48,7 @@
 
 const std = @import("std");
 const vm_mod = @import("vm.zig");
+const bcj2 = @import("bcj2.zig");
 
 // ---------------------------------------------------------------------------
 // Format constants
@@ -136,6 +137,7 @@ pub const CompressionType = enum(u8) {
     math_image2d    = 0x0A, // 2D MED predictor over raw raster, then compressed
     math_dict       = 0x0B, // zstd frame compressed against a shared trained dictionary
     math_audio      = 0x0C, // fixed-order LPC over PCM (WAV) samples, then compressed
+    math_bcj2       = 0x0D, // full mode: 4-stream BCJ2 x86 filter, each LZMA'd
 };
 
 /// Per-entry compression codec (FAT byte 245). gzip = 0 is the legacy default,
@@ -1457,6 +1459,7 @@ pub const Reader = struct {
                 break :blk zstdDecompressUsingDict(block, entry.original_size, self.dicts[entry.solid_index], a);
             },
             .math_audio      => extractAudio(block, entry.original_size, entry.codec, a),
+            .math_bcj2       => extractBcj2(block, entry.original_size, a),
             // A symlink's "contents" are its target path, stored verbatim.
             .symlink         => extractStore(block, entry.original_size, a),
             .solid_block     => extractSolidEntry(
@@ -2417,6 +2420,87 @@ pub fn lzmaDecompress(block: []const u8, original_size: u64, a: std.mem.Allocato
     if (rc != LZMA_OK) return error.LzmaDecompressFailed;
     if (out_pos != original_size) return error.SizeMismatch;
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// BCJ2 block (full mode): the 4 BCJ2 streams, each LZMA-compressed, in one blob.
+// Layout (header 29 B):
+//   [u8 version=1]
+//   [u32 main_ulen][u32 main_clen]
+//   [u32 call_ulen][u32 call_clen]
+//   [u32 jump_ulen][u32 jump_clen]
+//   [u32 rc_len]
+//   [LZMA(main)][LZMA(call)][LZMA(jump)][rc]
+// rc is already range-coded so it's stored raw. Empty streams have clen 0.
+// ---------------------------------------------------------------------------
+
+const BCJ2_HDR: usize = 29;
+
+fn lzmaOrEmpty(data: []const u8, preset: u32, a: std.mem.Allocator) ![]u8 {
+    if (data.len == 0) return a.alloc(u8, 0);
+    return lzmaCompress(data, a, preset);
+}
+
+/// Build a MATH_BCJ2 block from `tar`: split via BCJ2, LZMA each stream.
+/// Returns owned bytes (the entry block). original_size for the FAT == tar.len.
+pub fn buildBcj2Block(tar: []const u8, preset: u32, a: std.mem.Allocator) ![]u8 {
+    var s = try bcj2.encode(tar, a);
+    defer s.deinit(a);
+    const cm = try lzmaOrEmpty(s.main, preset, a);
+    defer a.free(cm);
+    const cc = try lzmaOrEmpty(s.call, preset, a);
+    defer a.free(cc);
+    const cj = try lzmaOrEmpty(s.jump, preset, a);
+    defer a.free(cj);
+
+    const total = BCJ2_HDR + cm.len + cc.len + cj.len + s.rc.len;
+    const out = try a.alloc(u8, total);
+    errdefer a.free(out);
+    out[0] = 1;
+    std.mem.writeInt(u32, out[1..5], @intCast(s.main.len), .little);
+    std.mem.writeInt(u32, out[5..9], @intCast(cm.len), .little);
+    std.mem.writeInt(u32, out[9..13], @intCast(s.call.len), .little);
+    std.mem.writeInt(u32, out[13..17], @intCast(cc.len), .little);
+    std.mem.writeInt(u32, out[17..21], @intCast(s.jump.len), .little);
+    std.mem.writeInt(u32, out[21..25], @intCast(cj.len), .little);
+    std.mem.writeInt(u32, out[25..29], @intCast(s.rc.len), .little);
+    var off: usize = BCJ2_HDR;
+    @memcpy(out[off..][0..cm.len], cm);
+    off += cm.len;
+    @memcpy(out[off..][0..cc.len], cc);
+    off += cc.len;
+    @memcpy(out[off..][0..cj.len], cj);
+    off += cj.len;
+    @memcpy(out[off..][0..s.rc.len], s.rc);
+    return out;
+}
+
+/// Decode a MATH_BCJ2 block back to the original `original_size` bytes (the tar).
+fn extractBcj2(block: []const u8, original_size: u64, a: std.mem.Allocator) ![]u8 {
+    if (block.len < BCJ2_HDR or block[0] != 1) return error.TruncatedContainer;
+    const main_ulen: usize = std.mem.readInt(u32, block[1..5], .little);
+    const main_clen: usize = std.mem.readInt(u32, block[5..9], .little);
+    const call_ulen: usize = std.mem.readInt(u32, block[9..13], .little);
+    const call_clen: usize = std.mem.readInt(u32, block[13..17], .little);
+    const jump_ulen: usize = std.mem.readInt(u32, block[17..21], .little);
+    const jump_clen: usize = std.mem.readInt(u32, block[21..25], .little);
+    const rc_len: usize = std.mem.readInt(u32, block[25..29], .little);
+    if (BCJ2_HDR + main_clen + call_clen + jump_clen + rc_len > block.len)
+        return error.TruncatedContainer;
+
+    var off: usize = BCJ2_HDR;
+    const main = if (main_ulen == 0) try a.alloc(u8, 0) else try lzmaDecompress(block[off .. off + main_clen], main_ulen, a);
+    defer a.free(main);
+    off += main_clen;
+    const call = if (call_ulen == 0) try a.alloc(u8, 0) else try lzmaDecompress(block[off .. off + call_clen], call_ulen, a);
+    defer a.free(call);
+    off += call_clen;
+    const jump = if (jump_ulen == 0) try a.alloc(u8, 0) else try lzmaDecompress(block[off .. off + jump_clen], jump_ulen, a);
+    defer a.free(jump);
+    off += jump_clen;
+    const rc = block[off .. off + rc_len];
+
+    return bcj2.decode(main, call, jump, rc, @intCast(original_size), a);
 }
 
 /// Compression config carried by each builder: which codec + its level.

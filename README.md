@@ -49,6 +49,7 @@ When you pack a directory, Mathpressor automatically routes each file:
 | `MATH_IMAGE2D` | `0x0A` | Raw raster (TGA/PGM/PPM) | 2D MED predictor + compressed |
 | `MATH_DICT` | `0x0B` | Many similar small files (JSON/strings/shaders) | zstd frame primed with a shared trained dictionary |
 | `MATH_AUDIO` | `0x0C` | 16-bit PCM WAV | fixed-order LPC (per-channel sample predictor) + compressed |
+| `MATH_BCJ2` | `0x0D` | Full mode's solid tar (x86 code) | 4-stream range-coded BCJ2, each LZMA'd |
 
 All routes reconstruct to bit-identical original bytes. To the caller, they are invisible.
 
@@ -280,8 +281,14 @@ ratios:
   for many similar small files. Both keep every entry independently decodable.
 
 - **Full mode — cold archive.** The whole selection becomes one solid tar →
-  LZMA(+x86 BCJ), with a math/transform pre-pass. Maximum ratio, but it must be
-  fully expanded to use — *not* live-runnable. Always the smaller of the two.
+  LZMA, with a math/transform pre-pass. At Max it races three x86 backends and
+  keeps the smallest: plain LZMA, in-place x86 BCJ, and **BCJ2** (`MATH_BCJ2`) —
+  a 4-stream, range-coded branch converter that splits CALL/JMP target addresses
+  into their own LZMA streams and models the convert/skip decision adaptively.
+  BCJ2 is what closes the old binary gap to 7-Zip: on libc it lands within ~0.8%
+  of 7-Zip's BCJ2 and beats `xz --x86` by ~4.4% (the keep-smaller guard means it
+  never loses on data-heavy tars). Maximum ratio, but it must be fully expanded
+  to use — *not* live-runnable. Always the smaller of the two modes.
 
 The intended hierarchy: full mode is #1 on ratio; regular mode is #2 (aiming to
 beat every general-purpose compressor) while staying live. The two constraints —

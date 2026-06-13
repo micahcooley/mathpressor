@@ -669,6 +669,7 @@ fn parse_fat_header_and_rows(header: &[u8; 12], fat_buf: &[u8]) -> Option<std::c
             0x0A => "IMAGE2D",
             0x0B => "DICT",
             0x0C => "AUDIO",
+            0x0D => "BCJ2",
             _    => "UNKNOWN",
         };
         // FAT layout: [248..256] data_offset, [256..264] original_size,
