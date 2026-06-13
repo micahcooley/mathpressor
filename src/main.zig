@@ -177,6 +177,9 @@ fn bcj2Bench(root: std.mem.Allocator, path: []const u8, out: anytype) !void {
         bj.c.lc, bj.c.lp, bj.c.pb, bj.len,
     });
     try out.print("  BCJ2 + CM(main)   : {d}  (cm_main={d})\n", .{ cm_total, cm_main.len });
+    const prod = container.buildBcj2Block(data, preset, root) catch &[_]u8{};
+    defer if (prod.len > 0) root.free(prod);
+    try out.print("  BCJ2 production   : {d}  (what full mode stores)\n", .{prod.len});
     const base: f64 = @floatFromInt(inplace.len);
     const b2: f64 = @floatFromInt(tuned_total);
     try out.print("  BCJ2-tuned vs in-place : {d:.2}% ({s})\n",

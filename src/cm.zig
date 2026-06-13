@@ -65,6 +65,24 @@ inline fn clampP(p: i32) u32 {
     return @intCast(p);
 }
 
+// A count-adaptive StateMap cell: u32 = (22-bit prediction << 10) | 10-bit count.
+inline fn smPredict12(cell: u32) i32 {
+    return @intCast(cell >> 20); // 22-bit prediction -> 12-bit
+}
+inline fn smUpdate(t: []u32, idx: usize, bit: u1) void {
+    const raw = t[idx];
+    const n: usize = raw & 1023;
+    const pred: i64 = @intCast(raw >> 10);
+    var base: i64 = @intCast(raw);
+    if (n < 1023) base += 1;
+    const y22: i64 = @as(i64, bit) << 22;
+    const step: i64 = (((y22 - pred) >> 3) * @as(i64, dt[n])) & ~@as(i64, 1023);
+    var nv: i64 = base + step;
+    if (nv < 0) nv = 0;
+    if (nv > 0xFFFF_FFFF) nv = 0xFFFF_FFFF;
+    t[idx] = @intCast(nv);
+}
+
 // ---- arithmetic coder (LZMA-style low/range/cache; same scheme as bcj2.zig,
 //      which round-trips, but here `p` is an EXTERNAL 12-bit P(bit=1)) --------
 
@@ -198,7 +216,7 @@ const TBITS = 22; // 4M entries per model table
 const TSIZE = 1 << TBITS;
 const TMASK = TSIZE - 1;
 const NINPUTS = NUM_ORDERS + 2; // orders + match + bias
-const NMIXCTX = 256; // mixer weight sets, selected by order-0 byte
+const NMIXCTX = 2048; // mixer weight sets: (match-length bucket << 8) | order-0 byte
 
 const Predictor = struct {
     a: std.mem.Allocator,
@@ -223,6 +241,10 @@ const Predictor = struct {
     match_len: u32 = 0,
     pred_bit: u1 = 0,
     match_valid: bool = false,
+    // learned match confidence: P(actual bit=1 | match length bucket, predicted bit)
+    match_sm: []u32,
+    match_ctx: usize = 0,
+    match_used: bool = false,
 
     // mixer: weights[ctx][input], i32 fixed point
     weights: []i32,
@@ -247,6 +269,7 @@ const Predictor = struct {
             .tables = undefined,
             .buf = try a.alloc(u8, @max(max_len, 1)),
             .match_ht = try a.alloc(u32, MATCH_HSIZE),
+            .match_sm = try a.alloc(u32, 256),
             .weights = try a.alloc(i32, NMIXCTX * NINPUTS),
             .apm1 = try APM.init(a, 256),
             .apm2 = try APM.init(a, 0x10000),
@@ -256,6 +279,7 @@ const Predictor = struct {
             @memset(t.*, 1 << 31); // prediction = 0.5, count = 0
         }
         @memset(p.match_ht, 0);
+        @memset(p.match_sm, 1 << 31);
         @memset(p.weights, 0);
         return p;
     }
@@ -264,6 +288,7 @@ const Predictor = struct {
         for (self.tables) |t| self.a.free(t);
         self.a.free(self.buf);
         self.a.free(self.match_ht);
+        self.a.free(self.match_sm);
         self.a.free(self.weights);
         self.apm1.deinit();
         self.apm2.deinit();
@@ -303,10 +328,14 @@ const Predictor = struct {
             ni += 1;
         }
 
-        // match model input: predict the next bit from the matched byte, but
-        // only while the bits already coded this byte agree with that byte.
+        // match model input: predict the next bit from the matched byte (while
+        // the bits already coded this byte agree with it), and read a LEARNED
+        // probability for "match of this length predicts bit b" from a StateMap
+        // — far better calibrated than a fixed confidence ramp.
         var match_in: i32 = 0;
         self.match_valid = false;
+        self.match_used = false;
+        var mbucket: usize = 0;
         if (self.match_len > 0 and self.match_ptr < self.buf_len) {
             const pbyte: u32 = self.buf[self.match_ptr];
             const bp: u32 = self.bitpos; // 0..7 bits consumed so far
@@ -314,11 +343,13 @@ const Predictor = struct {
             const expected: u32 = (@as(u32, 1) << @as(u5, @intCast(bp))) | top;
             if (expected == self.c0) {
                 self.match_valid = true;
+                self.match_used = true;
                 const sh: u5 = @intCast(7 - bp);
                 self.pred_bit = @intCast((pbyte >> sh) & 1);
-                const mlen: i32 = @intCast(@min(self.match_len, @as(u32, 28)));
-                const conf: i32 = mlen * 64;
-                match_in = if (self.pred_bit == 1) conf else -conf;
+                const lb: usize = @intCast(@min(self.match_len, @as(u32, 63)));
+                mbucket = @min(self.match_len, @as(u32, 7));
+                self.match_ctx = (lb << 1) | @as(usize, self.pred_bit);
+                match_in = stretch(@intCast(clampP(smPredict12(self.match_sm[self.match_ctx]))));
             }
         }
         self.inputs[ni] = match_in;
@@ -326,8 +357,9 @@ const Predictor = struct {
         self.inputs[ni] = 256; // bias
         ni += 1;
 
-        // mixer
-        self.mix_ctx = (self.hist[0]) & (NMIXCTX - 1);
+        // mixer: weight set selected by match-length bucket + order-0 byte, so
+        // the mix learns to trust the match more as it lengthens.
+        self.mix_ctx = ((mbucket << 8) | self.hist[0]) & (NMIXCTX - 1);
         const w = self.weights[self.mix_ctx * NINPUTS ..][0..NINPUTS];
         var dot: i64 = 0;
         for (0..NINPUTS) |k| dot += @as(i64, w[k]) * @as(i64, self.inputs[k]);
@@ -347,21 +379,9 @@ const Predictor = struct {
 
     /// Update all models with the actual bit, then advance partial-byte state.
     fn update(self: *Predictor, bit: u1) void {
-        // per-order count-adaptive StateMap update (lpaq scheme, i64 to be safe):
-        //   t += (((y<<22) - pred) >> 3) * dt[n]  with the low 10 (count) bits kept
-        const y22: i64 = @as(i64, bit) << 22;
-        for (0..NUM_ORDERS) |i| {
-            const raw = self.tables[i][self.cur_idx[i]];
-            const n: usize = raw & 1023;
-            const pred: i64 = @intCast(raw >> 10);
-            var base: i64 = @intCast(raw);
-            if (n < 1023) base += 1;
-            const step: i64 = (((y22 - pred) >> 3) * @as(i64, dt[n])) & ~@as(i64, 1023);
-            var nv: i64 = base + step;
-            if (nv < 0) nv = 0;
-            if (nv > 0xFFFF_FFFF) nv = 0xFFFF_FFFF;
-            self.tables[i][self.cur_idx[i]] = @intCast(nv);
-        }
+        // per-order + match count-adaptive StateMap updates
+        for (0..NUM_ORDERS) |i| smUpdate(self.tables[i], self.cur_idx[i], bit);
+        if (self.match_used) smUpdate(self.match_sm, self.match_ctx, bit);
 
         // mixer weight update
         const err: i32 = (@as(i32, bit) << 12) - @as(i32, @intCast(self.mixed_p));
