@@ -47,8 +47,32 @@ When you pack a directory, Mathpressor automatically routes each file:
 | `MATH_FILTERED` | `0x08` | Reversible transform helps the codec | filter id + compressed filtered stream |
 | `MATH_COLUMNAR` | `0x09` | Record array (vertex/float tables) | AoS→SoA transpose + compressed |
 | `MATH_IMAGE2D` | `0x0A` | Raw raster (TGA/PGM/PPM) | 2D MED predictor + compressed |
+| `MATH_DICT` | `0x0B` | Many similar small files (JSON/strings/shaders) | zstd frame primed with a shared trained dictionary |
 
-All four routes reconstruct to bit-identical original bytes. To the caller, they are invisible.
+All routes reconstruct to bit-identical original bytes. To the caller, they are invisible.
+
+### Cross-file sharing without a solid block (`MATH_DICT`)
+
+Many small similar files (per-language strings, JSON manifests, shader variants)
+compress far better when the codec can reference patterns shared *across* files.
+A solid block does that but destroys random access, so it is banned from live
+mode. A trained **zstd dictionary** gets the same cross-file sharing while
+keeping every entry independently decodable: one dictionary is trained per
+file-extension group at pack time, shipped **once** per archive, and each entry
+is its own dict-primed frame (still random-access, still live).
+
+It is fully guarded so it never costs bytes:
+
+- A file becomes a `MATH_DICT` entry only when its dict-primed frame is smaller
+  than the size it would otherwise get from the real backend (the *honesty
+  guard* — at Max that baseline is per-entry LZMA, so a smaller LZMA block is
+  never traded for a larger dict one).
+- A dictionary is kept only when the group's total saving repays the bytes the
+  dictionary costs to ship (the *amortization gate*). Several dictionary sizes
+  are tried and the best net is kept.
+- Files that don't benefit fall through to normal per-file routing.
+
+Set `MATHPRESSOR_NODICT=1` to disable the route (diagnostic / A-B switch).
 
 ---
 
@@ -236,7 +260,10 @@ ratios:
   regular mode never uses solid blocks (which would force decompressing a whole
   block to read one file) and why decode/synthesis *latency* matters as much as
   size. `MATH_BYTECODE` entries are the ideal live primitive: near-zero storage
-  and no decompression — pure on-demand VM synthesis.
+  and no decompression — pure on-demand VM synthesis. Two passes share data
+  *across* files without breaking random access: whole-file **dedup** (identical
+  files share one blob) and the trained-**dictionary** route (`MATH_DICT`, above)
+  for many similar small files. Both keep every entry independently decodable.
 
 - **Full mode — cold archive.** The whole selection becomes one solid tar →
   LZMA(+x86 BCJ), with a math/transform pre-pass. Maximum ratio, but it must be
@@ -247,6 +274,14 @@ beat every general-purpose compressor) while staying live. The two constraints �
 "beat everyone on size" and "run live" — are in genuine tension (a stronger but
 slower backend helps the first and hurts the second), which is why regular mode
 keeps a fast path and treats heavier backends as a ship/cold option.
+
+One workload stays structurally full-mode's: many tiny *near-duplicate* files.
+A solid block references the full window across every file with zero per-frame
+overhead; a per-entry dictionary captures the shared patterns but still pays a
+small per-frame cost, so it closes most of the gap (e.g. 2.4× better than the
+old per-file regular mode on such a corpus) without matching solid. That is the
+live-vs-cold trade working as intended — random access has a price, and full
+mode is the place you choose to stop paying it.
 
 ## The C-ABI
 

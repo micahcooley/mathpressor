@@ -77,6 +77,18 @@ pub const FLAG_FAT_GZIP: u16 = 0x0002;
 /// unpack time, and the solid tar stream is zstd-compressed by the container
 /// itself at the effort tier.
 pub const FLAG_FULL_TAR: u16 = 0x0004;
+/// Bit 3: the archive ships one or more trained zstd dictionaries. Layout
+/// becomes:
+///   [12B header][u64 comp_fat_len][gzip(FAT)][dict section][data region]
+/// where the dict section is:
+///   [u32 dict_count]  then for each dict  [u32 dict_len][dict_bytes]
+/// Entries with comp_type == .math_dict are zstd frames compressed against the
+/// dictionary whose index is stored in their `solid_index` field. The dict is
+/// shipped once and shared across many similar small files, giving cross-file
+/// compression WITHOUT a solid block — every entry still decodes independently
+/// (random access), so it stays live-runnable. data_offset values remain
+/// relative to the data region (after the dict section), so they're unchanged.
+pub const FLAG_HAS_DICTS: u16 = 0x0008;
 
 /// Serialise one FAT entry to its 280-byte wire row.
 fn fatRow(e: FatEntry) [FAT_ENTRY_SIZE]u8 {
@@ -122,6 +134,7 @@ pub const CompressionType = enum(u8) {
     math_filtered   = 0x08, // reversible math filter applied, then compressed
     math_columnar   = 0x09, // AoS->SoA transpose (record arrays), then compressed
     math_image2d    = 0x0A, // 2D MED predictor over raw raster, then compressed
+    math_dict       = 0x0B, // zstd frame compressed against a shared trained dictionary
 };
 
 /// Per-entry compression codec (FAT byte 245). gzip = 0 is the legacy default,
@@ -398,6 +411,10 @@ pub const StreamingBuilder = struct {
     comp: Compressor = .{},
     /// Container header flags written at finish() (e.g. FLAG_FULL_ZIP).
     flags: u16 = 0,
+    /// Trained zstd dictionaries shipped once and shared across entries whose
+    /// comp_type is .math_dict (their solid_index is the index into this list).
+    /// Each entry is owned (duped) and freed in deinit.
+    dicts: std.ArrayList([]u8),
 
     pub fn init(a: std.mem.Allocator) !StreamingBuilder {
         // Create a temp file in /tmp.
@@ -415,14 +432,25 @@ pub const StreamingBuilder = struct {
             .tmp_file = tmp_file,
             .tmp_path = tmp_path,
             .data_cursor = 0,
+            .dicts = std.ArrayList([]u8).init(a),
         };
     }
 
     pub fn deinit(self: *StreamingBuilder) void {
         self.fat.deinit();
+        for (self.dicts.items) |d| self.allocator.free(d);
+        self.dicts.deinit();
         self.tmp_file.close();
         std.fs.cwd().deleteFile(self.tmp_path) catch {};
         self.allocator.free(self.tmp_path);
+    }
+
+    /// Register a trained dictionary and return its index (for the entries that
+    /// will reference it via .math_dict + solid_index). The bytes are duped.
+    pub fn registerDict(self: *StreamingBuilder, dict: []const u8) !u32 {
+        const idx: u32 = @intCast(self.dicts.items.len);
+        try self.dicts.append(try self.allocator.dupe(u8, dict));
+        return idx;
     }
 
     /// Write a raw block to the temp file and register the FAT entry.
@@ -744,7 +772,17 @@ pub const StreamingBuilder = struct {
         var fat_buf = std.ArrayList(u8).init(self.allocator);
         defer fat_buf.deinit();
         for (self.fat.items) |e| try fat_buf.appendSlice(&fatRow(e));
-        try writeHeaderAndFat(w, fat_count, fat_buf.items, self.flags, self.allocator);
+        const base_flags = self.flags | (if (self.dicts.items.len > 0) FLAG_HAS_DICTS else 0);
+        try writeHeaderAndFat(w, fat_count, fat_buf.items, base_flags, self.allocator);
+
+        // --- Dict section (between FAT and data region) ---
+        if (self.dicts.items.len > 0) {
+            try w.writeInt(u32, @intCast(self.dicts.items.len), .little);
+            for (self.dicts.items) |d| {
+                try w.writeInt(u32, @intCast(d.len), .little);
+                try w.writeAll(d);
+            }
+        }
 
         // --- Data region: stream temp file in 64 KB chunks ---
         try self.tmp_file.seekTo(0);
@@ -1294,6 +1332,9 @@ pub const Reader = struct {
     allocator: std.mem.Allocator,
     /// Container header flags (e.g. FLAG_FULL_ZIP).
     flags: u16 = 0,
+    /// Shared dictionaries (slices into `data`); empty when FLAG_HAS_DICTS unset.
+    /// The outer array is allocator-owned; the slices alias `data` (not freed).
+    dicts: [][]const u8 = &[_][]const u8{},
 
     pub fn parse(data: []const u8, a: std.mem.Allocator) !Reader {
         if (data.len < HEADER_SIZE) return error.TruncatedContainer;
@@ -1333,6 +1374,28 @@ pub const Reader = struct {
             data_start = fat_end;
         }
 
+        // Dict section (between FAT and data region): [u32 count] then
+        // [u32 len][bytes] per dict. Slices alias `data`; data_start advances
+        // past it so per-entry data_offset values stay region-relative.
+        var dicts: [][]const u8 = &[_][]const u8{};
+        errdefer if (dicts.len > 0) a.free(dicts);
+        if (flags & FLAG_HAS_DICTS != 0) {
+            if (data.len < data_start + 4) return error.TruncatedContainer;
+            const count: usize = @intCast(std.mem.readInt(u32, data[data_start..][0..4], .little));
+            data_start += 4;
+            const ds = try a.alloc([]const u8, count);
+            errdefer a.free(ds);
+            for (ds) |*slot| {
+                if (data.len < data_start + 4) return error.TruncatedContainer;
+                const dlen: usize = @intCast(std.mem.readInt(u32, data[data_start..][0..4], .little));
+                data_start += 4;
+                if (data.len < data_start + dlen) return error.TruncatedContainer;
+                slot.* = data[data_start..][0..dlen];
+                data_start += dlen;
+            }
+            dicts = ds;
+        }
+
         // Parse FAT rows (280 bytes each). Layout:
         //   [0..239] path  [240] comp_type  [241..245] solid_index u32
         //   [245] codec  [248..256] data_offset  [256..264] original_size
@@ -1357,11 +1420,13 @@ pub const Reader = struct {
             .data_region = data[data_start..],
             .allocator = a,
             .flags = flags,
+            .dicts = dicts,
         };
     }
 
     pub fn deinit(self: *Reader) void {
         self.allocator.free(self.fat);
+        if (self.dicts.len > 0) self.allocator.free(self.dicts);
     }
 
     /// Reconstruct the original bytes for `path` into a freshly allocated
@@ -1386,6 +1451,10 @@ pub const Reader = struct {
             .math_filtered   => extractFiltered(block, entry.original_size, entry.codec, a),
             .math_columnar   => extractColumnar(block, entry.original_size, entry.codec, a),
             .math_image2d    => extractImage2D(block, entry.original_size, entry.codec, a),
+            .math_dict       => blk: {
+                if (entry.solid_index >= self.dicts.len) break :blk error.BadDictIndex;
+                break :blk zstdDecompressUsingDict(block, entry.original_size, self.dicts[entry.solid_index], a);
+            },
             // A symlink's "contents" are its target path, stored verbatim.
             .symlink         => extractStore(block, entry.original_size, a),
             .solid_block     => extractSolidEntry(
@@ -1983,6 +2052,88 @@ pub fn zstdDecompressUnknown(data: []const u8, a: std.mem.Allocator) ![]u8 {
 }
 
 // ---------------------------------------------------------------------------
+// zstd dictionary API (ZSTD_*_usingDict) + dictionary trainer (ZDICT). A
+// dictionary is a shared prefix the codec primes its window with before each
+// frame, so many similar small files compress as if they could reference one
+// another — cross-file sharing WITHOUT a solid block. Each frame still decodes
+// on its own (random access), which is what keeps the live (regular) mode live.
+// ---------------------------------------------------------------------------
+extern fn ZSTD_createDCtx() ?*anyopaque;
+extern fn ZSTD_freeDCtx(dctx: ?*anyopaque) usize;
+extern fn ZSTD_compress_usingDict(
+    cctx: ?*anyopaque,
+    dst: [*]u8,
+    dstCap: usize,
+    src: [*]const u8,
+    srcSize: usize,
+    dict: [*]const u8,
+    dictSize: usize,
+    level: c_int,
+) usize;
+extern fn ZSTD_decompress_usingDict(
+    dctx: ?*anyopaque,
+    dst: [*]u8,
+    dstCap: usize,
+    src: [*]const u8,
+    srcSize: usize,
+    dict: [*]const u8,
+    dictSize: usize,
+) usize;
+extern fn ZDICT_trainFromBuffer(
+    dictBuffer: [*]u8,
+    dictBufferCapacity: usize,
+    samplesBuffer: [*]const u8,
+    samplesSizes: [*]const usize,
+    nbSamples: c_uint,
+) usize;
+extern fn ZDICT_isError(code: usize) c_uint;
+
+/// Compress `data` as a single zstd frame primed with `dict`. Returns owned bytes.
+pub fn zstdCompressUsingDict(data: []const u8, dict: []const u8, level: c_int, a: std.mem.Allocator) ![]u8 {
+    const cctx = ZSTD_createCCtx() orelse return error.ZstdCompressFailed;
+    defer _ = ZSTD_freeCCtx(cctx);
+    const bound = ZSTD_compressBound(data.len);
+    const buf = try a.alloc(u8, bound);
+    defer a.free(buf);
+    const n = ZSTD_compress_usingDict(cctx, buf.ptr, bound, data.ptr, data.len, dict.ptr, dict.len, level);
+    if (ZSTD_isError(n) != 0) return error.ZstdCompressFailed;
+    return a.dupe(u8, buf[0..n]);
+}
+
+/// Decompress a dict-primed zstd frame of known original size (from the FAT).
+pub fn zstdDecompressUsingDict(data: []const u8, original_size: u64, dict: []const u8, a: std.mem.Allocator) ![]u8 {
+    const dctx = ZSTD_createDCtx() orelse return error.ZstdDecompressFailed;
+    defer _ = ZSTD_freeDCtx(dctx);
+    const out = try a.alloc(u8, @intCast(original_size));
+    errdefer a.free(out);
+    const n = ZSTD_decompress_usingDict(dctx, out.ptr, out.len, data.ptr, data.len, dict.ptr, dict.len);
+    if (ZSTD_isError(n) != 0) return error.ZstdDecompressFailed;
+    if (n != original_size) return error.SizeMismatch;
+    return out;
+}
+
+/// Train a zstd dictionary from `samples` (concatenated) with `sizes` giving
+/// each sample's length. Returns owned dict bytes, or null when training fails
+/// (too few/too-similar samples — ZDICT needs a minimum corpus). `capacity` is
+/// the target dictionary size; the trainer returns whatever fits within it.
+pub fn trainDict(
+    samples: []const u8,
+    sizes: []const usize,
+    capacity: usize,
+    a: std.mem.Allocator,
+) !?[]u8 {
+    if (sizes.len == 0 or samples.len == 0 or capacity == 0) return null;
+    const buf = try a.alloc(u8, capacity);
+    errdefer a.free(buf);
+    const n = ZDICT_trainFromBuffer(buf.ptr, capacity, samples.ptr, sizes.ptr, @intCast(sizes.len));
+    if (ZDICT_isError(n) != 0) {
+        a.free(buf);
+        return null;
+    }
+    return try a.realloc(buf, n);
+}
+
+// ---------------------------------------------------------------------------
 // LZMA / xz backend (liblzma) — stronger model than zstd (range coder +
 // adaptive bit-contexts + match model). Used by full mode where the extra
 // ratio is worth the slower, heavier compression. One-shot buffer API only:
@@ -2191,6 +2342,77 @@ test "lzma backend round-trips exactly across content types" {
     const lz = try lzmaCompress(data, a, lzmaPreset(2));
     defer a.free(lz);
     try testing.expect(lz.len < data.len);
+}
+
+test "trained dict: train, dict-compress, round-trip via container" {
+    const a = testing.allocator;
+    // Many similar small JSON-ish records — the dict's target workload.
+    var samples = std.ArrayList([]u8).init(a);
+    defer {
+        for (samples.items) |s| a.free(s);
+        samples.deinit();
+    }
+    var concat = std.ArrayList(u8).init(a);
+    defer concat.deinit();
+    var sizes = std.ArrayList(usize).init(a);
+    defer sizes.deinit();
+    var n: usize = 0;
+    while (n < 64) : (n += 1) {
+        const s = try std.fmt.allocPrint(a,
+            "{{\"id\":{d},\"type\":\"widget\",\"enabled\":true,\"label\":\"item number {d}\",\"tags\":[\"alpha\",\"beta\"]}}",
+            .{ n, n });
+        try samples.append(s);
+        try concat.appendSlice(s);
+        try sizes.append(s.len);
+    }
+
+    const dict = (try trainDict(concat.items, sizes.items, 8 * 1024, a)) orelse return error.SkipZigTest;
+    defer a.free(dict);
+    try testing.expect(dict.len > 0);
+
+    // Build a container: register the dict, add each sample as a .math_dict entry.
+    var cb = try StreamingBuilder.init(a);
+    defer cb.deinit();
+    const di = try cb.registerDict(dict);
+    for (samples.items, 0..) |s, i| {
+        const block = try zstdCompressUsingDict(s, dict, 19, a);
+        defer a.free(block);
+        var fat = FatEntry{
+            .comp_type = .math_dict,
+            .solid_index = di,
+            .data_offset = 0,
+            .original_size = s.len,
+            .compressed_size = block.len,
+            .checksum = fnv1a(s),
+            .codec = .zstd,
+        };
+        var nb: [64]u8 = undefined;
+        try fat.setPath(try std.fmt.bufPrint(&nb, "rec_{d}.json", .{i}));
+        try cb.appendBlock(fat, block);
+    }
+
+    // Serialize to a temp file, read back, and verify every entry byte-perfectly.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out = try tmp.dir.createFile("dict.math", .{ .read = true });
+    defer out.close();
+    try cb.finish(out);
+
+    try out.seekTo(0);
+    const bytes = try out.readToEndAlloc(a, 16 * 1024 * 1024);
+    defer a.free(bytes);
+
+    var rdr = try Reader.parse(bytes, a);
+    defer rdr.deinit();
+    try testing.expectEqual(@as(usize, 1), rdr.dicts.len);
+    try testing.expect((rdr.flags & FLAG_HAS_DICTS) != 0);
+    for (samples.items, 0..) |s, i| {
+        var nb: [64]u8 = undefined;
+        const path = try std.fmt.bufPrint(&nb, "rec_{d}.json", .{i});
+        const back = try rdr.extract(path, a);
+        defer a.free(back);
+        try testing.expectEqualSlices(u8, s, back);
+    }
 }
 
 // ---------------------------------------------------------------------------

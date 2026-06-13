@@ -314,6 +314,31 @@ pub export fn mp_pack_directory_solid(
     return 0;
 }
 
+// Pack an explicit selection of files/directories into one archive using the
+// live (regular) per-entry path: dedup + trained-dict pre-passes, no solid
+// grouping, so every asset stays independently decodable (random access).
+pub export fn mp_pack_selection_vfs(
+    base_ptr: [*]const u8, base_len: usize,
+    sel_ptr: [*]const u8, sel_len: usize,
+    out_ptr: [*]const u8, out_len: usize,
+    effort_tier: u8,
+    cancel_flag: *const std.atomic.Value(u8),
+    progress_ptr: *std.atomic.Value(f32),
+    ticker_ptr: [*]u8,
+) i32 {
+    const math_main = @import("main.zig");
+    math_main.packSelectionVfsAbi(
+        std.heap.page_allocator,
+        base_ptr[0..base_len], sel_ptr[0..sel_len], out_ptr[0..out_len], effort_tier,
+        cancel_flag, progress_ptr, ticker_ptr,
+    ) catch |err| {
+        if (err != error.Cancelled) std.debug.print("Zig packSelectionVfsAbi error: {s}\n", .{@errorName(err)});
+        return -1;
+    };
+    progress_ptr.store(1.0, .monotonic);
+    return 0;
+}
+
 // Pack an explicit selection of files/directories into one archive using
 // native solid grouping (fallback/store files bucketed into shared gzip blocks).
 pub export fn mp_pack_selection_solid(

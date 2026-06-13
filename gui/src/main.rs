@@ -584,7 +584,10 @@ fn trigger_pack_file(file_path: &str, out_path: &str, solid: bool, effort: i32, 
         let lib_path = find_libmathpressor()
             .ok_or_else(|| "libmathpressor.so not found — build the Zig engine first".to_string())?;
         let lib = unsafe { Library::new(&lib_path) }.map_err(|e| format!("Could not load library: {e}"))?;
-        let func: Symbol<PackDirFn> = unsafe { lib.get(b"mp_pack_directory_auto\0") }
+        // Regular mode = the live (VFS) per-entry path: dedup + trained-dict
+        // cross-file sharing with full random access. Full mode (solid) is the
+        // separate `solid` branch above.
+        let func: Symbol<PackDirFn> = unsafe { lib.get(b"mp_pack_directory_vfs\0") }
             .map_err(|e| format!("symbol missing: {e}"))?;
         Ok(unsafe {
             func(dir_arg.as_ptr(), dir_arg.len(), out_arg.as_ptr(), out_arg.len(), tier,
@@ -617,8 +620,10 @@ fn trigger_pack_selection(base_dir: &str, names: Vec<String>, out: &str, solid: 
                      &st.cancel_flag, &st.progress, st.ticker.as_ptr())
             })
         } else {
-            let func: Symbol<PackSelFn> = unsafe { lib.get(b"mp_pack_selection\0") }
-                .map_err(|e| format!("mp_pack_selection symbol missing: {e}"))?;
+            // Regular mode = the live (VFS) per-entry path (dedup + trained-dict,
+            // full random access). Full mode is the solid branch above.
+            let func: Symbol<PackSelFn> = unsafe { lib.get(b"mp_pack_selection_vfs\0") }
+                .map_err(|e| format!("mp_pack_selection_vfs symbol missing: {e}"))?;
             Ok(unsafe {
                 func(base.as_ptr(), base.len(), sel.as_ptr(), sel.len(),
                      out.as_ptr(), out.len(), tier,
@@ -662,6 +667,7 @@ fn parse_fat_header_and_rows(header: &[u8; 12], fat_buf: &[u8]) -> Option<std::c
             0x08 => "FILTERED",
             0x09 => "COLUMNAR",
             0x0A => "IMAGE2D",
+            0x0B => "DICT",
             _    => "UNKNOWN",
         };
         // FAT layout: [248..256] data_offset, [256..264] original_size,

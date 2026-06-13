@@ -29,6 +29,23 @@ pub fn main() !void {
     } else if (args.len >= 4 and std.mem.eql(u8, args[1], "packfull")) {
         const tier: u8 = if (args.len >= 5) std.fmt.parseInt(u8, args[4], 10) catch 1 else 1;
         try packFullCli(root, args[2], args[3], tier, out);
+    } else if (args.len >= 4 and std.mem.eql(u8, args[1], "packvfs")) {
+        // Live (regular) per-entry mode the GUI drives — dedup + trained-dict
+        // pre-passes included. Default tier balanced; arg 5 overrides (0/1/2).
+        const tier: u8 = if (args.len >= 5) std.fmt.parseInt(u8, args[4], 10) catch 1 else 1;
+        var cancel = std.atomic.Value(u8).init(0);
+        var prog = std.atomic.Value(f32).init(0);
+        var ticker: [512]u8 = undefined;
+        try packDirectoryVfsAbi(root, args[2], args[3], tier, &cancel, &prog, &ticker);
+        try out.print("Wrote {s}\n", .{args[3]});
+    } else if (args.len >= 4 and std.mem.eql(u8, args[1], "packauto")) {
+        // Auto/hybrid path (current GUI regular mode): per-file + solid buckets.
+        const tier: u8 = if (args.len >= 5) std.fmt.parseInt(u8, args[4], 10) catch 1 else 1;
+        var cancel = std.atomic.Value(u8).init(0);
+        var prog = std.atomic.Value(f32).init(0);
+        var ticker: [512]u8 = undefined;
+        try packDirectoryAutoAbi(root, args[2], args[3], tier, &cancel, &prog, &ticker);
+        try out.print("Wrote {s}\n", .{args[3]});
     } else if (args.len >= 4 and std.mem.eql(u8, args[1], "unpack")) {
         try unpackContainer(root, args[2], args[3], out);
     } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench")) {
@@ -2430,6 +2447,212 @@ fn packDirectoryAuto(
 }
 
 // ---------------------------------------------------------------------------
+// Trained-dictionary pre-pass (live cross-file sharing)
+// ---------------------------------------------------------------------------
+//
+// Many small similar files (per-language strings, JSON manifests, shader
+// variants, config) compress far better when the codec can reference shared
+// patterns across files. A solid block does that but destroys random access,
+// so it's banned from live mode. A trained zstd *dictionary* gets the same
+// cross-file sharing while keeping every entry independently decodable: the
+// dict is shipped ONCE per archive and each entry is its own dict-primed frame.
+//
+// This pass groups the unique representatives by file extension, trains one
+// dict per large-enough group, and claims a file as a .math_dict entry ONLY
+// when the dict-primed frame beats that file's real backend size (the honesty
+// guard — at Max the baseline is per-entry LZMA, so we never trade a smaller
+// LZMA block for a larger dict one). The dict's shipped bytes must be repaid by
+// the group's total saving (the amortization gate) or the whole group is left
+// to normal routing. Claimed files are removed from `reps` so the parallel pass
+// skips them; dedup of duplicates still works because the post-pass copies the
+// rep's comp_type/solid_index, which carries the dict index.
+
+const DICT_MIN_FILES: usize = 16; // ZDICT needs a real corpus; small groups can't amortize a dict
+const DICT_MAX_FILE: usize = 64 * 1024; // the win is on many SMALL similar files
+const DICT_MAX_GROUP_FILES: usize = 4096; // bound per-group memory/compute
+const DICT_MAX_GROUP_BYTES: usize = 64 * 1024 * 1024; // bound per-group memory
+
+/// Last extension of `rel` (including the dot), or "" if none. Case-sensitive
+/// (mixed-case same-type files are rare in asset trees; the gate just fails for
+/// any odd group, so this never produces a wrong archive — only a missed win).
+fn fileExt(rel: []const u8) []const u8 {
+    var i = rel.len;
+    var dot: ?usize = null;
+    while (i > 0) {
+        i -= 1;
+        if (rel[i] == '/') break;
+        if (rel[i] == '.' and dot == null) dot = i;
+    }
+    if (dot) |d| return rel[d..];
+    return "";
+}
+
+/// Train+test a shared dict per extension group and claim winning files as
+/// .math_dict entries appended to `cb` (the per-file StreamingBuilder; for the
+/// auto/solid path pass `&scb.inner`). Records claimed indices into `items` in
+/// `claimed` — the caller removes them from its own list, handling ownership.
+/// Serial — runs before the parallel pass, so no cb locking. Works for both the
+/// pure VFS path and the auto path because both ultimately funnel per-file
+/// blocks + dicts through a StreamingBuilder.
+fn dictPrePass(
+    root: std.mem.Allocator,
+    dir_path: []const u8,
+    effort: Effort,
+    cb: *container.StreamingBuilder,
+    items: []const []u8,
+    claimed: *std.AutoHashMap(usize, void),
+) !void {
+    // Escape hatch / A-B switch: MATHPRESSOR_NODICT disables the dict route.
+    if (std.process.hasEnvVarConstant("MATHPRESSOR_NODICT")) return;
+
+    const dict_level: c_int = switch (effort.tier) {
+        0 => 12,
+        2 => 19,
+        else => 16,
+    };
+
+    // Group representative indices by extension.
+    var groups = std.StringHashMap(std.ArrayList(usize)).init(root);
+    defer {
+        var it = groups.valueIterator();
+        while (it.next()) |v| v.deinit();
+        groups.deinit();
+    }
+    for (items, 0..) |rel, i| {
+        const ext = fileExt(rel);
+        if (ext.len == 0) continue; // skip extensionless: heterogeneous, no shared model
+        const gop = try groups.getOrPut(ext);
+        if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(usize).init(root);
+        try gop.value_ptr.append(i);
+    }
+
+    var dicts_made: u32 = 0;
+    var files_claimed: u32 = 0;
+    var bytes_saved: i64 = 0;
+
+    var git = groups.iterator();
+    while (git.next()) |g| {
+        const idxs = g.value_ptr.items;
+        if (idxs.len < DICT_MIN_FILES) continue;
+
+        var arena = std.heap.ArenaAllocator.init(root);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        // Read eligible (small, regular) files into the arena.
+        var contents = std.ArrayList([]u8).init(a);
+        var content_idx = std.ArrayList(usize).init(a); // parallel: rep index per content
+        var total_bytes: usize = 0;
+        var pb: [std.fs.max_path_bytes]u8 = undefined;
+        for (idxs) |ri| {
+            if (contents.items.len >= DICT_MAX_GROUP_FILES or total_bytes >= DICT_MAX_GROUP_BYTES) break;
+            const rel = items[ri];
+            const full = std.fmt.bufPrint(&pb, "{s}/{s}", .{ dir_path, rel }) catch continue;
+            var lb: [std.fs.max_path_bytes]u8 = undefined;
+            if (std.fs.cwd().readLink(full, &lb)) |_| continue else |_| {}
+            const st = std.fs.cwd().statFile(full) catch continue;
+            if (st.kind != .file or st.size == 0 or st.size > DICT_MAX_FILE) continue;
+            const f = std.fs.cwd().openFile(full, .{}) catch continue;
+            defer f.close();
+            const data = f.readToEndAlloc(a, DICT_MAX_FILE) catch continue;
+            contents.append(data) catch continue;
+            content_idx.append(ri) catch continue;
+            total_bytes += data.len;
+        }
+        if (contents.items.len < DICT_MIN_FILES) continue;
+
+        // Baseline (the real backend size each file would otherwise get) and the
+        // file's checksum — independent of the dict, so computed once.
+        const Cand = struct { ri: usize, block: []u8, orig: usize, csum: u32 };
+        const base_len = try a.alloc(usize, contents.items.len);
+        for (contents.items, 0..) |c, k| {
+            const base = effort.comp.compress(c, a) catch {
+                base_len[k] = std.math.maxInt(usize);
+                continue;
+            };
+            base_len[k] = base.len;
+        }
+
+        // Train at several capacities and keep whichever dict yields the smallest
+        // net (shipped dict + dict-compressed winners). Highly-similar files want
+        // a bigger dict than ZDICT's default ~1/100 heuristic; the amortization
+        // gate makes overshoot self-correcting, so trying a few is safe.
+        var sizes = std.ArrayList(usize).init(a);
+        var concat = std.ArrayList(u8).init(a);
+        for (contents.items) |c| {
+            sizes.append(c.len) catch continue;
+            concat.appendSlice(c) catch continue;
+        }
+        const caps = [_]usize{
+            std.math.clamp(total_bytes / 100, 4096, 112 * 1024),
+            std.math.clamp(total_bytes / 16, 4096, 112 * 1024),
+            std.math.clamp(total_bytes / 4, 8192, 112 * 1024),
+        };
+
+        var best_cands = std.ArrayList(Cand).init(a);
+        var best_dict: []u8 = &[_]u8{};
+        var best_net: usize = std.math.maxInt(usize);
+        var best_sum_base: usize = 0;
+        var last_cap: usize = 0;
+        for (caps) |cap| {
+            if (cap == last_cap) continue; // clamp can collapse caps to the same value
+            last_cap = cap;
+            const dict = (container.trainDict(concat.items, sizes.items, cap, a) catch null) orelse continue;
+            if (dict.len == 0) continue;
+
+            var cands = std.ArrayList(Cand).init(a);
+            var sum_dict: usize = 0;
+            var sum_base: usize = 0;
+            for (contents.items, 0..) |c, k| {
+                const dc = container.zstdCompressUsingDict(c, dict, dict_level, a) catch continue;
+                if (dc.len < base_len[k]) {
+                    cands.append(.{ .ri = content_idx.items[k], .block = dc, .orig = c.len, .csum = container.fnv1a(c) }) catch continue;
+                    sum_dict += dc.len;
+                    sum_base += base_len[k];
+                }
+            }
+            if (cands.items.len < DICT_MIN_FILES) continue;
+            const net = sum_dict + dict.len;
+            if (net < sum_base and net < best_net) {
+                best_net = net;
+                best_cands = cands;
+                best_dict = dict;
+                best_sum_base = sum_base;
+            }
+        }
+        if (best_cands.items.len < DICT_MIN_FILES) continue;
+
+        // Commit: register the winning dict, emit each winner as a .math_dict entry.
+        const dict_index = cb.registerDict(best_dict) catch continue;
+        for (best_cands.items) |cand| {
+            var fat = container.FatEntry{
+                .comp_type = .math_dict,
+                .solid_index = dict_index,
+                .data_offset = 0,
+                .original_size = cand.orig,
+                .compressed_size = cand.block.len,
+                .checksum = cand.csum,
+                .codec = .zstd,
+            };
+            fat.setPath(items[cand.ri]) catch continue;
+            cb.appendBlock(fat, cand.block) catch continue;
+            claimed.put(cand.ri, {}) catch {};
+            files_claimed += 1;
+        }
+        dicts_made += 1;
+        bytes_saved += @as(i64, @intCast(best_sum_base)) - @as(i64, @intCast(best_net));
+    }
+
+    if (files_claimed == 0) return;
+
+    var mbuf: [128]u8 = undefined;
+    const ml = std.fmt.bufPrint(&mbuf,
+        "  DICT      {d} file(s) share {d} trained dict(s), saved {d} B (incl. dict cost)\n",
+        .{ files_claimed, dicts_made, bytes_saved }) catch "";
+    std.io.getStdOut().writeAll(ml) catch {};
+}
+
+// ---------------------------------------------------------------------------
 // VFS-mode C-ABI pack: individual per-file routing, no solid grouping.
 // ---------------------------------------------------------------------------
 
@@ -2442,11 +2665,6 @@ pub fn packDirectoryVfsAbi(
     progress_ptr: *std.atomic.Value(f32),
     ticker_ptr: [*]u8,
 ) !void {
-    const effort = Effort.fromTierRegular(effort_tier);
-    var cb = try container.StreamingBuilder.init(root);
-    cb.comp = effort.comp;
-    defer cb.deinit();
-
     var jobs = std.ArrayList([]u8).init(root);
     defer {
         for (jobs.items) |p| root.free(p);
@@ -2455,6 +2673,31 @@ pub fn packDirectoryVfsAbi(
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     try collectWalk(root, dir_path, "", &path_buf, &jobs, cancel_flag);
     removeOutputJob(&jobs, root, dir_path, out_path);
+
+    try packJobsVfs(root, dir_path, jobs.items, out_path, effort_tier,
+        cancel_flag, progress_ptr, ticker_ptr);
+}
+
+/// Core of the live (regular) per-entry pack, shared by directory and selection
+/// entry points. `jobs` are relative paths under `base_dir` (borrowed — the
+/// caller owns and frees them). Runs the dedup + trained-dict pre-passes, the
+/// parallel per-file routing, the dedup post-pass, then writes the archive.
+/// Every entry stays independently decodable (random access) — this is the
+/// live mode, so no solid grouping.
+fn packJobsVfs(
+    root: std.mem.Allocator,
+    dir_path: []const u8,
+    jobs_items: []const []u8,
+    out_path: []const u8,
+    effort_tier: u8,
+    cancel_flag: *const std.atomic.Value(u8),
+    progress_ptr: *std.atomic.Value(f32),
+    ticker_ptr: [*]u8,
+) !void {
+    const effort = Effort.fromTierRegular(effort_tier);
+    var cb = try container.StreamingBuilder.init(root);
+    cb.comp = effort.comp;
+    defer cb.deinit();
 
     // Whole-file dedup pre-pass (serial): SHA-256 each file, split into unique
     // representatives and exact duplicates. Done before the parallel pass to
@@ -2471,7 +2714,7 @@ pub fn packDirectoryVfsAbi(
         var seen = std.AutoHashMap([32]u8, void).init(root);
         defer seen.deinit();
         var pb: [std.fs.max_path_bytes]u8 = undefined;
-        for (jobs.items) |rel| {
+        for (jobs_items) |rel| {
             const full = std.fmt.bufPrint(&pb, "{s}/{s}", .{ dir_path, rel }) catch {
                 reps.append(rel) catch {};
                 continue;
@@ -2507,6 +2750,24 @@ pub fn packDirectoryVfsAbi(
                 try rep_path_to_sha.put(rel, sh);
                 try reps.append(rel);
             }
+        }
+    }
+
+    // Trained-dictionary pre-pass (serial): claim groups of similar small files
+    // into shared-dict entries (cross-file sharing, still per-entry decodable).
+    // `reps` slices are borrowed (owned by `jobs`), so dropping claimed ones is
+    // just a filtered rebuild — no frees.
+    {
+        var claimed = std.AutoHashMap(usize, void).init(root);
+        defer claimed.deinit();
+        dictPrePass(root, dir_path, effort, &cb, reps.items, &claimed) catch {};
+        if (claimed.count() > 0) {
+            var survivors = std.ArrayList([]u8).init(root);
+            for (reps.items, 0..) |rel, i| {
+                if (!claimed.contains(i)) survivors.append(rel) catch {};
+            }
+            reps.deinit();
+            reps = survivors;
         }
     }
 
@@ -2569,6 +2830,47 @@ pub fn packDirectoryVfsAbi(
     const out_file = try std.fs.cwd().createFile(out_path, .{});
     defer out_file.close();
     try cb.finish(out_file);
+}
+
+/// Pack an explicit selection (files and/or directories) into one archive using
+/// the live (regular) per-entry path — the selection counterpart to
+/// packDirectoryVfsAbi. Same dedup + dict pre-passes and per-entry random
+/// access; no solid grouping.
+pub fn packSelectionVfsAbi(
+    root: std.mem.Allocator,
+    base_dir: []const u8,
+    selection: []const u8,
+    out_path: []const u8,
+    effort_tier: u8,
+    cancel_flag: *const std.atomic.Value(u8),
+    progress_ptr: *std.atomic.Value(f32),
+    ticker_ptr: [*]u8,
+) !void {
+    var jobs = std.ArrayList([]u8).init(root);
+    defer {
+        for (jobs.items) |p| root.free(p);
+        jobs.deinit();
+    }
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var it = std.mem.tokenizeScalar(u8, selection, '\n');
+    while (it.next()) |raw| {
+        while (cancel_flag.load(.monotonic) == 2) { std.time.sleep(100 * std.time.ns_per_ms); }
+        if (cancel_flag.load(.monotonic) == 1) return error.Cancelled;
+        const sel = std.mem.trim(u8, raw, " \r\t");
+        if (sel.len == 0) continue;
+        const full = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ base_dir, sel }) catch continue;
+        const st = std.fs.cwd().statFile(full) catch continue;
+        switch (st.kind) {
+            .directory => try collectWalk(root, base_dir, sel, &path_buf, &jobs, cancel_flag),
+            .file => try jobs.append(try root.dupe(u8, sel)),
+            else => {},
+        }
+    }
+    removeOutputJob(&jobs, root, base_dir, out_path);
+
+    try packJobsVfs(root, base_dir, jobs.items, out_path, effort_tier,
+        cancel_flag, progress_ptr, ticker_ptr);
 }
 
 // ---------------------------------------------------------------------------
