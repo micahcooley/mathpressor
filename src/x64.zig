@@ -44,48 +44,83 @@ fn decode(c: []const u8) Insn {
     }
     if (i >= c.len) return .{ .len = 0, .rip_off = null };
 
-    // ---- REX ----
-    if (c[i] & 0xF0 == 0x40) {
-        if (c[i] & 0x08 != 0) rex_w = true;
-        i += 1;
-    }
-    if (i >= c.len) return .{ .len = 0, .rip_off = null };
-
-    // ---- opcode (1, 2 via 0F, or 3 via 0F38/0F3A) ----
     var has_modrm = false;
     var imm: usize = 0; // immediate byte count
-    var two_byte = false;
-    var three_byte_3a = false;
+    var grp3: u8 = 0; // 0xF6/0xF7: immediate only when ModRM.reg is 0 or 1 (test)
 
-    var op = c[i];
-    i += 1;
-    if (op == 0x0F) {
+    // ---- VEX / EVEX (AVX) prefixes — replace REX, select an opcode map ----
+    // In 64-bit mode 0xC5/0xC4 are VEX and 0x62 is EVEX. They carry the opcode
+    // map (0F / 0F38 / 0F3A) in their bytes; the instruction is ModRM-form.
+    var handled = false;
+    if (c[i] == 0xC5) { // 2-byte VEX (implied 0F map)
+        if (i + 2 > c.len) return .{ .len = 0, .rip_off = null };
+        i += 2;
         if (i >= c.len) return .{ .len = 0, .rip_off = null };
-        two_byte = true;
-        op = c[i];
+        const op2 = c[i];
         i += 1;
-        if (op == 0x38 or op == 0x3A) {
-            three_byte_3a = (op == 0x3A);
-            if (i >= c.len) return .{ .len = 0, .rip_off = null };
-            op = c[i];
-            i += 1;
-        }
+        has_modrm = true;
+        imm = if (twobyte[op2].imm == .ib) 1 else 0;
+        handled = true;
+    } else if (c[i] == 0xC4) { // 3-byte VEX
+        if (i + 3 > c.len) return .{ .len = 0, .rip_off = null };
+        const map = c[i + 1] & 0x1F; // 1=0F, 2=0F38, 3=0F3A
+        i += 3;
+        if (i >= c.len) return .{ .len = 0, .rip_off = null };
+        const op2 = c[i];
+        i += 1;
+        has_modrm = true;
+        imm = vexImm(map, op2);
+        handled = true;
+    } else if (c[i] == 0x62) { // EVEX (4-byte prefix)
+        if (i + 4 > c.len) return .{ .len = 0, .rip_off = null };
+        const map = c[i + 1] & 0x07; // mm: 1=0F, 2=0F38, 3=0F3A
+        i += 4;
+        if (i >= c.len) return .{ .len = 0, .rip_off = null };
+        const op2 = c[i];
+        i += 1;
+        has_modrm = true;
+        imm = vexImm(map, op2);
+        handled = true;
     }
 
-    if (!two_byte) {
-        const p = onebyte[op];
-        has_modrm = p.modrm;
-        imm = immBytes(p.imm, opsize16, rex_w);
-    } else if (three_byte_3a) {
-        has_modrm = true; // 0F 3A maps all take ModRM + ib
-        imm = 1;
-    } else {
-        // 0F 38 (all ModRM, no imm) handled by the two-byte table's modrm flag;
-        // distinguish via a sentinel: we already consumed the third byte, so treat
-        // as ModRM, no immediate.
-        const p = twobyte[op];
-        has_modrm = p.modrm;
-        imm = immBytes(p.imm, opsize16, rex_w);
+    if (!handled) {
+        // ---- REX ----
+        if (c[i] & 0xF0 == 0x40) {
+            if (c[i] & 0x08 != 0) rex_w = true;
+            i += 1;
+        }
+        if (i >= c.len) return .{ .len = 0, .rip_off = null };
+
+        // ---- opcode (1, 2 via 0F, or 3 via 0F38/0F3A) ----
+        var two_byte = false;
+        var three_byte_3a = false;
+        var op = c[i];
+        i += 1;
+        if (op == 0x0F) {
+            if (i >= c.len) return .{ .len = 0, .rip_off = null };
+            two_byte = true;
+            op = c[i];
+            i += 1;
+            if (op == 0x38 or op == 0x3A) {
+                three_byte_3a = (op == 0x3A);
+                if (i >= c.len) return .{ .len = 0, .rip_off = null };
+                op = c[i];
+                i += 1;
+            }
+        }
+        if (!two_byte) {
+            const p = onebyte[op];
+            has_modrm = p.modrm;
+            imm = immBytes(p.imm, opsize16, rex_w);
+            if (op == 0xF6 or op == 0xF7) grp3 = op; // imm decided after ModRM.reg
+        } else if (three_byte_3a) {
+            has_modrm = true; // 0F 3A maps all take ModRM + ib
+            imm = 1;
+        } else {
+            const p = twobyte[op];
+            has_modrm = p.modrm;
+            imm = immBytes(p.imm, opsize16, rex_w);
+        }
     }
 
     // ---- ModRM / SIB / displacement ----
@@ -96,6 +131,10 @@ fn decode(c: []const u8) Insn {
         i += 1;
         const md: u8 = modrm >> 6;
         const rm: u8 = modrm & 7;
+        // grp3 (F6/F7): test Eb,Ib / Ev,Iz when reg field is 0 or 1.
+        if (grp3 != 0 and ((modrm >> 3) & 7) < 2) {
+            imm = if (grp3 == 0xF6) 1 else immBytes(.iz, opsize16, rex_w);
+        }
         if (md != 3) {
             if (rm == 4) {
                 // SIB
@@ -135,6 +174,17 @@ fn immBytes(k: ImmKind, opsize16: bool, rex_w: bool) usize {
         .iz => if (opsize16) 2 else 4,
         .iv => if (rex_w) 8 else (if (opsize16) 2 else 4),
         .i16_8 => 3,
+    };
+}
+
+/// Immediate byte count for a VEX/EVEX instruction by opcode map.
+/// 0F3A opcodes all take an ib; 0F opcodes take ib only where the legacy 0F map
+/// does (vcmpps, vpshuf, vshufps…); 0F38 take none.
+fn vexImm(map: u8, op: u8) usize {
+    return switch (map) {
+        3 => 1, // 0F3A
+        1 => if (twobyte[op].imm == .ib) 1 else 0, // 0F
+        else => 0, // 0F38 and others
     };
 }
 
