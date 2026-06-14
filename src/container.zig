@@ -50,6 +50,7 @@ const std = @import("std");
 const vm_mod = @import("vm.zig");
 const bcj2 = @import("bcj2.zig");
 const cm = @import("cm.zig");
+const lzma_enc = @import("lzma_enc.zig");
 const x64 = @import("x64.zig");
 
 // ---------------------------------------------------------------------------
@@ -144,6 +145,8 @@ pub const CompressionType = enum(u8) {
     math_chunked    = 0x0F, // large file as independently zstd-compressed chunks: a read
                             // decodes only the covering chunk(s), never the whole file →
                             // true random access into the compressed archive (live VFS).
+    math_optlzma    = 0x10, // our pure-Zig multi-state LZMA (.lzma stream); beats 7-Zip
+                            // on opaque data (cold/full mode; slow encode, fast decode).
 };
 
 /// Uncompressed bytes per chunk for `math_chunked` entries. 4 MiB balances ratio
@@ -1604,6 +1607,7 @@ pub const Reader = struct {
             .math_chunked    => extractChunked(block, entry.original_size, a),
             .math_bcj2       => extractBcj2(block, entry.original_size, a),
             .math_cm         => cm.decompress(block, @intCast(entry.original_size), a),
+            .math_optlzma    => lzma_enc.decode(block, a, @intCast(entry.original_size)),
             // A symlink's "contents" are its target path, stored verbatim.
             .symlink         => extractStore(block, entry.original_size, a),
             .solid_block     => extractSolidEntry(

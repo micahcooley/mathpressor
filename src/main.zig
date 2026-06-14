@@ -4146,7 +4146,20 @@ pub fn packTarFullAbi(
             null;
         defer if (cm_block) |b| root.free(b);
 
-        // Pick the smallest representation across LZMA / BCJ2 / CM.
+        // Our pure-Zig multi-state LZMA — beats 7-Zip on opaque data. Slow encode
+        // (~0.08 MB/s at K=32), so size-capped; COLD/Max only. Decodes via our own
+        // RangeDecoder (math_optlzma), no liblzma needed. The winning lever on the
+        // one data type where nothing else beats LZMA.
+        const OPTLZMA_CAP: u64 = 64 * 1024 * 1024;
+        const optlzma_block: ?[]u8 = if (effort_tier == 2 and tsize <= OPTLZMA_CAP) blk: {
+            const lzma_enc = @import("lzma_enc.zig");
+            var kdict: u32 = 1 << 20;
+            while (kdict < tar_data.len and kdict < (1 << 27)) kdict <<= 1;
+            break :blk lzma_enc.compressOptK(tar_data, root, .{ .dict_size = kdict, .nice_len = 273, .max_depth = 1024, .window = 1024, .kbest = 32 }) catch null;
+        } else null;
+        defer if (optlzma_block) |b| root.free(b);
+
+        // Pick the smallest representation across LZMA / BCJ2 / CM / multi-state.
         var best_block: []const u8 = comp;
         var best_ct: container.CompressionType = .fallback_stream;
         if (bcj2_block) |b| if (b.len < best_block.len) {
@@ -4156,6 +4169,10 @@ pub fn packTarFullAbi(
         if (cm_block) |b| if (b.len < best_block.len) {
             best_block = b;
             best_ct = .math_cm;
+        };
+        if (optlzma_block) |b| if (b.len < best_block.len) {
+            best_block = b;
+            best_ct = .math_optlzma;
         };
 
         // STORE guard: never let the wrapper inflate the tar.
