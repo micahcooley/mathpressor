@@ -314,9 +314,14 @@ const Encoder = struct {
     state: u32 = 0,
     reps: [4]u32 = .{ 0, 0, 0, 0 }, // 0-based distances (true distance - 1)
 
-    // match finder: hash-4 chains for >=4-byte matches.
+    // match finder. `head` = latest position per hash-4 (shared). Greedy
+    // `compress` uses `chain` (hash-4 chains); the optimal parser uses `son`
+    // (BT4 binary tree — best distance-per-length, what liblzma/7-Zip use).
     head: []i32,
-    chain: []i32,
+    chain: []i32 = &[_]i32{},
+    son: []i32 = &[_]i32{}, // 2 entries/pos: left=son[p*2], right=son[p*2+1]
+    head2: []i32 = &[_]i32{}, // 1<<16 exact 2-byte index (short matches)
+    head3: []i32 = &[_]i32{}, // 1<<16 3-byte hash
     hash_mask: u32,
 
     fn posSlot(dist: u32) u32 {
@@ -364,37 +369,62 @@ const Encoder = struct {
         return p;
     }
 
-    /// Fill `out` with (len, dist) pairs: for each achievable length the best
-    /// (smallest) distance, lengths strictly increasing. Inserts `pos` into the
-    /// match finder. Returns the number of pairs written.
+    /// BT4 match finder: fill `out` with (len, dist) pairs — for each achievable
+    /// length the *closest* distance, lengths strictly increasing — and insert
+    /// `pos` into the binary tree. This is the optimal distance-per-length the
+    /// hash chain couldn't give, and what lets the optimal parse reach 9e class.
     fn getMatches(self: *Encoder, data: []const u8, pos: usize, out: []Match) usize {
         var n: usize = 0;
-        if (pos + 4 > data.len) {
-            self.insert(data, pos);
-            return 0;
-        }
+        if (pos + 4 > data.len) return 0; // tail: never a match source
         const max_len = @min(@as(u32, kMatchMaxLen), @as(u32, @intCast(data.len - pos)));
-        var best_len: u32 = kMatchMinLen - 1;
         const min_pos: i64 = @as(i64, @intCast(pos)) - @as(i64, @intCast(self.opt.dict_size));
+        var best_len: u32 = kMatchMinLen - 1;
 
         const h = hash4(data, pos, self.hash_mask);
-        var cur = self.head[h];
-        var depth: u32 = 0;
-        while (cur >= 0 and @as(i64, cur) >= min_pos and depth < self.opt.max_depth) : (depth += 1) {
-            const src: usize = @intCast(cur);
-            if (best_len < max_len and data[src + best_len] == data[pos + best_len]) {
-                var l: u32 = 0;
-                while (l < max_len and data[src + l] == data[pos + l]) l += 1;
-                if (l > best_len) {
-                    out[n] = .{ .len = l, .dist = @intCast(pos - src) };
+        var cur_match = self.head[h];
+        self.head[h] = @intCast(pos);
+
+        var ptr0: usize = pos * 2 + 1; // pos's right-child slot
+        var ptr1: usize = pos * 2; // pos's left-child slot
+        var len0: u32 = 0;
+        var len1: u32 = 0;
+        var cut: u32 = self.opt.max_depth;
+        while (true) {
+            if (cut == 0 or cur_match < 0 or @as(i64, cur_match) < min_pos) {
+                self.son[ptr0] = -1;
+                self.son[ptr1] = -1;
+                break;
+            }
+            cut -= 1;
+            const cm: usize = @intCast(cur_match);
+            const pair = cm * 2;
+            var len = @min(len0, len1);
+            if (data[cm + len] == data[pos + len]) {
+                len += 1;
+                while (len != max_len and data[cm + len] == data[pos + len]) len += 1;
+                if (len > best_len) {
+                    out[n] = .{ .len = len, .dist = @intCast(pos - cm) };
                     n += 1;
-                    best_len = l;
-                    if (l >= max_len or n >= out.len) break;
+                    best_len = len;
+                }
+                if (len == max_len) {
+                    self.son[ptr1] = self.son[pair];
+                    self.son[ptr0] = self.son[pair + 1];
+                    break;
                 }
             }
-            cur = self.chain[src];
+            if (data[cm + len] < data[pos + len]) {
+                self.son[ptr1] = cur_match;
+                ptr1 = pair + 1;
+                cur_match = self.son[ptr1];
+                len1 = len;
+            } else {
+                self.son[ptr0] = cur_match;
+                ptr0 = pair;
+                cur_match = self.son[ptr0];
+                len0 = len;
+            }
         }
-        self.insert(data, pos);
         return n;
     }
 
@@ -729,10 +759,16 @@ pub fn compressOpt(data: []const u8, a: std.mem.Allocator, opt_in: Options) ![]u
     const head = try a.alloc(i32, hsize);
     defer a.free(head);
     @memset(head, -1);
-    const chain = try a.alloc(i32, @max(data.len, 1));
-    defer a.free(chain);
+    const son = try a.alloc(i32, 2 * @max(data.len, 1));
+    defer a.free(son);
+    const head2 = try a.alloc(i32, 1 << 16);
+    defer a.free(head2);
+    @memset(head2, -1);
+    const head3 = try a.alloc(i32, 1 << 16);
+    defer a.free(head3);
+    @memset(head3, -1);
 
-    var enc = Encoder{ .a = a, .opt = opt, .literal = literal, .head = head, .chain = chain, .hash_mask = hsize - 1 };
+    var enc = Encoder{ .a = a, .opt = opt, .literal = literal, .head = head, .son = son, .head2 = head2, .head3 = head3, .hash_mask = hsize - 1 };
 
     var out = std.ArrayList(u8).init(a);
     errdefer out.deinit();
@@ -748,20 +784,27 @@ pub fn compressOpt(data: []const u8, a: std.mem.Allocator, opt_in: Options) ![]u
     const INF: u32 = 0xFFFF_FFFF;
 
     const WIN: usize = 1024;
-    const opts = try a.alloc(OptNode, WIN + 1);
+    const OPTS_CAP = WIN + kMatchMaxLen + 1; // matches may reach past WIN without truncation
+    const opts = try a.alloc(OptNode, OPTS_CAP);
     defer a.free(opts);
     var matches: [kMatchMaxLen + 2]Match = undefined;
-    var ops: [WIN]Match = undefined; // backtracked op list (len, dist); dist 0 = literal
+    var ops: [WIN + 1]Match = undefined; // backtracked op list (len, dist); dist 0 = literal
 
     var anchor: usize = 0;
     while (anchor < data.len) {
-        const max_win = @min(WIN, data.len - anchor);
+        const remaining = data.len - anchor;
+        const cap_scan = @min(WIN, remaining);
         opts[0] = .{ .price = 0, .state = enc.state, .reps = enc.reps, .from = 0, .len = 0, .dist = 0 };
         var z: usize = 1;
-        while (z <= max_win) : (z += 1) opts[z].price = INF;
+        const init_to = @min(OPTS_CAP - 1, cap_scan + kMatchMaxLen);
+        while (z <= init_to) : (z += 1) opts[z].price = INF;
+
+        var stop: usize = cap_scan; // window end (positions the DP path consumes)
+        var forced_len: u32 = 0; // a >=nice_len match emitted whole after the path
+        var forced_dist: u32 = 0;
 
         var cur: usize = 0;
-        while (cur < max_win) : (cur += 1) {
+        while (cur < cap_scan) : (cur += 1) {
             const p = anchor + cur;
             const nmatch = enc.getMatches(data, p, &matches); // inserts p
             if (opts[cur].price == INF) continue;
@@ -772,6 +815,7 @@ pub fn compressOpt(data: []const u8, a: std.mem.Allocator, opt_in: Options) ![]u
             const im_idx = (st << kNumPosBitsMax) + pos_state;
             const im0 = priceBit(enc.is_match[im_idx], 0);
             const im1 = priceBit(enc.is_match[im_idx], 1);
+            const max_here: u32 = @intCast(remaining - cur); // longest any match can be
 
             // (1) literal
             {
@@ -788,15 +832,15 @@ pub fn compressOpt(data: []const u8, a: std.mem.Allocator, opt_in: Options) ![]u
 
             const rep_base = base + im1 + priceBit(enc.is_rep[st], 1);
             const new_base = base + im1 + priceBit(enc.is_rep[st], 0);
-            const win_left: u32 = @intCast(max_win - cur);
+            var longest: u32 = 0;
+            var longest_dist: u32 = 0;
 
             // (2) rep matches
             for (reps, 0..) |r, ri| {
                 const dist = r + 1;
                 if (dist > p) continue;
                 const src = p - dist;
-                var maxl: u32 = @min(@as(u32, kMatchMaxLen), win_left);
-                if (@as(usize, maxl) > data.len - p) maxl = @intCast(data.len - p);
+                const maxl: u32 = @min(@as(u32, kMatchMaxLen), max_here);
                 var l: u32 = 0;
                 while (l < maxl and data[src + l] == data[p + l]) l += 1;
                 var rep_sel: u32 = 0;
@@ -827,6 +871,10 @@ pub fn compressOpt(data: []const u8, a: std.mem.Allocator, opt_in: Options) ![]u
                         if (np < opts[cur + len].price)
                             opts[cur + len] = .{ .price = np, .state = repNextState(st), .reps = nreps, .from = @intCast(cur), .len = len, .dist = dist };
                     }
+                    if (l > longest) {
+                        longest = l;
+                        longest_dist = dist;
+                    }
                 }
             }
 
@@ -842,41 +890,63 @@ pub fn compressOpt(data: []const u8, a: std.mem.Allocator, opt_in: Options) ![]u
                 nreps[1] = nreps[0];
                 nreps[0] = d0;
                 var len = start_len;
-                const top = @min(md.len, win_left);
-                while (len <= top) : (len += 1) {
+                while (len <= md.len) : (len += 1) {
                     const np = new_base + enc.len_coder.price(len - kMatchMinLen, pos_state) + enc.priceDistance(d0, len);
                     if (np < opts[cur + len].price)
                         opts[cur + len] = .{ .price = np, .state = matchNextState(st), .reps = nreps, .from = @intCast(cur), .len = len, .dist = md.dist };
                 }
                 start_len = md.len + 1;
+                if (md.len > longest) {
+                    longest = md.len;
+                    longest_dist = md.dist;
+                }
+            }
+
+            // long-match early stop: a >=nice_len match is essentially always
+            // worth taking whole — emit the optimal path up to here, then it,
+            // instead of letting the window boundary truncate it.
+            if (longest >= enc.opt.nice_len) {
+                stop = cur;
+                forced_len = longest;
+                forced_dist = longest_dist;
+                break;
             }
         }
 
-        // backtrack from max_win to 0, collect ops in reverse
+        // backtrack from `stop` to 0, collect ops in reverse
         var nops: usize = 0;
-        var idx: usize = max_win;
+        var idx: usize = stop;
         while (idx != 0) {
             const node = opts[idx];
             ops[nops] = .{ .len = node.len, .dist = node.dist };
             nops += 1;
             idx = node.from;
         }
-        // emit forward (reverse of collection order)
+        // emit the optimal path forward (reverse of collection order)
         var pos = anchor;
         var oi: usize = nops;
         while (oi != 0) {
             oi -= 1;
             const op = ops[oi];
-            const pos_state: u32 = @as(u32, @intCast(pos)) & pb_mask;
+            const ps: u32 = @as(u32, @intCast(pos)) & pb_mask;
             if (op.dist == 0) {
-                try enc.emitLit(&rc, data, pos, pos_state);
+                try enc.emitLit(&rc, data, pos, ps);
                 pos += 1;
             } else {
-                try enc.emitMatch(&rc, op.len, op.dist, pos_state);
+                try enc.emitMatch(&rc, op.len, op.dist, ps);
                 pos += op.len;
             }
         }
-        anchor += max_win;
+        anchor += stop;
+
+        // emit the forced long match whole, then skip-insert its covered bytes
+        if (forced_len > 0) {
+            const ps: u32 = @as(u32, @intCast(anchor)) & pb_mask;
+            try enc.emitMatch(&rc, forced_len, forced_dist, ps);
+            var k: usize = 1;
+            while (k < forced_len) : (k += 1) _ = enc.getMatches(data, anchor + k, &matches);
+            anchor += forced_len;
+        }
     }
 
     try rc.flush();
