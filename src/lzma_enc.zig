@@ -281,7 +281,7 @@ const LenCoder = struct {
 };
 
 // ---- the encoder -----------------------------------------------------------
-const Match = struct { len: u32, dist: u32 }; // dist is the true distance (>=1)
+pub const Match = struct { len: u32, dist: u32 }; // dist is the true distance (>=1)
 
 pub const Options = struct {
     lc: u4 = 3,
@@ -290,6 +290,7 @@ pub const Options = struct {
     dict_size: u32 = 1 << 26, // 64 MiB
     nice_len: u32 = 64,
     max_depth: u32 = 96,
+    dist_penalty: u32 = 0, // experimental far-distance bias (price units per slot)
 };
 
 const Encoder = struct {
@@ -304,7 +305,7 @@ const Encoder = struct {
     is_rep_g2: [kNumStates]u16 = [_]u16{kProbInit} ** kNumStates,
     is_rep0_long: [kNumStates << kNumPosBitsMax]u16 = [_]u16{kProbInit} ** (kNumStates << kNumPosBitsMax),
     pos_slot: [kNumLenToPosStates][1 << 6]u16 = [_][1 << 6]u16{[_]u16{kProbInit} ** (1 << 6)} ** kNumLenToPosStates,
-    spec_pos: [kNumFullDistances - kEndPosModelIndex]u16 = [_]u16{kProbInit} ** (kNumFullDistances - kEndPosModelIndex),
+    spec_pos: [kNumFullDistances - kEndPosModelIndex + 1]u16 = [_]u16{kProbInit} ** (kNumFullDistances - kEndPosModelIndex + 1),
     align_probs: [kAlignTableSize]u16 = [_]u16{kProbInit} ** kAlignTableSize,
     len_coder: LenCoder = .{},
     rep_len_coder: LenCoder = .{},
@@ -366,7 +367,11 @@ const Encoder = struct {
                 p += priceTreeReverse(self.align_probs[0..], kNumAlignBits, reduced & (kAlignTableSize - 1));
             }
         }
-        return p;
+        // EXPERIMENT: far-distance penalty. The fixed-window price model can't see
+        // that committing to close distances trains the model into a cheaper basin
+        // (liblzma converges there; our locally-cheapest DP falls into a far/rep
+        // basin). A static penalty ~ slot approximates that amortized cost.
+        return p + slot * self.opt.dist_penalty;
     }
 
     /// BT4 match finder: fill `out` with (len, dist) pairs — for each achievable
@@ -951,6 +956,278 @@ pub fn compressOpt(data: []const u8, a: std.mem.Allocator, opt_in: Options) ![]u
 
     try rc.flush();
     return out.toOwnedSlice();
+}
+
+/// Diagnostic: run the BT4 match finder up to `pos` and return the matches it
+/// surfaces there — to check whether close matches are being found.
+pub fn probeMatchesAt(data: []const u8, pos: usize, opt: Options, a: std.mem.Allocator, out: []Match) !usize {
+    var hbits: u5 = 16;
+    while ((@as(u32, 1) << hbits) < data.len and hbits < 24) hbits += 1;
+    const hsize = @as(u32, 1) << hbits;
+    const head = try a.alloc(i32, hsize);
+    defer a.free(head);
+    @memset(head, -1);
+    const son = try a.alloc(i32, 2 * @max(data.len, 1));
+    defer a.free(son);
+    const head2 = try a.alloc(i32, 1 << 16);
+    defer a.free(head2);
+    @memset(head2, -1);
+    const head3 = try a.alloc(i32, 1 << 16);
+    defer a.free(head3);
+    @memset(head3, -1);
+    var enc = Encoder{ .a = a, .opt = opt, .literal = &[_]u16{}, .head = head, .son = son, .head2 = head2, .head3 = head3, .hash_mask = hsize - 1 };
+    var scratch: [kMatchMaxLen + 2]Match = undefined;
+    var i: usize = 0;
+    while (i < pos) : (i += 1) _ = enc.getMatches(data, i, &scratch);
+    return enc.getMatches(data, pos, out);
+}
+
+// ===========================================================================
+// FORENSIC TOOL: an LZMA decoder that dumps token statistics. Lets us compare
+// liblzma's actual parse decisions to ours on the SAME data — the only way to
+// see *where* a 6% gap hides when matches, prices, and params are all identical.
+// ===========================================================================
+const RangeDecoder = struct {
+    code: u32 = 0,
+    range: u32 = 0xFFFF_FFFF,
+    src: []const u8,
+    pos: usize = 0,
+    fn nextByte(self: *RangeDecoder) u8 {
+        if (self.pos >= self.src.len) return 0;
+        const b = self.src[self.pos];
+        self.pos += 1;
+        return b;
+    }
+    fn init(src: []const u8) RangeDecoder {
+        var d = RangeDecoder{ .src = src };
+        _ = d.nextByte();
+        var i: usize = 0;
+        while (i < 4) : (i += 1) d.code = (d.code << 8) | d.nextByte();
+        return d;
+    }
+    fn decodeBit(self: *RangeDecoder, prob: *u16) u1 {
+        const bound = (self.range >> kNumBitModelTotalBits) * prob.*;
+        var bit: u1 = undefined;
+        if (self.code < bound) {
+            self.range = bound;
+            updProb0(prob);
+            bit = 0;
+        } else {
+            self.code -= bound;
+            self.range -= bound;
+            updProb1(prob);
+            bit = 1;
+        }
+        while (self.range < kTopValue) {
+            self.range <<= 8;
+            self.code = (self.code << 8) | self.nextByte();
+        }
+        return bit;
+    }
+    fn decodeDirect(self: *RangeDecoder, num_bits: u6) u32 {
+        var res: u32 = 0;
+        var i: u6 = num_bits;
+        while (i != 0) : (i -= 1) {
+            self.range >>= 1;
+            self.code -%= self.range;
+            const t: u32 = 0 -% (self.code >> 31);
+            self.code +%= self.range & t;
+            while (self.range < kTopValue) {
+                self.range <<= 8;
+                self.code = (self.code << 8) | self.nextByte();
+            }
+            res = (res << 1) +% (t +% 1);
+        }
+        return res;
+    }
+    fn decodeTree(self: *RangeDecoder, probs: []u16, num_bits: u6) u32 {
+        var m: u32 = 1;
+        var i: u6 = 0;
+        while (i < num_bits) : (i += 1) m = (m << 1) | self.decodeBit(&probs[m]);
+        return m - (@as(u32, 1) << @as(u5, @intCast(num_bits)));
+    }
+    fn decodeTreeReverse(self: *RangeDecoder, probs: []u16, num_bits: u6) u32 {
+        var m: u32 = 1;
+        var res: u32 = 0;
+        var i: u6 = 0;
+        while (i < num_bits) : (i += 1) {
+            const b = self.decodeBit(&probs[m]);
+            m = (m << 1) | b;
+            res |= @as(u32, b) << @intCast(i);
+        }
+        return res;
+    }
+};
+
+pub const TokenStats = struct {
+    out_len: usize = 0,
+    n_lit: u64 = 0,
+    n_newmatch: u64 = 0,
+    n_rep: u64 = 0, // rep0..3 with len>=2
+    n_shortrep: u64 = 0,
+    newmatch_bytes: u64 = 0,
+    rep_bytes: u64 = 0,
+    rep0_used: u64 = 0,
+    rep_far_used: u64 = 0, // rep1/2/3
+    sum_newmatch_dist: u64 = 0,
+};
+
+const DecLenCoder = struct {
+    choice: u16 = kProbInit,
+    choice2: u16 = kProbInit,
+    low: [1 << kNumPosBitsMax][8]u16 = [_][8]u16{[_]u16{kProbInit} ** 8} ** (1 << kNumPosBitsMax),
+    mid: [1 << kNumPosBitsMax][8]u16 = [_][8]u16{[_]u16{kProbInit} ** 8} ** (1 << kNumPosBitsMax),
+    high: [256]u16 = [_]u16{kProbInit} ** 256,
+    fn decode(self: *DecLenCoder, rc: *RangeDecoder, pos_state: u32) u32 {
+        if (rc.decodeBit(&self.choice) == 0) return rc.decodeTree(self.low[pos_state][0..], 3);
+        if (rc.decodeBit(&self.choice2) == 0) return 8 + rc.decodeTree(self.mid[pos_state][0..], 3);
+        return 16 + rc.decodeTree(self.high[0..], 8);
+    }
+};
+
+/// Decode a .lzma (alone) stream and return token statistics. For unknown-size
+/// streams (liblzma writes size = u64 max + an end marker) pass `known_size`.
+pub fn dumpStats(stream: []const u8, a: std.mem.Allocator, known_size: ?usize) !TokenStats {
+    if (stream.len < 13) return error.Truncated;
+    const props = stream[0];
+    const lc: u4 = @intCast(props % 9);
+    const r = props / 9;
+    const lp: u4 = @intCast(r % 5);
+    const pb: u4 = @intCast(r / 5);
+    const raw_size = std.mem.readInt(u64, stream[5..13], .little);
+    const out_size: usize = if (raw_size == std.math.maxInt(u64)) (known_size orelse return error.UnknownSize) else @intCast(raw_size);
+
+    const out = try a.alloc(u8, out_size);
+    defer a.free(out);
+    const lit = try a.alloc(u16, @as(usize, 0x300) << @intCast(lc + lp));
+    defer a.free(lit);
+    @memset(lit, kProbInit);
+
+    var is_match = [_]u16{kProbInit} ** (kNumStates << kNumPosBitsMax);
+    var is_rep = [_]u16{kProbInit} ** kNumStates;
+    var is_rep_g0 = [_]u16{kProbInit} ** kNumStates;
+    var is_rep_g1 = [_]u16{kProbInit} ** kNumStates;
+    var is_rep_g2 = [_]u16{kProbInit} ** kNumStates;
+    var is_rep0_long = [_]u16{kProbInit} ** (kNumStates << kNumPosBitsMax);
+    var pos_slot = [_][1 << 6]u16{[_]u16{kProbInit} ** (1 << 6)} ** kNumLenToPosStates;
+    var spec_pos = [_]u16{kProbInit} ** (kNumFullDistances - kEndPosModelIndex + 1);
+    var align_probs = [_]u16{kProbInit} ** kAlignTableSize;
+    var len_coder = DecLenCoder{};
+    var rep_len_coder = DecLenCoder{};
+
+    var rc = RangeDecoder.init(stream[13..]);
+    var st: TokenStats = .{ .out_len = out_size };
+    var state: u32 = 0;
+    var reps = [4]u32{ 0, 0, 0, 0 };
+    const pb_mask: u32 = (@as(u32, 1) << pb) - 1;
+    const lp_mask: u32 = (@as(u32, 1) << lp) - 1;
+    var o: usize = 0;
+    while (o < out_size) {
+        const pos_state = @as(u32, @intCast(o)) & pb_mask;
+        const im = (state << kNumPosBitsMax) + pos_state;
+        if (rc.decodeBit(&is_match[im]) == 0) {
+            const prev: u8 = if (o == 0) 0 else out[o - 1];
+            const idx = 0x300 * (((@as(u32, @intCast(o)) & lp_mask) << lc) + (@as(u32, prev) >> @intCast(8 - lc)));
+            const probs = lit[idx..][0..0x300];
+            var sym: u32 = 1;
+            if (state < 7) {
+                while (sym < 0x100) sym = (sym << 1) | rc.decodeBit(&probs[sym]);
+            } else {
+                var mb: u32 = out[o - (reps[0] + 1)];
+                while (sym < 0x100) {
+                    mb <<= 1;
+                    const match_bit = mb & 0x100;
+                    const b = rc.decodeBit(&probs[0x100 + match_bit + sym]);
+                    sym = (sym << 1) | b;
+                    if (match_bit != (@as(u32, b) << 8)) {
+                        while (sym < 0x100) sym = (sym << 1) | rc.decodeBit(&probs[sym]);
+                        break;
+                    }
+                }
+            }
+            out[o] = @intCast(sym & 0xFF);
+            o += 1;
+            state = litNextState(state);
+            st.n_lit += 1;
+            continue;
+        }
+        var len: u32 = undefined;
+        if (rc.decodeBit(&is_rep[state]) == 1) {
+            if (rc.decodeBit(&is_rep_g0[state]) == 0) {
+                if (rc.decodeBit(&is_rep0_long[im]) == 0) {
+                    state = shortRepNextState(state);
+                    out[o] = out[o - (reps[0] + 1)];
+                    o += 1;
+                    st.n_shortrep += 1;
+                    continue;
+                }
+                st.rep0_used += 1;
+            } else {
+                var dist: u32 = undefined;
+                if (rc.decodeBit(&is_rep_g1[state]) == 0) {
+                    dist = reps[1];
+                    reps[1] = reps[0];
+                } else if (rc.decodeBit(&is_rep_g2[state]) == 0) {
+                    dist = reps[2];
+                    reps[2] = reps[1];
+                    reps[1] = reps[0];
+                } else {
+                    dist = reps[3];
+                    reps[3] = reps[2];
+                    reps[2] = reps[1];
+                    reps[1] = reps[0];
+                }
+                reps[0] = dist;
+                st.rep_far_used += 1;
+            }
+            len = rep_len_coder.decode(&rc, pos_state) + kMatchMinLen;
+            state = repNextState(state);
+            st.n_rep += 1;
+            st.rep_bytes += len;
+        } else {
+            reps[3] = reps[2];
+            reps[2] = reps[1];
+            reps[1] = reps[0];
+            len = len_coder.decode(&rc, pos_state) + kMatchMinLen;
+            const len_state = @min(len - kMatchMinLen, kNumLenToPosStates - 1);
+            const slot = rc.decodeTree(pos_slot[len_state][0..], 6);
+            var dist0: u32 = slot;
+            if (slot >= kStartPosModelIndex) {
+                const footer: u6 = @intCast((slot >> 1) - 1);
+                dist0 = (2 | (slot & 1)) << @as(u5, @intCast(footer));
+                if (slot < kEndPosModelIndex) {
+                    const off = dist0 - slot;
+                    // reverse tree on spec_pos[off..]
+                    var m: u32 = 1;
+                    var add: u32 = 0;
+                    var i: u6 = 0;
+                    while (i < footer) : (i += 1) {
+                        const b = rc.decodeBit(&spec_pos[off + m]);
+                        m = (m << 1) | b;
+                        add |= @as(u32, b) << @intCast(i);
+                    }
+                    dist0 += add;
+                } else {
+                    dist0 += rc.decodeDirect(footer - kNumAlignBits) << kNumAlignBits;
+                    dist0 += rc.decodeTreeReverse(align_probs[0..], kNumAlignBits);
+                }
+            }
+            if (dist0 == 0xFFFF_FFFF) break; // end-of-stream marker
+            reps[0] = dist0;
+            st.n_newmatch += 1;
+            st.newmatch_bytes += len;
+            st.sum_newmatch_dist += dist0 + 1;
+            state = matchNextState(state);
+        }
+        // copy len bytes from reps[0]
+        const dist = reps[0] + 1;
+        var k: u32 = 0;
+        while (k < len) : (k += 1) {
+            out[o] = out[o - dist];
+            o += 1;
+        }
+    }
+    return st;
 }
 
 // --- tests: round-trip our output through xz's liblzma decoder is done in

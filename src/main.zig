@@ -53,7 +53,35 @@ pub fn main() !void {
     } else if (args.len >= 3 and std.mem.eql(u8, args[1], "x64bench")) {
         try x64Bench(root, args[2], out);
     } else if (args.len >= 3 and std.mem.eql(u8, args[1], "lzmaenc")) {
-        try lzmaEncBench(root, args[2], out);
+        const pen: u32 = if (args.len >= 4) (std.fmt.parseInt(u32, args[3], 10) catch 0) else 0;
+        try lzmaEncBench(root, args[2], pen, out);
+    } else if (args.len >= 4 and std.mem.eql(u8, args[1], "mfprobe")) {
+        const lzma_enc = @import("lzma_enc.zig");
+        const f = try std.fs.cwd().openFile(args[2], .{});
+        defer f.close();
+        const data = try f.readToEndAlloc(root, 1 << 30);
+        defer root.free(data);
+        const pos = try std.fmt.parseInt(usize, args[3], 10);
+        var buf: [300]lzma_enc.Match = undefined;
+        const dict: u32 = 1 << 26;
+        const n = try lzma_enc.probeMatchesAt(data, pos, .{ .dict_size = dict, .max_depth = 1024 }, root, &buf);
+        try out.print("matches at pos {d} ({d} found):\n", .{ pos, n });
+        for (buf[0..n]) |m| try out.print("  len {d:>3}  dist {d}\n", .{ m.len, m.dist });
+    } else if (args.len >= 3 and std.mem.eql(u8, args[1], "lzmadump")) {
+        const lzma_enc = @import("lzma_enc.zig");
+        const f = try std.fs.cwd().openFile(args[2], .{});
+        defer f.close();
+        const data = try f.readToEndAlloc(root, 1 << 30);
+        defer root.free(data);
+        const known: ?usize = if (args.len >= 4) (std.fmt.parseInt(usize, args[3], 10) catch null) else null;
+        const s = try lzma_enc.dumpStats(data, root, known);
+        const ol: f64 = @floatFromInt(s.out_len);
+        try out.print("tokens for {s} (decoded {d} bytes):\n", .{ args[2], s.out_len });
+        try out.print("  literals     : {d:>10}  ({d:.1}% of output bytes)\n", .{ s.n_lit, @as(f64, @floatFromInt(s.n_lit)) / ol * 100 });
+        try out.print("  new matches  : {d:>10}  ({d:.1}% of bytes, avg len {d:.1}, avg dist {d})\n", .{ s.n_newmatch, @as(f64, @floatFromInt(s.newmatch_bytes)) / ol * 100, if (s.n_newmatch > 0) @as(f64, @floatFromInt(s.newmatch_bytes)) / @as(f64, @floatFromInt(s.n_newmatch)) else 0, if (s.n_newmatch > 0) s.sum_newmatch_dist / s.n_newmatch else 0 });
+        try out.print("  rep matches  : {d:>10}  ({d:.1}% of bytes, avg len {d:.1})  [rep0 {d}, rep1-3 {d}]\n", .{ s.n_rep, @as(f64, @floatFromInt(s.rep_bytes)) / ol * 100, if (s.n_rep > 0) @as(f64, @floatFromInt(s.rep_bytes)) / @as(f64, @floatFromInt(s.n_rep)) else 0, s.rep0_used, s.rep_far_used });
+        try out.print("  short reps   : {d:>10}\n", .{s.n_shortrep});
+        try out.print("  total tokens : {d}\n", .{s.n_lit + s.n_newmatch + s.n_rep + s.n_shortrep});
     } else if (args.len >= 4 and std.mem.eql(u8, args[1], "unpack")) {
         try unpackContainer(root, args[2], args[3], out);
     } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench")) {
@@ -70,7 +98,7 @@ pub fn main() !void {
 /// Diagnostic: run our pure-Zig LZMA encoder on a file, write the .lzma so it
 /// can be decode-verified with `xz -d --format=lzma`, and compare its size to
 /// liblzma 9e. This is the foundation for closing the parser gap to 7-Zip.
-fn lzmaEncBench(root: std.mem.Allocator, path: []const u8, out: anytype) !void {
+fn lzmaEncBench(root: std.mem.Allocator, path: []const u8, penalty: u32, out: anytype) !void {
     const lzma_enc = @import("lzma_enc.zig");
     const f = try std.fs.cwd().openFile(path, .{});
     defer f.close();
@@ -80,7 +108,7 @@ fn lzmaEncBench(root: std.mem.Allocator, path: []const u8, out: anytype) !void {
     var dict: u32 = 1 << 20;
     while (dict < data.len and dict < (1 << 27)) dict <<= 1;
 
-    const cfg = lzma_enc.Options{ .dict_size = dict, .nice_len = 273, .max_depth = 1024 };
+    const cfg = lzma_enc.Options{ .dict_size = dict, .nice_len = 273, .max_depth = 1024, .dist_penalty = penalty };
 
     var t = try std.time.Timer.start();
     const greedy = try lzma_enc.compress(data, root, cfg);
@@ -96,6 +124,11 @@ fn lzmaEncBench(root: std.mem.Allocator, path: []const u8, out: anytype) !void {
     const lf = try std.fs.cwd().createFile("/tmp/ours.lzma", .{});
     defer lf.close();
     try lf.writeAll(ours);
+    { // also dump greedy for forensic distance comparison
+        const gf = try std.fs.cwd().createFile("/tmp/greedy.lzma", .{});
+        defer gf.close();
+        try gf.writeAll(greedy);
+    }
 
     const lz = try container.lzmaCompress(data, root, container.lzmaPreset(2));
     defer root.free(lz);
