@@ -2775,6 +2775,53 @@ pub fn lzmaCompressX86(data: []const u8, a: std.mem.Allocator, preset: u32) ![]u
     return a.dupe(u8, buf[0..out_pos]);
 }
 
+/// Round a length up to the next power of two, clamped to [1 MiB, 1.5 GiB] — the
+/// valid LZMA dictionary range. Used to size a big dictionary that covers the
+/// whole input so long-range matches beyond preset-9's 64 MiB window are found.
+fn dictSizeFor(len: usize) u32 {
+    const lo: u64 = 1 << 20; // 1 MiB floor
+    const hi: u64 = 1536 * 1024 * 1024; // liblzma's 1.5 GiB ceiling
+    var d: u64 = lo;
+    while (d < len and d < hi) d <<= 1;
+    return @intCast(@min(d, hi));
+}
+
+/// LZMA2 with an explicit (large) dictionary — used by COLD full mode on big
+/// solid tars. preset-9 caps the window at 64 MiB; a real game pak has matching
+/// content scattered hundreds of MB apart that only a dictionary spanning the
+/// whole input can reach (measured: −0.14% on a 961 MB pak vs the 64 MiB window).
+/// The .xz block header records the dict size, so `lzmaDecompress`
+/// (lzma_stream_buffer_decode) reconstructs it with no extra metadata or codec.
+/// `cap` bounds the dictionary for memory (encoder needs ~10.5× dict for BT4).
+pub fn lzmaCompressBigDict(data: []const u8, a: std.mem.Allocator, preset: u32, cap: u32, use_x86: bool) ![]u8 {
+    var opt: lzma_options_lzma = std.mem.zeroes(lzma_options_lzma);
+    if (lzma_lzma_preset(&opt, preset) != 0) return error.LzmaCompressFailed;
+    const want = dictSizeFor(data.len);
+    opt.dict_size = @min(want, cap);
+    // Only worth the extra RAM/time when it actually exceeds the preset window.
+    if (opt.dict_size <= 64 * 1024 * 1024) return error.LzmaCompressFailed;
+    var filters_x86 = [_]lzma_filter{
+        .{ .id = LZMA_FILTER_X86, .options = null },
+        .{ .id = LZMA_FILTER_LZMA2, .options = &opt },
+        .{ .id = LZMA_VLI_UNKNOWN, .options = null },
+    };
+    var filters_plain = [_]lzma_filter{
+        .{ .id = LZMA_FILTER_LZMA2, .options = &opt },
+        .{ .id = LZMA_VLI_UNKNOWN, .options = null },
+    };
+    const filters: [*]lzma_filter = if (use_x86) &filters_x86 else &filters_plain;
+    const bound = lzma_stream_buffer_bound(data.len);
+    const buf = try a.alloc(u8, bound);
+    defer a.free(buf);
+    var out_pos: usize = 0;
+    const rc = lzma_stream_buffer_encode(
+        filters, LZMA_CHECK_NONE, null,
+        data.ptr, data.len, buf.ptr, &out_pos, buf.len,
+    );
+    if (rc != LZMA_OK) return error.LzmaCompressFailed;
+    return a.dupe(u8, buf[0..out_pos]);
+}
+
 /// LZMA with explicit literal-context / literal-position / position bits. The
 /// .xz stream self-describes the filter params, so lzmaDecompress reads it back
 /// with no extra metadata. Used to tune the BCJ2 address streams (4-byte-aligned

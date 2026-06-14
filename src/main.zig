@@ -3994,6 +3994,29 @@ pub fn packTarFullAbi(
         }
         defer root.free(comp);
 
+        // COLD big-dictionary pass for large tars. preset-9 caps the LZMA window
+        // at 64 MiB, but a multi-hundred-MB solid tar (e.g. a 961 MB game pak)
+        // has matching content scattered far beyond that — a dictionary spanning
+        // the whole input reaches it (measured −0.14% on FPS Chess's pak). Runs
+        // AFTER the 64 MiB candidates above have freed their encoders, so peak
+        // RAM stays bounded; dict capped at 512 MiB (~6 GB BT4 encoder). The .xz
+        // block header self-describes the dict, so decode is unchanged. x86 BCJ
+        // is applied only when the tar looks like code (it hurts opaque data).
+        if (effort_tier == 2 and tsize > 128 * 1024 * 1024) {
+            // 256 MiB dict (~2.7 GB BT4 encoder) — captures the long-range win
+            // while staying safe on 8 GB-class machines; 512 MiB gained only a
+            // further ~0.04% but needs ~5.5 GB (OOM-risky next to the 64 MiB
+            // candidates + the in-memory tar).
+            const BIGDICT_CAP: u32 = 256 * 1024 * 1024;
+            const use_x86 = looksLikeX86(tar_data);
+            if (container.lzmaCompressBigDict(tar_data, root, preset, BIGDICT_CAP, use_x86) catch null) |bd| {
+                if (bd.len < comp.len) {
+                    root.free(comp);
+                    comp = bd;
+                } else root.free(bd);
+            }
+        }
+
         // Backend race (Max only, mutually exclusive by content), keep smallest:
         //  - x86 code -> BCJ2 with CM main stream (allow_cm=true): the 4-stream
         //    filter + context-mixing the de-addressed code beats 7-Zip.
