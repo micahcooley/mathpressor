@@ -2,7 +2,7 @@
 
 > **🧒 In plain English** — Mathpressor squeezes a whole folder (say, a video game) into a much smaller file. But unlike a normal `.zip`, your program can **run directly from the squeezed file** — it unpacks only the bits it needs, the instant it needs them, so nothing ever gets unzipped onto your disk. We squeezed a **1 GB game down to 320 MB and it still ran at full speed**, with no way to tell the difference.
 >
-> *This README is written two ways at once: the technical text, and an **In plain English** box like this after the jargon-heavy parts. Read whichever you like — or both, side by side.*
+> *This README is written two ways at once: the technical text, and an **In plain English** box like this after the jargon-heavy parts. It also flows **shallow → deep** — what it is and how to use it come first; the byte-level internals (opcodes, wire format) are at the bottom. Read whichever you like, scroll as far down as you want.*
 
 A deterministic procedural-asset engine, container format, and **live VFS** — 100% Zig. Mathpressor packs a file tree by routing each asset to whichever is smallest: demoscene-style **procedural synthesis** (store a tiny generator program instead of the pixels), reversible domain transforms (x86 BCJ2/RIP, 2D image predictor, columnar, audio LPC), or a strong general backend (zstd / LZMA / context-mixing). Then a host can **run straight off the compressed archive** — random-access, decode-on-demand, nothing inflated to disk. Ships as a CLI, a desktop GUI, and a `libmathpressor.so` over a plain C-ABI.
 
@@ -20,9 +20,10 @@ For assets that can be represented procedurally (noise textures, cave masks, mar
 
 > **🧒 In plain English** — Instead of one way to shrink a file, Mathpressor tries several and keeps the smallest. The fanciest trick: if a texture is something a little math formula can *draw* (like clouds or static), it stores the **recipe** (a few bytes) instead of the picture (thousands of bytes) and re-draws it on demand. Most files aren't drawable that way, so for those it uses normal-but-strong compression. It never makes a file bigger — worst case it just stores it as-is.
 
-### The Four Storage Routes
+### The storage routes
 
-When you pack a directory, Mathpressor automatically routes each file:
+When you pack a directory, Mathpressor automatically routes each file to one of
+these (the diagram shows the original four; the table lists them all):
 
 ```
                          ┌─────────────────────────────────────┐
@@ -96,177 +97,6 @@ an exact involution. Because the predictor is net-new ground, this beats general
 compressors — even *solid* ones — on raw audio while staying per-entry/live
 (measured: a 7-file WAV set packed to 11.9 KB vs solid 7z 18.5 KB, solid xz
 23.5 KB, per-file xz 25.3 KB). Honesty-guarded like every route.
-
----
-
-## Hard Constraints
-
-| Constraint | Implementation |
-|---|---|
-| **100% Zig** | No C, C++, or Python anywhere in the engine or build system. |
-| **Zero float in the core loop** | The VM, math generators, and all runtime paths use strict 32/64-bit integer arithmetic. `f64` is used only in the offline translator (Shannon entropy). Verified bit-identical on x86-64 LE, big-endian s390x, and aarch64 — all produce checksum `0x5757ceb1`. |
-| **No hidden allocations** | Every asset is synthesized inside its own `std.heap.ArenaAllocator` torn down on return. The pack CLI uses a streaming writer (one file's compressed data in RAM at a time, not the whole archive). |
-| **Custom PRNG** | A hand-rolled, frozen `XorShift32` with shift triple (13, 17, 5). Never `std.Random` — the stdlib's internals can change between Zig releases. Zero-seed remapped to `0xDEAD_BEEF`. |
-| **Wrapping arithmetic for delta** | Residual delta uses `-% ` / `+% ` wrapping subtraction/addition, keeping reconstruction in-range without any clamping or branching. |
-
----
-
-## Architecture
-
-```
-mathpressor/
-├── build.zig               ReleaseFast + strip by default; produces exe + .so
-└── src/
-    ├── math_gen.zig        Deterministic integer generators (PRNG, noise, cellular, warp)
-    ├── vm.zig              Bytecode interpreter + Builder assembler (11 opcodes)
-    ├── translator.zig      Opportunistic translator: entropy gate → math search → delta
-    ├── container.zig       .math archive format: Builder, StreamingBuilder, Reader
-    ├── abi.zig             Mathpressor C-ABI boundary (mp_* exports)
-    └── main.zig            CLI entry point (demo, bench, pack, unpack, pack_demo)
-```
-
-Build produces two artifacts:
-- `zig-out/bin/mathpressor` — standalone CLI (demo, bench, pack, unpack)
-- `zig-out/lib/libmathpressor.so` — C-ABI shared library host applications link at runtime
-
----
-
-## Instruction Set Architecture
-
-All multi-byte operands are **little-endian**, decoded with explicit `std.mem.readInt` calls — never raw pointer casts — so bytecode is fully portable across architectures.
-
-The VM has **4 buffer slots** (indexed 0–3). `OP_INT_NOISE` fills a slot and makes it the *current* buffer. Post-processing ops (`OP_INVERT`, `OP_ADD_CONST`, etc.) act on the current buffer. `OP_BLEND_MULT`, `OP_MIX`, `OP_WARP`, and `OP_COPY` combine slots.
-
-| Opcode | Mnemonic | Payload | Effect |
-|--------|----------|---------|--------|
-| `0x01` | `SEED` | `u32` | Reseed the PRNG |
-| `0x02` | `INT_NOISE` | `u8 dst, u16 w, u16 h, u8 freq` | 4-octave fractal integer noise → slot `dst`; select it |
-| `0x03` | `INVERT` | — | `255 − p` on current buffer |
-| `0x04` | `ADD_CONST` | `i16` | Saturating brightness offset |
-| `0x05` | `BLEND_MULT` | `u8 src` | `cur[i] = cur[i] * src[i] / 255` (multiply mask) |
-| `0x06` | `COPY` | `u8 src, u8 dst` | Copy slot `src` → slot `dst` |
-| `0x07` | `CELLULAR` | `u8 steps, u8 birth, u8 survive` | Moore-neighbourhood CA smoothing |
-| `0x08` | `WARP` | `u8 src, u8 strength` | Domain-warp current buffer using slot `src` as displacement |
-| `0x09` | `LEVEL` | `u8 lo, u8 hi` | Contrast stretch: remap `[lo, hi]` → `[0, 255]` |
-| `0x0A` | `THRESHOLD` | `u8 pivot` | Binarise: `≥pivot → 255`, `<pivot → 0` |
-| `0x0B` | `MIX` | `u8 src, u8 alpha` | Linear blend current ← `alpha/255 * src` |
-| `0x0C` | `CONST_FILL` | `u8 dst, u16 w, u16 h, u8 value` | Fill slot with a constant byte (padding/sparse files) |
-| `0x0D` | `RAMP` | `u8 dst, u16 w, u16 h, u8 start, u8 step` | `buf[i] = start + step·i mod 256` (lookup-table ramps) |
-| `0x0E` | `REPEAT` | `u8 dst, u16 w, u16 h, u8 plen, plen×u8` | Tile a literal pattern: `buf[i] = pat[i % plen]` |
-| `0xFF` | `HALT` | — | Lock current buffer as output, end execution |
-
----
-
-## The .math Container Format
-
-Wire layout (all integers little-endian):
-
-```
-[12 B]          Header: "MATH" magic, version u16=1, fat_count u32, reserved u16
-[280 B × N]     FAT: one entry per file (path[240], comp_type, offsets, sizes, checksum)
-[variable]      Data region: compressed blocks in FAT order
-```
-
-FAT entry layout (280 bytes):
-
-```
-path[240]           null-terminated UTF-8 relative path
-comp_type u8        0x01 / 0x02 / 0x03 / 0x04  (see table above)
-_pad[7]
-data_offset u64     byte offset from start of data region
-original_size u64   uncompressed byte count
-compressed_size u64 size of stored block (total, including framing)
-checksum u32        FNV-1a of original uncompressed bytes
-_pad2[4]
-```
-
-### MATH_RESIDUAL block layout (inside data region)
-
-```
-[u8: bytecode_len]
-[bytecode_len bytes: the approximate program]
-[u64 le: gz_delta_len]
-[gz_delta_len bytes: gzip-compressed residual delta]
-```
-
-Reconstruction: `vm_execute(bytecode)[i] +% delta[i] == original[i]` — always exact, wrapping arithmetic, no clamping.
-
----
-
-## The Translator
-
-`src/translator.zig` runs offline (at pack time) to decide the route for each asset.
-Any byte length qualifies: the canvas is the smallest covering rectangle
-(`side = ceil(√len)`), and extraction truncates the padded tail.
-
-**Phase 1 — Structural gate** (`O(1)`):  
-Reject empty files and anything beyond the 4096×4096 canvas (≈16.7 MB).
-
-**Phase 2 — Analytical detectors** (`O(n)`, no search):  
-One linear scan recognises three structures that occur in real files and
-*constructs* the program directly — no iteration:
-
-- `CONST_FILL` — padding / sparse / zeroed files (the modal byte)
-- `RAMP` — arithmetic byte sequences (`start + step·i mod 256`, lookup tables)
-- `REPEAT` — short-period tiled patterns (repeated structs, stride records)
-
-An exact hit is verified once through the VM and stored as `MATH_BYTECODE`.
-These run **before** the entropy gate deliberately: a perfect byte ramp has a
-uniform histogram (8.0 bits/byte) and the entropy heuristic would reject it.
-
-**Phase 3 — Entropy gate** (`O(n)`):  
-If ≥ 7.5 bits/byte (encrypted, already-compressed, random) → skip the search
-(a qualifying analytic approximation is still carried through).
-
-**Phase 4 — Iterative math search** (budget set by the effort tier):  
-Sweep `(seed, template, frequency)` combinations through the VM. For each candidate, compute the **L1 norm** (sum of per-byte absolute differences).
-
-- L1 = 0 → exact match → `MATH_BYTECODE`
-- L1 > 0 but ≥70% of bytes are exact → `MATH_RESIDUAL`
-  - Delta compiled as: `delta[i] = raw[i] −% approx[i]`
-  - Delta compressed (exact positions are 0, compresses well)
-- Nothing qualifies → `addBinary()` (compress vs STORE guard)
-
-**The STORE guard** (inside `addBinary`):  
-Always compare compressed output size vs raw. If it inflates, store raw bytes instead — the container never inflates any file.
-
-**The residual guard** (pack paths):  
-A `MATH_RESIDUAL` is stored only when `program + compressed delta` is smaller
-than compressing the whole file — the math route must *earn* its place, never
-be overhead dressed up as a win.
-
-**Phase 5 — Per-block decomposition** (`MATH_BLOCKS`, fallback files only):  
-Files whose *pages* are part-equation, part-data decompose into 4 KB blocks:
-each block gets an exact analytic check (constant / ramp / repeat), equation
-blocks become 1–3 byte descriptors, and the literal blocks concatenate into
-one stream compressed conventionally. The same honesty guard applies — the
-decomposition is stored only when it beats whole-file compression. Measured
-honestly: LZ codecs already capture constant and repeated pages nearly free,
-so this route fires where analytic pages cost LZ real bytes (e.g., files of
-distinct lookup-table ramps: 3.5% smaller than zstd on the same data) and
-stays silently out of the way everywhere else.
-
-**Phase 6 — Reversible math filters** (`MATH_FILTERED`):  
-A filter is a length-preserving, exactly-invertible integer transform applied
-*before* the codec — it shrinks nothing itself, it rewrites the bytes so the
-LZ/entropy stage finds more redundancy. This is the literal sense of "use math
-to make the file cheaper," and it's how `xz` beats plain DEFLATE:
-
-- **delta** (distance 1 / 2 / 4) — `out[i] = in[i] −% in[i−d]`; turns counters,
-  gradients, and PCM-style data into runs of small values the codec crushes.
-- **x86 BCJ** — rewrites `CALL`/`JMP` rel32 operands to absolute, so the same
-  function called from many sites becomes byte-identical and the codec matches
-  it. Reversible because the opcode byte is never touched and the 4 operand
-  bytes are skipped, so encode and decode walk identical positions.
-
-The pack path tries the viable filters (BCJ is gated by a cheap x86-density
-prescreen), compresses each, and keeps the smallest — but only if it beats the
-unfiltered representations (honesty guard). On a real 46 MB Steam `.so` the BCJ
-filter is **~5% smaller than zstd-19**, bit-perfect; full mode lifts such
-executables out of the solid tar into individual `MATH_FILTERED` entries, so
-the binary win and the cross-file solid win compose.
-
-Built-in templates: `single_noise`, `noise_invert`, `noise_bright`, `blend_mult`, `cave`, `marble`, plus the three analytic constructors above.
 
 ---
 
@@ -390,52 +220,6 @@ mathfs <archive.math> <mountpoint> -f -o ro        # mount; reads decode chunks 
 fusermount3 -u <mountpoint>                         # unmount
 ```
 
-## The C-ABI
-
-A host application loads `libmathpressor.so` and drives the engine through a plain
-C-ABI — only integers and raw pointers cross the boundary, so it is callable from
-C, C++, Rust, or any FFI. All exported symbols use the `mp_` prefix.
-
-The core runtime entry point is asset synthesis:
-
-```zig
-pub export fn mp_synthesize_asset(
-    asset_id: u32,
-    bytecode_ptr: [*]const u8,
-    bytecode_len: usize,
-    out_buffer_ptr: [*]u8,
-    out_buffer_len: usize,
-) i32;
-```
-
-Returns bytes written (≥ 0) or a negative `MP_ERR_*` code. Each call constructs and destroys its own `ArenaAllocator` over `page_allocator` — no retained state, no hidden heap growth.
-
-The same library also exposes the tooling entry points used by the bundled desktop GUI (these walk the filesystem and write archives, so they are heavier than the stateless synthesis call above):
-
-| Symbol | Purpose |
-|--------|---------|
-| `mp_synthesize_asset` | synthesize one asset from bytecode (runtime path) |
-| `mp_pack_directory_auto` / `_vfs` / `_solid` | pack a directory into a `.math` archive |
-| `mp_extract_file` | extract one file from a `.math` archive (re-parses each call) |
-| `mp_open` / `mp_close` | open an archive once (parse FAT + build a path index), then close |
-| `mp_read_entry` | decode one asset by path from an open handle — O(1) lookup, no re-parse |
-| `mp_entry_chunk_size` / `mp_read_chunk` | chunk geometry + single-chunk decode — live random access into large `MATH_CHUNKED` files (used by `mathfs`) |
-| `mp_entry_size` / `mp_entry_count` / `mp_entry_name` / `mp_entry_size_at` | size/enumerate entries on a handle |
-| `mp_fnv1a` | FNV-1a checksum helper |
-
-**Live VFS for a game engine.** A host that streams many assets from one archive
-uses the open-handle API: call `mp_open` once (the archive bytes must stay mapped),
-then `mp_read_entry(handle, path, buf, len)` per asset on demand — an O(1) path
-lookup plus a single-entry decode (true random access; no FAT re-parse). Every
-regular-mode route (LZMA, BCJ2+RIP, dict, audio, image, columnar, math-bytecode)
-decodes per-entry, so the whole live VFS works at Max. Measured on a 1245-entry
-archive: reading every asset via the handle is **3.2× faster** than re-parsing per
-call, and each asset decodes at 38–244 MB/s depending on route.
-
-The pack functions run **serially**: `std.Thread.Pool` cannot initialize inside a `dlopen`ed shared library (the Zig start code that sets up thread-local storage never runs), so the parallel pack pipeline lives only in the standalone CLI. The GUI calls these from a background thread, so the UI stays responsive.
-
----
-
 ## Build & Run
 
 ```sh
@@ -491,6 +275,223 @@ analytic detectors miss, while the detectors are O(n) and effectively free.
 ```
 
 On a real Steam installation (~8.6 GB, 58 000+ files): the streaming builder keeps peak RAM under 15 MB regardless of archive size. Files are routed by entropy — compiled DLLs and `.so` files get gzip'd at 2.4–2.5×, shell scripts and HTML at 3–9×, already-compressed `.tar.xz` / `.gz` files hit the STORE guard and are kept raw.
+
+---
+
+## Hard Constraints
+
+| Constraint | Implementation |
+|---|---|
+| **100% Zig** | No C, C++, or Python anywhere in the engine or build system. |
+| **Zero float in the core loop** | The VM, math generators, and all runtime paths use strict 32/64-bit integer arithmetic. `f64` is used only in the offline translator (Shannon entropy). Verified bit-identical on x86-64 LE, big-endian s390x, and aarch64 — all produce checksum `0x5757ceb1`. |
+| **No hidden allocations** | Every asset is synthesized inside its own `std.heap.ArenaAllocator` torn down on return. The pack CLI uses a streaming writer (one file's compressed data in RAM at a time, not the whole archive). |
+| **Custom PRNG** | A hand-rolled, frozen `XorShift32` with shift triple (13, 17, 5). Never `std.Random` — the stdlib's internals can change between Zig releases. Zero-seed remapped to `0xDEAD_BEEF`. |
+| **Wrapping arithmetic for delta** | Residual delta uses `-% ` / `+% ` wrapping subtraction/addition, keeping reconstruction in-range without any clamping or branching. |
+
+---
+
+## Architecture
+
+```
+mathpressor/
+├── build.zig               ReleaseFast + strip by default; produces exe + .so
+└── src/
+    ├── math_gen.zig        Deterministic integer generators (PRNG, noise, cellular, warp)
+    ├── vm.zig              Bytecode interpreter + Builder assembler (11 opcodes)
+    ├── translator.zig      Opportunistic translator: entropy gate → math search → delta
+    ├── container.zig       .math archive format: Builder, StreamingBuilder, Reader
+    ├── abi.zig             Mathpressor C-ABI boundary (mp_* exports)
+    └── main.zig            CLI entry point (demo, bench, pack, unpack, pack_demo)
+```
+
+Build produces two artifacts:
+- `zig-out/bin/mathpressor` — standalone CLI (demo, bench, pack, unpack)
+- `zig-out/lib/libmathpressor.so` — C-ABI shared library host applications link at runtime
+
+---
+
+## The C-ABI
+
+A host application loads `libmathpressor.so` and drives the engine through a plain
+C-ABI — only integers and raw pointers cross the boundary, so it is callable from
+C, C++, Rust, or any FFI. All exported symbols use the `mp_` prefix.
+
+The core runtime entry point is asset synthesis:
+
+```zig
+pub export fn mp_synthesize_asset(
+    asset_id: u32,
+    bytecode_ptr: [*]const u8,
+    bytecode_len: usize,
+    out_buffer_ptr: [*]u8,
+    out_buffer_len: usize,
+) i32;
+```
+
+Returns bytes written (≥ 0) or a negative `MP_ERR_*` code. Each call constructs and destroys its own `ArenaAllocator` over `page_allocator` — no retained state, no hidden heap growth.
+
+The same library also exposes the tooling entry points used by the bundled desktop GUI (these walk the filesystem and write archives, so they are heavier than the stateless synthesis call above):
+
+| Symbol | Purpose |
+|--------|---------|
+| `mp_synthesize_asset` | synthesize one asset from bytecode (runtime path) |
+| `mp_pack_directory_auto` / `_vfs` / `_solid` | pack a directory into a `.math` archive |
+| `mp_extract_file` | extract one file from a `.math` archive (re-parses each call) |
+| `mp_open` / `mp_close` | open an archive once (parse FAT + build a path index), then close |
+| `mp_read_entry` | decode one asset by path from an open handle — O(1) lookup, no re-parse |
+| `mp_entry_chunk_size` / `mp_read_chunk` | chunk geometry + single-chunk decode — live random access into large `MATH_CHUNKED` files (used by `mathfs`) |
+| `mp_entry_size` / `mp_entry_count` / `mp_entry_name` / `mp_entry_size_at` | size/enumerate entries on a handle |
+| `mp_fnv1a` | FNV-1a checksum helper |
+
+**Live VFS for a game engine.** A host that streams many assets from one archive
+uses the open-handle API: call `mp_open` once (the archive bytes must stay mapped),
+then `mp_read_entry(handle, path, buf, len)` per asset on demand — an O(1) path
+lookup plus a single-entry decode (true random access; no FAT re-parse). Every
+regular-mode route (LZMA, BCJ2+RIP, dict, audio, image, columnar, math-bytecode)
+decodes per-entry, so the whole live VFS works at Max. Measured on a 1245-entry
+archive: reading every asset via the handle is **3.2× faster** than re-parsing per
+call, and each asset decodes at 38–244 MB/s depending on route.
+
+The pack functions run **serially**: `std.Thread.Pool` cannot initialize inside a `dlopen`ed shared library (the Zig start code that sets up thread-local storage never runs), so the parallel pack pipeline lives only in the standalone CLI. The GUI calls these from a background thread, so the UI stays responsive.
+
+---
+
+## The Translator
+
+`src/translator.zig` runs offline (at pack time) to decide the route for each asset.
+Any byte length qualifies: the canvas is the smallest covering rectangle
+(`side = ceil(√len)`), and extraction truncates the padded tail.
+
+**Phase 1 — Structural gate** (`O(1)`):  
+Reject empty files and anything beyond the 4096×4096 canvas (≈16.7 MB).
+
+**Phase 2 — Analytical detectors** (`O(n)`, no search):  
+One linear scan recognises three structures that occur in real files and
+*constructs* the program directly — no iteration:
+
+- `CONST_FILL` — padding / sparse / zeroed files (the modal byte)
+- `RAMP` — arithmetic byte sequences (`start + step·i mod 256`, lookup tables)
+- `REPEAT` — short-period tiled patterns (repeated structs, stride records)
+
+An exact hit is verified once through the VM and stored as `MATH_BYTECODE`.
+These run **before** the entropy gate deliberately: a perfect byte ramp has a
+uniform histogram (8.0 bits/byte) and the entropy heuristic would reject it.
+
+**Phase 3 — Entropy gate** (`O(n)`):  
+If ≥ 7.5 bits/byte (encrypted, already-compressed, random) → skip the search
+(a qualifying analytic approximation is still carried through).
+
+**Phase 4 — Iterative math search** (budget set by the effort tier):  
+Sweep `(seed, template, frequency)` combinations through the VM. For each candidate, compute the **L1 norm** (sum of per-byte absolute differences).
+
+- L1 = 0 → exact match → `MATH_BYTECODE`
+- L1 > 0 but ≥70% of bytes are exact → `MATH_RESIDUAL`
+  - Delta compiled as: `delta[i] = raw[i] −% approx[i]`
+  - Delta compressed (exact positions are 0, compresses well)
+- Nothing qualifies → `addBinary()` (compress vs STORE guard)
+
+**The STORE guard** (inside `addBinary`):  
+Always compare compressed output size vs raw. If it inflates, store raw bytes instead — the container never inflates any file.
+
+**The residual guard** (pack paths):  
+A `MATH_RESIDUAL` is stored only when `program + compressed delta` is smaller
+than compressing the whole file — the math route must *earn* its place, never
+be overhead dressed up as a win.
+
+**Phase 5 — Per-block decomposition** (`MATH_BLOCKS`, fallback files only):  
+Files whose *pages* are part-equation, part-data decompose into 4 KB blocks:
+each block gets an exact analytic check (constant / ramp / repeat), equation
+blocks become 1–3 byte descriptors, and the literal blocks concatenate into
+one stream compressed conventionally. The same honesty guard applies — the
+decomposition is stored only when it beats whole-file compression. Measured
+honestly: LZ codecs already capture constant and repeated pages nearly free,
+so this route fires where analytic pages cost LZ real bytes (e.g., files of
+distinct lookup-table ramps: 3.5% smaller than zstd on the same data) and
+stays silently out of the way everywhere else.
+
+**Phase 6 — Reversible math filters** (`MATH_FILTERED`):  
+A filter is a length-preserving, exactly-invertible integer transform applied
+*before* the codec — it shrinks nothing itself, it rewrites the bytes so the
+LZ/entropy stage finds more redundancy. This is the literal sense of "use math
+to make the file cheaper," and it's how `xz` beats plain DEFLATE:
+
+- **delta** (distance 1 / 2 / 4) — `out[i] = in[i] −% in[i−d]`; turns counters,
+  gradients, and PCM-style data into runs of small values the codec crushes.
+- **x86 BCJ** — rewrites `CALL`/`JMP` rel32 operands to absolute, so the same
+  function called from many sites becomes byte-identical and the codec matches
+  it. Reversible because the opcode byte is never touched and the 4 operand
+  bytes are skipped, so encode and decode walk identical positions.
+
+The pack path tries the viable filters (BCJ is gated by a cheap x86-density
+prescreen), compresses each, and keeps the smallest — but only if it beats the
+unfiltered representations (honesty guard). On a real 46 MB Steam `.so` the BCJ
+filter is **~5% smaller than zstd-19**, bit-perfect; full mode lifts such
+executables out of the solid tar into individual `MATH_FILTERED` entries, so
+the binary win and the cross-file solid win compose.
+
+Built-in templates: `single_noise`, `noise_invert`, `noise_bright`, `blend_mult`, `cave`, `marble`, plus the three analytic constructors above.
+
+---
+
+## Instruction Set Architecture
+
+All multi-byte operands are **little-endian**, decoded with explicit `std.mem.readInt` calls — never raw pointer casts — so bytecode is fully portable across architectures.
+
+The VM has **4 buffer slots** (indexed 0–3). `OP_INT_NOISE` fills a slot and makes it the *current* buffer. Post-processing ops (`OP_INVERT`, `OP_ADD_CONST`, etc.) act on the current buffer. `OP_BLEND_MULT`, `OP_MIX`, `OP_WARP`, and `OP_COPY` combine slots.
+
+| Opcode | Mnemonic | Payload | Effect |
+|--------|----------|---------|--------|
+| `0x01` | `SEED` | `u32` | Reseed the PRNG |
+| `0x02` | `INT_NOISE` | `u8 dst, u16 w, u16 h, u8 freq` | 4-octave fractal integer noise → slot `dst`; select it |
+| `0x03` | `INVERT` | — | `255 − p` on current buffer |
+| `0x04` | `ADD_CONST` | `i16` | Saturating brightness offset |
+| `0x05` | `BLEND_MULT` | `u8 src` | `cur[i] = cur[i] * src[i] / 255` (multiply mask) |
+| `0x06` | `COPY` | `u8 src, u8 dst` | Copy slot `src` → slot `dst` |
+| `0x07` | `CELLULAR` | `u8 steps, u8 birth, u8 survive` | Moore-neighbourhood CA smoothing |
+| `0x08` | `WARP` | `u8 src, u8 strength` | Domain-warp current buffer using slot `src` as displacement |
+| `0x09` | `LEVEL` | `u8 lo, u8 hi` | Contrast stretch: remap `[lo, hi]` → `[0, 255]` |
+| `0x0A` | `THRESHOLD` | `u8 pivot` | Binarise: `≥pivot → 255`, `<pivot → 0` |
+| `0x0B` | `MIX` | `u8 src, u8 alpha` | Linear blend current ← `alpha/255 * src` |
+| `0x0C` | `CONST_FILL` | `u8 dst, u16 w, u16 h, u8 value` | Fill slot with a constant byte (padding/sparse files) |
+| `0x0D` | `RAMP` | `u8 dst, u16 w, u16 h, u8 start, u8 step` | `buf[i] = start + step·i mod 256` (lookup-table ramps) |
+| `0x0E` | `REPEAT` | `u8 dst, u16 w, u16 h, u8 plen, plen×u8` | Tile a literal pattern: `buf[i] = pat[i % plen]` |
+| `0xFF` | `HALT` | — | Lock current buffer as output, end execution |
+
+---
+
+## The .math Container Format
+
+Wire layout (all integers little-endian):
+
+```
+[12 B]          Header: "MATH" magic, version u16=1, fat_count u32, reserved u16
+[280 B × N]     FAT: one entry per file (path[240], comp_type, offsets, sizes, checksum)
+[variable]      Data region: compressed blocks in FAT order
+```
+
+FAT entry layout (280 bytes):
+
+```
+path[240]           null-terminated UTF-8 relative path
+comp_type u8        0x01 / 0x02 / 0x03 / 0x04  (see table above)
+_pad[7]
+data_offset u64     byte offset from start of data region
+original_size u64   uncompressed byte count
+compressed_size u64 size of stored block (total, including framing)
+checksum u32        FNV-1a of original uncompressed bytes
+_pad2[4]
+```
+
+### MATH_RESIDUAL block layout (inside data region)
+
+```
+[u8: bytecode_len]
+[bytecode_len bytes: the approximate program]
+[u64 le: gz_delta_len]
+[gz_delta_len bytes: gzip-compressed residual delta]
+```
+
+Reconstruction: `vm_execute(bytecode)[i] +% delta[i] == original[i]` — always exact, wrapping arithmetic, no clamping.
 
 ---
 

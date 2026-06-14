@@ -1,5 +1,10 @@
 # The journey: making a real game run live off a `.math`
 
+> **🧒 In one line** — how we got a real, full-size video game to run from a heavily
+> shrunk file without it ever feeling slow — and the wrong turns along the way.
+>
+> *Reads top-to-bottom shallow → deep: the story first, the technical guts as you scroll.*
+
 This is the development story behind the live VFS — what we set out to test, the
 dead-ends, the bugs we found, and how the result landed. The hard numbers are in
 [`../bench/REPORT.md`](../bench/REPORT.md); this is the narrative.

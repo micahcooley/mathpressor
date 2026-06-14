@@ -1,5 +1,11 @@
 # What's genuinely new here (and what stands on prior art)
 
+> **🧒 In one line** — an honest answer to "is any of this actually new?" Short version:
+> the building blocks mostly already exist; the *way they're combined* (and a few
+> measured wins + a working game demo) is the new part.
+>
+> *Shallow → deep: the plain summary first, the per-type numbers and prior-art table below.*
+
 An honest map of Mathpressor's contributions. The headline: Mathpressor's value is a
 **novel system** — procedural synthesis and traditional compression unified into one
 auto-routing, live, random-access container — plus **measured wins on structured

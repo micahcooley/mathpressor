@@ -1,5 +1,10 @@
 # Mathpressor live-VFS benchmark — FPS Chess (real game, on Micah's PC)
 
+> **🧒 In one line** — the actual numbers from packing a real 1 GB game to 320 MB and
+> running it live off that file: it stayed at full speed (60 fps) with no stutters.
+>
+> *Shallow → deep: storage and the headline result first, then the byte-level details.*
+
 **Goal:** ship a game compressed, run it *live* off the compressed archive without
 inflating it to disk, and lose no runtime performance. Test corpus: the actual
 Steam install of **FPS Chess** (UE4), 1.056 GiB across 28 files, dominated by one
