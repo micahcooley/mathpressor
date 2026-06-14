@@ -52,6 +52,8 @@ pub fn main() !void {
         try cmBench(root, args[2], out);
     } else if (args.len >= 3 and std.mem.eql(u8, args[1], "x64bench")) {
         try x64Bench(root, args[2], out);
+    } else if (args.len >= 3 and std.mem.eql(u8, args[1], "lzmaenc")) {
+        try lzmaEncBench(root, args[2], out);
     } else if (args.len >= 4 and std.mem.eql(u8, args[1], "unpack")) {
         try unpackContainer(root, args[2], args[3], out);
     } else if (args.len == 2 and std.mem.eql(u8, args[1], "bench")) {
@@ -63,6 +65,41 @@ pub fn main() !void {
     } else {
         try runDemo(root, out);
     }
+}
+
+/// Diagnostic: run our pure-Zig LZMA encoder on a file, write the .lzma so it
+/// can be decode-verified with `xz -d --format=lzma`, and compare its size to
+/// liblzma 9e. This is the foundation for closing the parser gap to 7-Zip.
+fn lzmaEncBench(root: std.mem.Allocator, path: []const u8, out: anytype) !void {
+    const lzma_enc = @import("lzma_enc.zig");
+    const f = try std.fs.cwd().openFile(path, .{});
+    defer f.close();
+    const data = try f.readToEndAlloc(root, 1 << 30);
+    defer root.free(data);
+
+    var dict: u32 = 1 << 20;
+    while (dict < data.len and dict < (1 << 27)) dict <<= 1;
+
+    var t = try std.time.Timer.start();
+    const ours = try lzma_enc.compress(data, root, .{ .dict_size = dict, .nice_len = 128, .max_depth = 256 });
+    defer root.free(ours);
+    const enc_ms = t.read() / std.time.ns_per_ms;
+
+    // write the .lzma for external decode verification
+    const lf = try std.fs.cwd().createFile("/tmp/ours.lzma", .{});
+    defer lf.close();
+    try lf.writeAll(ours);
+
+    const lz = try container.lzmaCompress(data, root, container.lzmaPreset(2));
+    defer root.free(lz);
+
+    const o: f64 = @floatFromInt(ours.len);
+    const l: f64 = @floatFromInt(lz.len);
+    try out.print("lzmaenc on {s} ({d} B)\n", .{ path, data.len });
+    try out.print("  ours (.lzma)  : {d}  ({d} ms)  -> /tmp/ours.lzma\n", .{ ours.len, enc_ms });
+    try out.print("  liblzma 9e    : {d}\n", .{lz.len});
+    try out.print("  ours vs lzma  : {d:.2}% ({s})\n", .{ (o / l - 1.0) * 100.0, if (ours.len < lz.len) "ours smaller" else "liblzma smaller" });
+    try out.print("  verify: xz -d --format=lzma < /tmp/ours.lzma | cmp - {s}\n", .{path});
 }
 
 /// Diagnostic: measure the x86-64 RIP-relative filter's effect on LZMA size.
