@@ -950,7 +950,7 @@ pub fn compressOpt(data: []const u8, a: std.mem.Allocator, opt_in: Options) ![]u
                     var len: u32 = kMatchMinLen;
                     while (len <= l) : (len += 1) {
                         const np = rep_base + rep_sel + rep0long + enc.rep_len_coder.price(len - kMatchMinLen, pos_state);
-                        if (np < opts[cur + len].price)
+                        if (np <= opts[cur + len].price) // prefer match (and longer) on ties, like liblzma
                             opts[cur + len] = .{ .price = np, .state = repNextState(st), .reps = nreps, .from = @intCast(cur), .len = len, .dist = dist };
                     }
                     if (l > longest) {
@@ -974,7 +974,7 @@ pub fn compressOpt(data: []const u8, a: std.mem.Allocator, opt_in: Options) ![]u
                 var len = start_len;
                 while (len <= md.len) : (len += 1) {
                     const np = new_base + enc.len_coder.price(len - kMatchMinLen, pos_state) + enc.priceDistance(d0, len);
-                    if (np < opts[cur + len].price)
+                    if (np <= opts[cur + len].price) // prefer longer/new on ties, like liblzma
                         opts[cur + len] = .{ .price = np, .state = matchNextState(st), .reps = nreps, .from = @intCast(cur), .len = len, .dist = md.dist };
                 }
                 start_len = md.len + 1;
