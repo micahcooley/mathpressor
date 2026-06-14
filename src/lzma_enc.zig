@@ -387,6 +387,35 @@ const Encoder = struct {
         const min_pos: i64 = @as(i64, @intCast(pos)) - @as(i64, @intCast(self.opt.dict_size));
         var best_len: u32 = kMatchMinLen - 1;
 
+        // len-2 / len-3 matches from the hash-2 / hash-3 heads. The >=4 BT4 below
+        // is blind to these (4-byte hash), but liblzma uses them heavily — the
+        // parse diverges from liblzma at the very first short match without them.
+        // Kept strictly len 2 then 3 then >=4 so the DP's per-length logic holds.
+        {
+            const h2 = hash2(data, pos);
+            const c2 = self.head2[h2];
+            self.head2[h2] = @intCast(pos);
+            if (c2 >= 0 and @as(i64, c2) >= min_pos) {
+                const src: usize = @intCast(c2);
+                if (data[src] == data[pos] and data[src + 1] == data[pos + 1]) {
+                    out[n] = .{ .len = 2, .dist = @intCast(pos - src) };
+                    n += 1;
+                    best_len = 2;
+                }
+            }
+            const h3 = hash3(data, pos);
+            const c3 = self.head3[h3];
+            self.head3[h3] = @intCast(pos);
+            if (c3 >= 0 and @as(i64, c3) >= min_pos) {
+                const src: usize = @intCast(c3);
+                if (data[src] == data[pos] and data[src + 1] == data[pos + 1] and data[src + 2] == data[pos + 2]) {
+                    out[n] = .{ .len = 3, .dist = @intCast(pos - src) };
+                    n += 1;
+                    best_len = 3;
+                }
+            }
+        }
+
         const h = hash4(data, pos, self.hash_mask);
         var cur_match = self.head[h];
         self.head[h] = @intCast(pos);
@@ -1298,7 +1327,7 @@ const DecLenCoder = struct {
 
 /// Decode a .lzma (alone) stream and return token statistics. For unknown-size
 /// streams (liblzma writes size = u64 max + an end marker) pass `known_size`.
-pub fn dumpStats(stream: []const u8, a: std.mem.Allocator, known_size: ?usize) !TokenStats {
+pub fn dumpStats(stream: []const u8, a: std.mem.Allocator, known_size: ?usize, tok: ?*std.ArrayList(u8)) !TokenStats {
     if (stream.len < 13) return error.Truncated;
     const props = stream[0];
     const lc: u4 = @intCast(props % 9);
@@ -1334,6 +1363,7 @@ pub fn dumpStats(stream: []const u8, a: std.mem.Allocator, known_size: ?usize) !
     const lp_mask: u32 = (@as(u32, 1) << lp) - 1;
     var o: usize = 0;
     while (o < out_size) {
+        const tpos = o;
         const pos_state = @as(u32, @intCast(o)) & pb_mask;
         const im = (state << kNumPosBitsMax) + pos_state;
         if (rc.decodeBit(&is_match[im]) == 0) {
@@ -1360,6 +1390,7 @@ pub fn dumpStats(stream: []const u8, a: std.mem.Allocator, known_size: ?usize) !
             o += 1;
             state = litNextState(state);
             st.n_lit += 1;
+            if (tok) |t| try t.writer().print("{d} L 1 0\n", .{tpos});
             continue;
         }
         var len: u32 = undefined;
@@ -1367,6 +1398,7 @@ pub fn dumpStats(stream: []const u8, a: std.mem.Allocator, known_size: ?usize) !
             if (rc.decodeBit(&is_rep_g0[state]) == 0) {
                 if (rc.decodeBit(&is_rep0_long[im]) == 0) {
                     state = shortRepNextState(state);
+                    if (tok) |t| try t.writer().print("{d} S 1 {d}\n", .{ tpos, reps[0] + 1 });
                     out[o] = out[o - (reps[0] + 1)];
                     o += 1;
                     st.n_shortrep += 1;
@@ -1395,6 +1427,7 @@ pub fn dumpStats(stream: []const u8, a: std.mem.Allocator, known_size: ?usize) !
             state = repNextState(state);
             st.n_rep += 1;
             st.rep_bytes += len;
+            if (tok) |t| try t.writer().print("{d} R {d} {d}\n", .{ tpos, len, reps[0] + 1 });
         } else {
             reps[3] = reps[2];
             reps[2] = reps[1];
@@ -1428,6 +1461,7 @@ pub fn dumpStats(stream: []const u8, a: std.mem.Allocator, known_size: ?usize) !
             st.n_newmatch += 1;
             st.newmatch_bytes += len;
             st.sum_newmatch_dist += dist0 + 1;
+            if (tok) |t| try t.writer().print("{d} M {d} {d}\n", .{ tpos, len, dist0 + 1 });
             state = matchNextState(state);
         }
         // copy len bytes from reps[0]

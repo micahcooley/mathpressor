@@ -55,6 +55,21 @@ pub fn main() !void {
     } else if (args.len >= 3 and std.mem.eql(u8, args[1], "lzmaenc")) {
         const pen: u32 = if (args.len >= 4) (std.fmt.parseInt(u32, args[3], 10) catch 0) else 0;
         try lzmaEncBench(root, args[2], pen, out);
+    } else if (args.len >= 5 and std.mem.eql(u8, args[1], "lzmatokens")) {
+        // lzmatokens <file.lzma> <known_size> <out.txt> : dump pos/kind/len/dist per token
+        const lzma_enc = @import("lzma_enc.zig");
+        const f = try std.fs.cwd().openFile(args[2], .{});
+        defer f.close();
+        const data = try f.readToEndAlloc(root, 1 << 30);
+        defer root.free(data);
+        const known = std.fmt.parseInt(usize, args[3], 10) catch null;
+        var buf = std.ArrayList(u8).init(root);
+        defer buf.deinit();
+        _ = try lzma_enc.dumpStats(data, root, known, &buf);
+        const of = try std.fs.cwd().createFile(args[4], .{});
+        defer of.close();
+        try of.writeAll(buf.items);
+        try out.print("wrote {d} token lines to {s}\n", .{ std.mem.count(u8, buf.items, "\n"), args[4] });
     } else if (args.len >= 3 and std.mem.eql(u8, args[1], "transcode")) {
         const lzma_enc = @import("lzma_enc.zig");
         const f = try std.fs.cwd().openFile(args[2], .{});
@@ -83,7 +98,7 @@ pub fn main() !void {
         const data = try f.readToEndAlloc(root, 1 << 30);
         defer root.free(data);
         const known: ?usize = if (args.len >= 4) (std.fmt.parseInt(usize, args[3], 10) catch null) else null;
-        const s = try lzma_enc.dumpStats(data, root, known);
+        const s = try lzma_enc.dumpStats(data, root, known, null);
         const ol: f64 = @floatFromInt(s.out_len);
         try out.print("tokens for {s} (decoded {d} bytes):\n", .{ args[2], s.out_len });
         try out.print("  literals     : {d:>10}  ({d:.1}% of output bytes)\n", .{ s.n_lit, @as(f64, @floatFromInt(s.n_lit)) / ol * 100 });
