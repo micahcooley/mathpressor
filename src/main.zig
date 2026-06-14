@@ -144,10 +144,16 @@ fn lzmaEncBench(root: std.mem.Allocator, path: []const u8, penalty: u32, out: an
     defer root.free(ours);
     const opt_ms = t.read() / std.time.ns_per_ms;
 
-    // write the optimal-parse .lzma for external decode verification
+    t.reset();
+    const oursK = try lzma_enc.compressOptK(data, root, cfg);
+    defer root.free(oursK);
+    const optk_ms = t.read() / std.time.ns_per_ms;
+
+    // write the K-best .lzma for external decode verification
     const lf = try std.fs.cwd().createFile("/tmp/ours.lzma", .{});
     defer lf.close();
-    try lf.writeAll(ours);
+    try lf.writeAll(oursK);
+    try out.print("  multi-state K: {d}  ({d} ms)\n", .{ oursK.len, optk_ms });
     { // also dump greedy for forensic distance comparison
         const gf = try std.fs.cwd().createFile("/tmp/greedy.lzma", .{});
         defer gf.close();

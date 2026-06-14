@@ -678,6 +678,7 @@ const OptNode = struct {
     from: u32,
     len: u32,
     dist: u32,
+    from_k: u32 = 0, // which K-best candidate at `from` (multi-state DP)
 };
 
 /// Compress `data` to a standalone `.lzma` (LZMA_alone) buffer that liblzma /
@@ -1031,6 +1032,210 @@ pub fn compressOpt(data: []const u8, a: std.mem.Allocator, opt_in: Options) ![]u
         }
     }
 
+    try rc.flush();
+    return out.toOwnedSlice();
+}
+
+// K-best insertion into a multi-state node's candidate list (ascending price).
+fn kInsert(opts: []OptNode, kc: usize, target: usize, cand: OptNode) void {
+    const base = target * kc;
+    if (cand.price >= opts[base + kc - 1].price) return;
+    var i: usize = kc - 1;
+    while (i > 0 and opts[base + i - 1].price > cand.price) : (i -= 1) {
+        opts[base + i] = opts[base + i - 1];
+    }
+    opts[base + i] = cand;
+}
+
+/// Multi-state (K-best) optimal parse: keep the top-K (price, state, reps)
+/// candidates per position, so a slightly-pricier path with BETTER reps survives
+/// to enable a cheaper continuation — the rep-setup paths a single-state DP (and
+/// liblzma's single opt[] array) lose. More powerful than single-state, so it can
+/// beat liblzma, not just match it.
+pub fn compressOptK(data: []const u8, a: std.mem.Allocator, opt_in: Options) ![]u8 {
+    initPrices();
+    const opt = opt_in;
+    if (opt.lc + opt.lp > 4) return error.BadParams;
+
+    var hbits: u5 = 16;
+    while ((@as(u32, 1) << hbits) < data.len and hbits < 24) hbits += 1;
+    const hsize = @as(u32, 1) << hbits;
+    const lit_size: usize = @as(usize, 0x300) << @intCast(opt.lc + opt.lp);
+    const literal = try a.alloc(u16, lit_size);
+    defer a.free(literal);
+    @memset(literal, kProbInit);
+    const head = try a.alloc(i32, hsize);
+    defer a.free(head);
+    @memset(head, -1);
+    const son = try a.alloc(i32, 2 * @max(data.len, 1));
+    defer a.free(son);
+    const head2 = try a.alloc(i32, 1 << 16);
+    defer a.free(head2);
+    @memset(head2, -1);
+    const head3 = try a.alloc(i32, 1 << 16);
+    defer a.free(head3);
+    @memset(head3, -1);
+    var enc = Encoder{ .a = a, .opt = opt, .literal = literal, .head = head, .son = son, .head2 = head2, .head3 = head3, .hash_mask = hsize - 1 };
+
+    var out = std.ArrayList(u8).init(a);
+    errdefer out.deinit();
+    const props: u8 = @intCast((@as(u32, opt.pb) * 5 + opt.lp) * 9 + opt.lc);
+    try out.append(props);
+    var hdr: [12]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], opt.dict_size, .little);
+    std.mem.writeInt(u64, hdr[4..12], data.len, .little);
+    try out.appendSlice(&hdr);
+
+    var rc = RangeEncoder{ .out = &out };
+    const pb_mask: u32 = (@as(u32, 1) << opt.pb) - 1;
+    const INF: u32 = 0xFFFF_FFFF;
+
+    const K: usize = 4;
+    const WIN: usize = opt.window;
+    const OPTS_CAP = WIN + kMatchMaxLen + 1;
+    const opts = try a.alloc(OptNode, OPTS_CAP * K);
+    defer a.free(opts);
+    var matches: [kMatchMaxLen + 2]Match = undefined;
+    const ops = try a.alloc(Match, WIN + 1);
+    defer a.free(ops);
+
+    var anchor: usize = 0;
+    while (anchor < data.len) {
+        const remaining = data.len - anchor;
+        const cap_scan = @min(WIN, remaining);
+        const init_to = @min(OPTS_CAP, cap_scan + kMatchMaxLen + 1);
+        var z: usize = 0;
+        while (z < init_to) : (z += 1) {
+            var kk: usize = 0;
+            while (kk < K) : (kk += 1) opts[z * K + kk].price = INF;
+        }
+        opts[0] = .{ .price = 0, .state = enc.state, .reps = enc.reps, .from = 0, .len = 0, .dist = 0 };
+
+        var stop: usize = cap_scan;
+        var forced_len: u32 = 0;
+        var forced_dist: u32 = 0;
+        var cur: usize = 0;
+        while (cur < cap_scan) : (cur += 1) {
+            const p = anchor + cur;
+            const nmatch = enc.getMatches(data, p, &matches); // inserts p
+            const max_here: u32 = @intCast(remaining - cur);
+            const pos_state: u32 = @as(u32, @intCast(p)) & pb_mask;
+            var longest: u32 = 0;
+            var longest_dist: u32 = 0;
+            if (nmatch > 0) {
+                longest = matches[nmatch - 1].len;
+                longest_dist = matches[nmatch - 1].dist;
+            }
+            var k: usize = 0;
+            while (k < K) : (k += 1) {
+                const node = opts[cur * K + k];
+                if (node.price == INF) continue;
+                const base = node.price;
+                const st = node.state;
+                const reps = node.reps;
+                const im_idx = (st << kNumPosBitsMax) + pos_state;
+                const im0 = priceBit(enc.is_match[im_idx], 0);
+                const im1 = priceBit(enc.is_match[im_idx], 1);
+                { // literal
+                    const prev: u8 = if (p == 0) 0 else data[p - 1];
+                    const probs = enc.litProbs(p, prev);
+                    const lp: u32 = if (st < 7) priceLiteral(probs, data[p], 0, false) else priceLiteral(probs, data[p], data[p - (reps[0] + 1)], true);
+                    kInsert(opts, K, cur + 1, .{ .price = base + im0 + lp, .state = litNextState(st), .reps = reps, .from = @intCast(cur), .from_k = @intCast(k), .len = 1, .dist = 0 });
+                }
+                const rep_base = base + im1 + priceBit(enc.is_rep[st], 1);
+                const new_base = base + im1 + priceBit(enc.is_rep[st], 0);
+                for (reps, 0..) |r, ri| {
+                    const dist = r + 1;
+                    if (dist > p) continue;
+                    const src = p - dist;
+                    const maxl: u32 = @min(@as(u32, kMatchMaxLen), max_here);
+                    var l: u32 = 0;
+                    while (l < maxl and data[src + l] == data[p + l]) l += 1;
+                    var rep_sel: u32 = 0;
+                    if (ri == 0) {
+                        rep_sel = priceBit(enc.is_rep_g0[st], 0);
+                    } else {
+                        rep_sel = priceBit(enc.is_rep_g0[st], 1);
+                        rep_sel += if (ri == 1) priceBit(enc.is_rep_g1[st], 0) else (priceBit(enc.is_rep_g1[st], 1) + priceBit(enc.is_rep_g2[st], @intCast(ri - 2)));
+                    }
+                    if (ri == 0 and l >= 1) {
+                        kInsert(opts, K, cur + 1, .{ .price = rep_base + rep_sel + priceBit(enc.is_rep0_long[im_idx], 0), .state = shortRepNextState(st), .reps = reps, .from = @intCast(cur), .from_k = @intCast(k), .len = 1, .dist = dist });
+                    }
+                    if (l >= kMatchMinLen) {
+                        var nreps = reps;
+                        if (ri != 0) {
+                            const d = nreps[ri];
+                            var z2 = ri;
+                            while (z2 > 0) : (z2 -= 1) nreps[z2] = nreps[z2 - 1];
+                            nreps[0] = d;
+                        }
+                        const rep0long: u32 = if (ri == 0) priceBit(enc.is_rep0_long[im_idx], 1) else 0;
+                        var len: u32 = kMatchMinLen;
+                        while (len <= l) : (len += 1) {
+                            kInsert(opts, K, cur + len, .{ .price = rep_base + rep_sel + rep0long + enc.rep_len_coder.price(len - kMatchMinLen, pos_state), .state = repNextState(st), .reps = nreps, .from = @intCast(cur), .from_k = @intCast(k), .len = len, .dist = dist });
+                        }
+                    }
+                }
+                var mi: usize = 0;
+                var start_len: u32 = kMatchMinLen;
+                while (mi < nmatch) : (mi += 1) {
+                    const md = matches[mi];
+                    const d0 = md.dist - 1;
+                    var nreps = reps;
+                    nreps[3] = nreps[2];
+                    nreps[2] = nreps[1];
+                    nreps[1] = nreps[0];
+                    nreps[0] = d0;
+                    var len = start_len;
+                    while (len <= md.len) : (len += 1) {
+                        kInsert(opts, K, cur + len, .{ .price = new_base + enc.len_coder.price(len - kMatchMinLen, pos_state) + enc.priceDistance(d0, len), .state = matchNextState(st), .reps = nreps, .from = @intCast(cur), .from_k = @intCast(k), .len = len, .dist = md.dist });
+                    }
+                    start_len = md.len + 1;
+                }
+            }
+            if (longest >= enc.opt.nice_len) {
+                stop = cur;
+                forced_len = longest;
+                forced_dist = longest_dist;
+                break;
+            }
+        }
+        // backtrack from the cheapest candidate at `stop`
+        var nops: usize = 0;
+        var idx: usize = stop;
+        var bk: u32 = 0;
+        while (idx != 0) {
+            const node = opts[idx * K + bk];
+            ops[nops] = .{ .len = node.len, .dist = node.dist };
+            nops += 1;
+            const nf = node.from;
+            const nfk = node.from_k;
+            idx = nf;
+            bk = nfk;
+        }
+        var pos = anchor;
+        var oi: usize = nops;
+        while (oi != 0) {
+            oi -= 1;
+            const op = ops[oi];
+            const ps: u32 = @as(u32, @intCast(pos)) & pb_mask;
+            if (op.dist == 0) {
+                try enc.emitLit(&rc, data, pos, ps);
+                pos += 1;
+            } else {
+                try enc.emitMatch(&rc, op.len, op.dist, ps);
+                pos += op.len;
+            }
+        }
+        anchor += stop;
+        if (forced_len > 0) {
+            const ps: u32 = @as(u32, @intCast(anchor)) & pb_mask;
+            try enc.emitMatch(&rc, forced_len, forced_dist, ps);
+            var kf: usize = 1;
+            while (kf < forced_len) : (kf += 1) _ = enc.getMatches(data, anchor + kf, &matches);
+            anchor += forced_len;
+        }
+    }
     try rc.flush();
     return out.toOwnedSlice();
 }
