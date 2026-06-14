@@ -323,7 +323,14 @@ const Encoder = struct {
     // (BT4 binary tree — best distance-per-length, what liblzma/7-Zip use).
     head: []i32,
     chain: []i32 = &[_]i32{},
-    son: []i32 = &[_]i32{}, // 2 entries/pos: left=son[p*2], right=son[p*2+1]
+    // BT4 tree. `son` is a CYCLIC buffer of `2 * cyc` entries indexed by
+    // `(pos & cyc_mask) * 2` — not absolute position. Matches are bounded to the
+    // last `cyc` positions anyway (min_pos), so a full-length son array was pure
+    // waste (7.7 GB for a 961 MB tar); the cyclic buffer is ~1 GB at the same dict
+    // and identical match quality. `cyc` is the pow2 window (== declared dict_size).
+    son: []i32 = &[_]i32{}, // 2 entries/slot: left=son[s*2], right=son[s*2+1]
+    cyc: u32 = 0, // cyclic window size (pow2 >= requested dict_size)
+    cyc_mask: u32 = 0, // cyc - 1
     head2: []i32 = &[_]i32{}, // 1<<16 exact 2-byte index (short matches)
     head3: []i32 = &[_]i32{}, // 1<<16 3-byte hash
     hash_mask: u32,
@@ -385,7 +392,11 @@ const Encoder = struct {
         var n: usize = 0;
         if (pos + 4 > data.len) return 0; // tail: never a match source
         const max_len = @min(@as(u32, kMatchMaxLen), @as(u32, @intCast(data.len - pos)));
-        const min_pos: i64 = @as(i64, @intCast(pos)) - @as(i64, @intCast(self.opt.dict_size));
+        // Window is `cyc` positions [pos-cyc+1, pos] — one less than cyc so every
+        // live position maps to a distinct cyclic slot (max distance cyc-1 < cyc,
+        // the declared dict). `min_pos` is the oldest still-referenceable position.
+        const min_pos: i64 = @as(i64, @intCast(pos)) - @as(i64, @intCast(self.cyc)) + 1;
+        const mask = self.cyc_mask;
         var best_len: u32 = kMatchMinLen - 1;
 
         // len-2 / len-3 matches from the hash-2 / hash-3 heads. The >=4 BT4 below
@@ -421,8 +432,8 @@ const Encoder = struct {
         var cur_match = self.head[h];
         self.head[h] = @intCast(pos);
 
-        var ptr0: usize = pos * 2 + 1; // pos's right-child slot
-        var ptr1: usize = pos * 2; // pos's left-child slot
+        var ptr0: usize = (pos & mask) * 2 + 1; // pos's right-child slot
+        var ptr1: usize = (pos & mask) * 2; // pos's left-child slot
         var len0: u32 = 0;
         var len1: u32 = 0;
         var cut: u32 = self.opt.max_depth;
@@ -434,7 +445,7 @@ const Encoder = struct {
             }
             cut -= 1;
             const cm: usize = @intCast(cur_match);
-            const pair = cm * 2;
+            const pair = (cm & mask) * 2;
             var len = @min(len0, len1);
             if (data[cm + len] == data[pos + len]) {
                 len += 1;
@@ -821,6 +832,18 @@ pub fn compress(data: []const u8, a: std.mem.Allocator, opt_in: Options) ![]u8 {
     return out.toOwnedSlice();
 }
 
+/// Size of the BT4 cyclic match-finder window: the smallest power of two that is
+/// >= the requested dict_size, but never larger than the data (a window past the
+/// input can't hold a match). This is the declared dict in the .lzma header and
+/// bounds max match distance to `cyc - 1`, so every live position maps to a unique
+/// cyclic slot. Capped at 1<<28 (2 GB son) as a memory backstop.
+fn cyclicWindow(dict_size: u32, data_len: usize) u32 {
+    const want: u64 = @min(@as(u64, dict_size), @max(@as(u64, data_len), 1));
+    var cyc: u32 = 1 << 12; // 4096 floor
+    while (cyc < want and cyc < (1 << 28)) cyc <<= 1;
+    return cyc;
+}
+
 /// Optimal-parse compressor: a windowed forward DP over the price model picks
 /// the minimum-cost sequence of literals / matches / rep-matches, instead of the
 /// greedy `compress` above. This is what lifts ratio from "fast preset" class to
@@ -842,7 +865,8 @@ pub fn compressOpt(data: []const u8, a: std.mem.Allocator, opt_in: Options) ![]u
     const head = try a.alloc(i32, hsize);
     defer a.free(head);
     @memset(head, -1);
-    const son = try a.alloc(i32, 2 * @max(data.len, 1));
+    const cyc = cyclicWindow(opt.dict_size, data.len);
+    const son = try a.alloc(i32, 2 * @as(usize, cyc));
     defer a.free(son);
     const head2 = try a.alloc(i32, 1 << 16);
     defer a.free(head2);
@@ -851,14 +875,14 @@ pub fn compressOpt(data: []const u8, a: std.mem.Allocator, opt_in: Options) ![]u
     defer a.free(head3);
     @memset(head3, -1);
 
-    var enc = Encoder{ .a = a, .opt = opt, .literal = literal, .head = head, .son = son, .head2 = head2, .head3 = head3, .hash_mask = hsize - 1 };
+    var enc = Encoder{ .a = a, .opt = opt, .literal = literal, .head = head, .son = son, .cyc = cyc, .cyc_mask = cyc - 1, .head2 = head2, .head3 = head3, .hash_mask = hsize - 1 };
 
     var out = std.ArrayList(u8).init(a);
     errdefer out.deinit();
     const props: u8 = @intCast((@as(u32, opt.pb) * 5 + opt.lp) * 9 + opt.lc);
     try out.append(props);
     var hdr: [12]u8 = undefined;
-    std.mem.writeInt(u32, hdr[0..4], opt.dict_size, .little);
+    std.mem.writeInt(u32, hdr[0..4], cyc, .little);
     std.mem.writeInt(u64, hdr[4..12], data.len, .little);
     try out.appendSlice(&hdr);
 
@@ -1088,7 +1112,8 @@ pub fn compressOptK(data: []const u8, a: std.mem.Allocator, opt_in: Options) ![]
     const head = try a.alloc(i32, hsize);
     defer a.free(head);
     @memset(head, -1);
-    const son = try a.alloc(i32, 2 * @max(data.len, 1));
+    const cyc = cyclicWindow(opt.dict_size, data.len);
+    const son = try a.alloc(i32, 2 * @as(usize, cyc));
     defer a.free(son);
     const head2 = try a.alloc(i32, 1 << 16);
     defer a.free(head2);
@@ -1096,14 +1121,14 @@ pub fn compressOptK(data: []const u8, a: std.mem.Allocator, opt_in: Options) ![]
     const head3 = try a.alloc(i32, 1 << 16);
     defer a.free(head3);
     @memset(head3, -1);
-    var enc = Encoder{ .a = a, .opt = opt, .literal = literal, .head = head, .son = son, .head2 = head2, .head3 = head3, .hash_mask = hsize - 1 };
+    var enc = Encoder{ .a = a, .opt = opt, .literal = literal, .head = head, .son = son, .cyc = cyc, .cyc_mask = cyc - 1, .head2 = head2, .head3 = head3, .hash_mask = hsize - 1 };
 
     var out = std.ArrayList(u8).init(a);
     errdefer out.deinit();
     const props: u8 = @intCast((@as(u32, opt.pb) * 5 + opt.lp) * 9 + opt.lc);
     try out.append(props);
     var hdr: [12]u8 = undefined;
-    std.mem.writeInt(u32, hdr[0..4], opt.dict_size, .little);
+    std.mem.writeInt(u32, hdr[0..4], cyc, .little);
     std.mem.writeInt(u64, hdr[4..12], data.len, .little);
     try out.appendSlice(&hdr);
 

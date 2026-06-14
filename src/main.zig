@@ -4146,12 +4146,16 @@ pub fn packTarFullAbi(
             null;
         defer if (cm_block) |b| root.free(b);
 
-        // Our pure-Zig multi-state LZMA — beats 7-Zip on opaque data. Slow encode
-        // (~0.08 MB/s at K=32), so size-capped; COLD/Max only. Decodes via our own
-        // RangeDecoder (math_optlzma), no liblzma needed. The winning lever on the
-        // one data type where nothing else beats LZMA.
-        const OPTLZMA_SINGLE_CAP: u64 = 64 * 1024 * 1024;
-        const OPTLZMA_CHUNK_CAP: u64 = 2 * 1024 * 1024 * 1024;
+        // Our pure-Zig multi-state LZMA — beats 7-Zip on opaque data. The cyclic
+        // BT4 match finder keeps the son array at 2×dict (≈1 GB at a 128 MB dict)
+        // regardless of tar size, so single-pass scales to ~1 GB tars without the
+        // old 8×data blowup. Dedup-K=8 beats 7z ~3% at ~0.4 MB/s. COLD/Max only;
+        // decodes via our own RangeDecoder (math_optlzma), no liblzma needed.
+        // Single-pass preserves cross-chunk references (the win on referential
+        // paks); chunking only kicks in past the single-pass cap, where memory
+        // or time would otherwise be prohibitive.
+        const OPTLZMA_SINGLE_CAP: u64 = 1024 * 1024 * 1024;
+        const OPTLZMA_CHUNK_CAP: u64 = 8 * 1024 * 1024 * 1024;
         var optlzma_block: ?[]u8 = null;
         var optlzma_ct: container.CompressionType = .math_optlzma;
         if (effort_tier == 2) {
@@ -4159,13 +4163,13 @@ pub fn packTarFullAbi(
             if (tsize <= OPTLZMA_SINGLE_CAP) {
                 var kdict: u32 = 1 << 20;
                 while (kdict < tar_data.len and kdict < (1 << 27)) kdict <<= 1;
-                optlzma_block = lzma_enc.compressOptK(tar_data, root, .{ .dict_size = kdict, .nice_len = 273, .max_depth = 1024, .window = 1024, .kbest = 32 }) catch null;
+                optlzma_block = lzma_enc.compressOptK(tar_data, root, .{ .dict_size = kdict, .nice_len = 273, .max_depth = 1024, .window = 1024, .kbest = 8 }) catch null;
                 optlzma_ct = .math_optlzma;
             } else if (tsize <= OPTLZMA_CHUNK_CAP) {
-                // large cold tar: parallel chunked multi-state. 64 MB chunks match
-                // 7-Zip's dict coverage (cross-64 MB redundancy is rare), so the
-                // multi-state win survives; bounds encode time to ~total/cores.
-                optlzma_block = lzma_enc.compressOptKChunked(tar_data, root, 64 * 1024 * 1024, 32) catch null;
+                // Past the single-pass cap: parallel chunked multi-state. 128 MB
+                // chunks match the dict window (cross-128 MB redundancy is rare),
+                // so the multi-state win survives; bounds encode time to ~total/cores.
+                optlzma_block = lzma_enc.compressOptKChunked(tar_data, root, 128 * 1024 * 1024, 8) catch null;
                 optlzma_ct = .math_optlzma_chunked;
             }
         }
