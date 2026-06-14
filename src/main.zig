@@ -132,7 +132,7 @@ fn lzmaEncBench(root: std.mem.Allocator, path: []const u8, penalty: u32, out: an
     var dict: u32 = 1 << 20;
     while (dict < data.len and dict < (1 << 27)) dict <<= 1;
 
-    const cfg = lzma_enc.Options{ .dict_size = dict, .nice_len = 273, .max_depth = 1024, .window = if (penalty > 0) penalty else 1024 };
+    const cfg = lzma_enc.Options{ .dict_size = dict, .nice_len = 273, .max_depth = 1024, .window = 1024, .kbest = if (penalty > 0) penalty else 4 };
 
     var t = try std.time.Timer.start();
     const greedy = try lzma_enc.compress(data, root, cfg);

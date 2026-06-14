@@ -293,6 +293,7 @@ pub const Options = struct {
     dist_penalty: u32 = 0, // experimental far-distance bias (price units per slot)
     rep_penalty: u32 = 0, // experimental: bias the DP away from reps toward new matches
     window: usize = 1024, // optimal-parse window (price refreshes at each window)
+    kbest: usize = 4, // multi-state DP: candidates kept per position
 };
 
 const Encoder = struct {
@@ -1090,7 +1091,7 @@ pub fn compressOptK(data: []const u8, a: std.mem.Allocator, opt_in: Options) ![]
     const pb_mask: u32 = (@as(u32, 1) << opt.pb) - 1;
     const INF: u32 = 0xFFFF_FFFF;
 
-    const K: usize = 4;
+    const K: usize = opt.kbest;
     const WIN: usize = opt.window;
     const OPTS_CAP = WIN + kMatchMaxLen + 1;
     const opts = try a.alloc(OptNode, OPTS_CAP * K);
