@@ -1,6 +1,6 @@
 # Mathpressor
 
-> **👉 In plain English** — Mathpressor squeezes a whole folder (say, a video game) into a much smaller file. But unlike a normal `.zip`, your program can **run directly from the squeezed file** — it unpacks only the bits it needs, the instant it needs them, so nothing ever gets unzipped onto your disk. We squeezed a **1 GB game down to 320 MB and it still ran at full speed**, with no way to tell the difference.
+> **→ In plain English** — Mathpressor squeezes a whole folder (say, a video game) into a much smaller file. But unlike a normal `.zip`, your program can **run directly from the squeezed file** — it unpacks only the bits it needs, the instant it needs them, so nothing ever gets unzipped onto your disk. We squeezed a **1 GB game down to 320 MB and it still ran at full speed**, with no way to tell the difference.
 >
 > *This README is written two ways at once: the technical text, and an **In plain English** box like this after the jargon-heavy parts. It also flows **shallow → deep** — what it is and how to use it come first; the byte-level internals (opcodes, wire format) are at the bottom. Read whichever you like, scroll as far down as you want.*
 
@@ -18,7 +18,7 @@ Mathpressor: `bytecode program → VM synthesis → raw pixels`
 
 For assets that can be represented procedurally (noise textures, cave masks, marble veins, etc.), the bytecode program is orders of magnitude smaller than even the best compressed representation. In practice most real-world data *isn't* procedural, so Mathpressor falls back to a strong general backend (zstd / LZMA / context-mixing) plus reversible domain transforms, or raw storage — whichever is smallest. Synthesis is the ideal *live* primitive (near-zero storage, no decompression); the traditional routes carry everything else.
 
-> **👉 In plain English** — Instead of one way to shrink a file, Mathpressor tries several and keeps the smallest. The fanciest trick: if a texture is something a little math formula can *draw* (like clouds or static), it stores the **recipe** (a few bytes) instead of the picture (thousands of bytes) and re-draws it on demand. Most files aren't drawable that way, so for those it uses normal-but-strong compression. It never makes a file bigger — worst case it just stores it as-is.
+> **→ In plain English** — Instead of one way to shrink a file, Mathpressor tries several and keeps the smallest. The fanciest trick: if a texture is something a little math formula can *draw* (like clouds or static), it stores the **recipe** (a few bytes) instead of the picture (thousands of bytes) and re-draws it on demand. Most files aren't drawable that way, so for those it uses normal-but-strong compression. It never makes a file bigger — worst case it just stores it as-is.
 
 ### The storage routes
 
@@ -102,7 +102,7 @@ compressors — even *solid* ones — on raw audio while staying per-entry/live
 
 ## Two modes: live (regular) vs cold (full)
 
-> **👉 In plain English** — Two settings. **Regular** is the "play it live" setting: a bit
+> **→ In plain English** — Two settings. **Regular** is the "play it live" setting: a bit
 > bigger, but you can run the game straight from it. **Full** is the "shrink it as much as
 > possible" setting: smaller, but you must fully unpack it before using it (like a backup or a
 > download). Same files, you pick the trade — run-it-now vs smallest-possible.
@@ -155,7 +155,7 @@ ratios:
   uniformly smaller, on opaque data.* Full mode is maximum ratio but must be fully
   expanded to use — *not* live-runnable.
 
-> **👉 In plain English** — Compared to the popular shrink tools (7-Zip, xz), Mathpressor
+> **→ In plain English** — Compared to the popular shrink tools (7-Zip, xz), Mathpressor
 > wins on things it understands well — **text, program code, and pictures** (it's noticeably
 > smaller there). It *loses* on stuff that's already hard to shrink, like a game's
 > pre-packed artwork. So it's not "smaller than everything at everything" — it's "smaller on
@@ -196,7 +196,7 @@ concurrent decode engine on top: decodes run outside the cache lock (refcounted,
 so many cores decode at once), an **adaptive prefetch** pool reads ahead only on
 detected sequential runs, and a large RAM LRU keeps the working set warm.
 
-> **👉 In plain English** — A normal squeezed file is like a vacuum-sealed bag: to grab one
+> **→ In plain English** — A normal squeezed file is like a vacuum-sealed bag: to grab one
 > sock you must open the whole thing. That's why an early version *froze* for ~8 seconds
 > whenever the game needed something. The fix: pack the big file as many small sealed bags
 > (4 MB each) with a table of contents, so the game opens **only the bag it needs** (a few
