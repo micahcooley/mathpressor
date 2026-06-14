@@ -907,7 +907,7 @@ fn packFileParallel(ctx: *PackCtx, rel_path: []u8) !void {
         const d = blk: {
             ctx.cb_mu.lock();
             defer ctx.cb_mu.unlock();
-            break :blk try ctx.cb.addBinaryStreamingFile(rel_path, file, fsize);
+            break :blk try ctx.cb.addChunkedStreamingFile(rel_path, file, fsize);
         };
         _ = ctx.total_raw.fetchAdd(fsize, .monotonic);
         ctx.progress.addBytes(fsize);
@@ -2624,7 +2624,7 @@ fn packFileAutoParallel(ctx: *PackCtxAuto, rel_path: []u8) !void {
         const d = blk: {
             ctx.scb_mu.lock();
             defer ctx.scb_mu.unlock();
-            break :blk try ctx.scb.inner.addBinaryStreamingFile(rel_path, file, fsize);
+            break :blk try ctx.scb.inner.addChunkedStreamingFile(rel_path, file, fsize);
         };
         _ = ctx.total_raw.fetchAdd(fsize, .monotonic);
         ctx.progress.addBytes(fsize);
@@ -3313,7 +3313,7 @@ fn packFileSolidParallel(ctx: *PackCtxAuto, rel_path: []u8) !void {
     if (fsize > STREAM_THRESHOLD) {
         ctx.scb_mu.lock();
         defer ctx.scb_mu.unlock();
-        _ = try ctx.scb.inner.addBinaryStreamingFile(rel_path, file, fsize);
+        _ = try ctx.scb.inner.addChunkedStreamingFile(rel_path, file, fsize);
         _ = ctx.total_raw.fetchAdd(fsize, .monotonic);
         ctx.progress.addBytes(fsize);
         return;

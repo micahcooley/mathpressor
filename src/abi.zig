@@ -243,6 +243,44 @@ pub export fn mp_read_entry(
     return @intCast(bytes.len);
 }
 
+/// Live-VFS random access: chunk geometry of `path`. Returns the uncompressed
+/// bytes per chunk for a `math_chunked` entry (so the caller can map a byte
+/// offset → chunk index), 0 if the entry is not chunked (decode it whole via
+/// mp_read_entry instead), or -20 if not found.
+pub export fn mp_entry_chunk_size(handle: ?*anyopaque, path_ptr: [*:0]const u8) i64 {
+    const h: *Handle = @ptrCast(@alignCast(handle orelse return MP_ERR_NULL));
+    const idx = h.map.get(std.mem.sliceTo(path_ptr, 0)) orelse return -20;
+    return @intCast(h.reader.chunkUsize(&h.reader.fat[idx]));
+}
+
+/// Decode ONE chunk of a `math_chunked` entry into `out` — the live-VFS
+/// primitive. Only that chunk's compressed frame is touched in the archive and
+/// decompressed in RAM; the rest of the file is never read or inflated. Returns
+/// bytes written (>= 0), or a negative MP_ERR_*/-20..-22.
+pub export fn mp_read_chunk(
+    handle: ?*anyopaque,
+    path_ptr: [*:0]const u8,
+    chunk_index: u32,
+    out_buffer_ptr: [*]u8,
+    out_buffer_len: usize,
+) i32 {
+    const h: *Handle = @ptrCast(@alignCast(handle orelse return MP_ERR_NULL));
+    const idx = h.map.get(std.mem.sliceTo(path_ptr, 0)) orelse return -20;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const bytes = h.reader.readChunk(&h.reader.fat[idx], chunk_index, arena.allocator()) catch |err| {
+        return switch (err) {
+            error.NotChunked => -23,
+            error.SolidIndexOutOfRange => -22,
+            error.TruncatedContainer => MP_ERR_TRUNCATED,
+            else => MP_ERR_TRUNCATED,
+        };
+    };
+    if (bytes.len > out_buffer_len) return MP_ERR_OUT_TOO_SMALL;
+    @memcpy(out_buffer_ptr[0..bytes.len], bytes);
+    return @intCast(bytes.len);
+}
+
 /// Enumerate: copy entry `index`'s NUL-terminated relative path into `out`.
 /// Returns the path length (>= 0), -20 if index out of range, or
 /// MP_ERR_OUT_TOO_SMALL if the buffer can't hold the name + NUL.

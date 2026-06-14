@@ -141,7 +141,15 @@ pub const CompressionType = enum(u8) {
     math_audio      = 0x0C, // fixed-order LPC over PCM (WAV) samples, then compressed
     math_bcj2       = 0x0D, // full mode: 4-stream BCJ2 x86 filter, each LZMA'd
     math_cm         = 0x0E, // context-mixing backend (cold/full mode; beats LZMA on text)
+    math_chunked    = 0x0F, // large file as independently zstd-compressed chunks: a read
+                            // decodes only the covering chunk(s), never the whole file →
+                            // true random access into the compressed archive (live VFS).
 };
+
+/// Uncompressed bytes per chunk for `math_chunked` entries. 4 MiB balances ratio
+/// (window reset per chunk costs a little) against random-access granularity (a
+/// single read decodes 4 MiB, ~ms, instead of the whole multi-hundred-MB file).
+pub const CHUNK_USIZE: u32 = 4 * 1024 * 1024;
 
 /// Per-entry compression codec (FAT byte 245). gzip = 0 is the legacy default,
 /// so archives written before this byte existed decode correctly.
@@ -766,6 +774,130 @@ pub const StreamingBuilder = struct {
             .guard_fired = ctype == .store,
             .gzip_would_have_been = @intCast(stored),
         };
+    }
+
+    /// Stream-compress a large file as INDEPENDENTLY DECODABLE CHUNKS so the live
+    /// VFS can decode only the region a read touches — never the whole file, and
+    /// never to disk. Each `CHUNK_USIZE` slice of the original is its own zstd
+    /// frame; an index of per-chunk stored sizes precedes the data so any chunk
+    /// is O(1) seekable. This is the storage shape that makes "reach into the
+    /// compressed archive and pull just what's needed" actually work.
+    ///
+    /// Block layout (at data_offset):
+    ///   [u32 chunk_usize][u32 num_chunks][num_chunks × u32 stored_size]
+    ///   [chunk0][chunk1]...   (stored_size top bit = chunk stored raw, not zstd)
+    pub fn addChunkedStreamingFile(
+        self: *StreamingBuilder,
+        path: []const u8,
+        file: std.fs.File,
+        size: u64,
+    ) !Builder.StorageDecision {
+        const a = self.allocator;
+        var in_buf = try a.alloc(u8, CHUNK_USIZE);
+        defer a.free(in_buf);
+
+        // Pass 1 — FNV-1a over the whole file.
+        try file.seekTo(0);
+        var csum: u32 = 0x811C_9DC5;
+        while (true) {
+            const n = try file.read(in_buf);
+            if (n == 0) break;
+            for (in_buf[0..n]) |b| {
+                csum ^= b;
+                csum *%= 0x0100_0193;
+            }
+        }
+
+        const num_chunks: u32 = @intCast((size + CHUNK_USIZE - 1) / CHUNK_USIZE);
+        const header_bytes: u64 = 8 + @as(u64, num_chunks) * 4;
+        const block_offset = self.data_cursor;
+
+        // Header: chunk_usize, num_chunks, then a placeholder index we backfill.
+        try self.tmp_file.seekTo(block_offset);
+        try self.tmp_file.writer().writeInt(u32, CHUNK_USIZE, .little);
+        try self.tmp_file.writer().writeInt(u32, num_chunks, .little);
+        const sizes = try a.alloc(u32, num_chunks);
+        defer a.free(sizes);
+        @memset(sizes, 0);
+        // reserve the index region
+        {
+            const zeros = try a.alloc(u8, @intCast(@as(u64, num_chunks) * 4));
+            defer a.free(zeros);
+            @memset(zeros, 0);
+            try self.tmp_file.writeAll(zeros);
+        }
+
+        // Pass 2 — compress each chunk independently, writing it out + recording
+        // its stored size (top bit set ⇒ stored raw because zstd would inflate).
+        try file.seekTo(0);
+        var data_written: u64 = 0;
+        var i: u32 = 0;
+        while (i < num_chunks) : (i += 1) {
+            const want: usize = @intCast(@min(@as(u64, CHUNK_USIZE), size - @as(u64, i) * CHUNK_USIZE));
+            var got: usize = 0;
+            while (got < want) {
+                const n = try file.read(in_buf[got..want]);
+                if (n == 0) break;
+                got += n;
+            }
+            const chunk = in_buf[0..got];
+            const comp = try zstdCompress(chunk, a, self.comp.zstd_level);
+            defer a.free(comp);
+            if (comp.len < chunk.len) {
+                try self.tmp_file.writeAll(comp);
+                sizes[i] = @intCast(comp.len);
+                data_written += comp.len;
+            } else {
+                try self.tmp_file.writeAll(chunk); // incompressible chunk → raw
+                sizes[i] = @as(u32, @intCast(chunk.len)) | 0x8000_0000;
+                data_written += chunk.len;
+            }
+        }
+
+        const stored = header_bytes + data_written;
+
+        // Honesty guard: if chunking didn't beat raw, STORE the file instead.
+        if (stored >= size) {
+            try self.tmp_file.seekTo(block_offset);
+            try file.seekTo(0);
+            var written: u64 = 0;
+            while (true) {
+                const n = try file.read(in_buf);
+                if (n == 0) break;
+                try self.tmp_file.writeAll(in_buf[0..n]);
+                written += n;
+            }
+            var fat = FatEntry{
+                .comp_type = .store,
+                .data_offset = block_offset,
+                .original_size = size,
+                .compressed_size = written,
+                .checksum = csum,
+                .codec = .zstd,
+            };
+            try fat.setPath(path);
+            self.data_cursor = block_offset + written;
+            try self.fat.append(fat);
+            return .{ .comp_type = .store, .stored_size = @intCast(written), .guard_fired = true, .gzip_would_have_been = @intCast(written) };
+        }
+
+        // Backfill the chunk-size index, then continue at end-of-block.
+        try self.tmp_file.seekTo(block_offset + 8);
+        for (sizes) |s| try self.tmp_file.writer().writeInt(u32, s, .little);
+        try self.tmp_file.seekTo(block_offset + stored);
+
+        var fat = FatEntry{
+            .comp_type = .math_chunked,
+            .data_offset = block_offset,
+            .original_size = size,
+            .compressed_size = stored,
+            .checksum = csum,
+            .codec = .zstd,
+        };
+        try fat.setPath(path);
+        self.data_cursor = block_offset + stored;
+        try self.fat.append(fat);
+        return .{ .comp_type = .math_chunked, .stored_size = @intCast(stored), .guard_fired = false, .gzip_would_have_been = @intCast(stored) };
     }
 
     /// Finalise: write header + FAT + stream the temp file into `out_file`.
@@ -1469,6 +1601,7 @@ pub const Reader = struct {
                 break :blk zstdDecompressUsingDict(block, entry.original_size, self.dicts[entry.solid_index], a);
             },
             .math_audio      => extractAudio(block, entry.original_size, entry.codec, a),
+            .math_chunked    => extractChunked(block, entry.original_size, a),
             .math_bcj2       => extractBcj2(block, entry.original_size, a),
             .math_cm         => cm.decompress(block, @intCast(entry.original_size), a),
             // A symlink's "contents" are its target path, stored verbatim.
@@ -1497,6 +1630,62 @@ pub const Reader = struct {
         }
         return null;
     }
+
+    /// Chunk geometry of a `math_chunked` entry: returns the uncompressed bytes
+    /// per chunk, or 0 if the entry is not chunked (decode it whole instead).
+    pub fn chunkUsize(self: *const Reader, entry: *const FatEntry) u32 {
+        if (entry.comp_type != .math_chunked) return 0;
+        const block = self.data_region[entry.data_offset..][0..entry.compressed_size];
+        if (block.len < 8) return 0;
+        return std.mem.readInt(u32, block[0..4], .little);
+    }
+
+    /// Decode a single chunk of a `math_chunked` entry into a fresh buffer. This
+    /// is the live-VFS primitive: the only bytes touched in the archive are the
+    /// one chunk's compressed frame, decompressed in RAM — the rest of the file
+    /// is never read or inflated. `chunk_index` is 0-based.
+    pub fn readChunk(self: *const Reader, entry: *const FatEntry, chunk_index: u32, a: std.mem.Allocator) ![]u8 {
+        if (entry.comp_type != .math_chunked) return error.NotChunked;
+        const block = self.data_region[entry.data_offset..][0..entry.compressed_size];
+        if (block.len < 8) return error.TruncatedContainer;
+        const chunk_usize = std.mem.readInt(u32, block[0..4], .little);
+        const num_chunks = std.mem.readInt(u32, block[4..8], .little);
+        if (chunk_index >= num_chunks) return error.SolidIndexOutOfRange;
+
+        // Walk the index to this chunk's compressed offset + stored size.
+        const index_off: usize = 8;
+        const data_off: usize = 8 + @as(usize, num_chunks) * 4;
+        if (block.len < data_off) return error.TruncatedContainer;
+        var comp_off: usize = data_off;
+        var i: u32 = 0;
+        var stored_raw: u32 = 0;
+        while (i <= chunk_index) : (i += 1) {
+            const raw = std.mem.readInt(u32, block[index_off + i * 4 ..][0..4], .little);
+            const sz = raw & 0x7FFF_FFFF;
+            if (i == chunk_index) {
+                stored_raw = raw;
+                break;
+            }
+            comp_off += sz;
+        }
+        const sz = stored_raw & 0x7FFF_FFFF;
+        const is_raw = (stored_raw & 0x8000_0000) != 0;
+        if (comp_off + sz > block.len) return error.TruncatedContainer;
+        const frame = block[comp_off..][0..sz];
+
+        // Uncompressed size of this chunk (the last one is the remainder).
+        const this_usize: usize = if (chunk_index + 1 == num_chunks)
+            @intCast(entry.original_size - @as(u64, chunk_index) * chunk_usize)
+        else
+            chunk_usize;
+
+        if (is_raw) {
+            const out = try a.alloc(u8, this_usize);
+            @memcpy(out, frame[0..this_usize]);
+            return out;
+        }
+        return zstdDecompress(frame, this_usize, a);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -1521,6 +1710,45 @@ fn extractMath(bytecode: []const u8, original_size: u64, a: std.mem.Allocator) !
 }
 
 /// STORE: the data region holds the raw bytes verbatim — just dupe and return.
+/// Full decode of a `math_chunked` block: walk the index, decompress each chunk
+/// in order into one `original_size` buffer. Used for whole-file reads
+/// (unpack/verify); the live VFS uses `Reader.readChunk` for partial reads.
+fn extractChunked(block: []const u8, original_size: u64, a: std.mem.Allocator) ![]u8 {
+    if (block.len < 8) return error.TruncatedContainer;
+    const chunk_usize = std.mem.readInt(u32, block[0..4], .little);
+    const num_chunks = std.mem.readInt(u32, block[4..8], .little);
+    const index_off: usize = 8;
+    const data_off: usize = 8 + @as(usize, num_chunks) * 4;
+    if (block.len < data_off) return error.TruncatedContainer;
+
+    const out = try a.alloc(u8, @intCast(original_size));
+    errdefer a.free(out);
+
+    var comp_off: usize = data_off;
+    var i: u32 = 0;
+    var written: u64 = 0;
+    while (i < num_chunks) : (i += 1) {
+        const raw = std.mem.readInt(u32, block[index_off + i * 4 ..][0..4], .little);
+        const sz = raw & 0x7FFF_FFFF;
+        const is_raw = (raw & 0x8000_0000) != 0;
+        if (comp_off + sz > block.len) return error.TruncatedContainer;
+        const frame = block[comp_off..][0..sz];
+        const this_usize: usize = @intCast(@min(@as(u64, chunk_usize), original_size - written));
+        if (is_raw) {
+            if (frame.len < this_usize) return error.TruncatedContainer;
+            @memcpy(out[@intCast(written)..][0..this_usize], frame[0..this_usize]);
+        } else {
+            const dec = try zstdDecompress(frame, this_usize, a);
+            defer a.free(dec);
+            @memcpy(out[@intCast(written)..][0..this_usize], dec);
+        }
+        written += this_usize;
+        comp_off += sz;
+    }
+    if (written != original_size) return error.SizeMismatch;
+    return out;
+}
+
 fn extractStore(raw: []const u8, original_size: u64, a: std.mem.Allocator) ![]u8 {
     if (raw.len != original_size) return error.SizeMismatch;
     return a.dupe(u8, raw);
