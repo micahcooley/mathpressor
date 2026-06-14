@@ -1,6 +1,6 @@
 # Mathpressor live-VFS benchmark — FPS Chess (real game, on Micah's PC)
 
-> **🧒 In one line** — the actual numbers from packing a real 1 GB game to 320 MB and
+> **👉 In one line** — the actual numbers from packing a real 1 GB game to 320 MB and
 > running it live off that file: it stayed at full speed (60 fps) with no stutters.
 >
 > *Shallow → deep: storage and the headline result first, then the byte-level details.*

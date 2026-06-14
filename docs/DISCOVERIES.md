@@ -1,6 +1,6 @@
 # What's genuinely new here (and what stands on prior art)
 
-> **🧒 In one line** — an honest answer to "is any of this actually new?" Short version:
+> **👉 In one line** — an honest answer to "is any of this actually new?" Short version:
 > the building blocks mostly already exist; the *way they're combined* (and a few
 > measured wins + a working game demo) is the new part.
 >
