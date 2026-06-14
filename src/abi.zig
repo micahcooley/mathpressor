@@ -160,6 +160,109 @@ pub export fn mp_extract_file(
     return @intCast(bytes.len);
 }
 
+// ---------------------------------------------------------------------------
+// Open-archive handle API — for a host (e.g. a game engine) that streams many
+// assets from ONE archive live. mp_extract_file re-parses the header+FAT on
+// every call; this parses ONCE (mp_open) and builds a path->entry index, so
+// mp_read_entry is an O(1) lookup + single-entry decode (true random access, no
+// re-parse). Every regular-mode route (LZMA/BCJ2+RIP/dict/audio/image/columnar/
+// math) decodes per-entry, so this is the live VFS surface for a game engine.
+//
+// Memory contract: the archive bytes passed to mp_open must stay alive (e.g.
+// mmap'd) until mp_close — the decoder reads directly from them; nothing is
+// copied. Each mp_read_entry uses a private arena for scratch, freed on return.
+// ---------------------------------------------------------------------------
+
+const Handle = struct {
+    reader: container.Reader,
+    map: std.StringHashMap(usize), // path -> FAT index, built once at open
+};
+
+/// Open an in-memory .math archive. Returns an opaque handle, or null on a parse
+/// error. The archive bytes must outlive the handle (they are not copied).
+pub export fn mp_open(archive_ptr: [*]const u8, archive_len: usize) ?*anyopaque {
+    if (archive_len == 0) return null;
+    const a = std.heap.page_allocator;
+    const archive = archive_ptr[0..archive_len];
+    var rdr = container.Reader.parse(archive, a) catch return null;
+    const h = a.create(Handle) catch {
+        rdr.deinit();
+        return null;
+    };
+    h.* = .{ .reader = rdr, .map = std.StringHashMap(usize).init(a) };
+    for (h.reader.fat, 0..) |*e, i| {
+        h.map.put(e.getPath(), i) catch {}; // duplicate paths: last wins
+    }
+    return @ptrCast(h);
+}
+
+/// Close a handle from mp_open and free its index. Safe on null.
+pub export fn mp_close(handle: ?*anyopaque) void {
+    const h: *Handle = @ptrCast(@alignCast(handle orelse return));
+    h.map.deinit();
+    h.reader.deinit();
+    std.heap.page_allocator.destroy(h);
+}
+
+/// Number of entries, or -1 on a null handle.
+pub export fn mp_entry_count(handle: ?*anyopaque) i64 {
+    const h: *Handle = @ptrCast(@alignCast(handle orelse return -1));
+    return @intCast(h.reader.fat.len);
+}
+
+/// Original (uncompressed) size of `path`, for sizing the read buffer.
+/// Returns size (>= 0), or -20 if not found.
+pub export fn mp_entry_size(handle: ?*anyopaque, path_ptr: [*:0]const u8) i64 {
+    const h: *Handle = @ptrCast(@alignCast(handle orelse return MP_ERR_NULL));
+    const idx = h.map.get(std.mem.sliceTo(path_ptr, 0)) orelse return -20;
+    return @intCast(h.reader.fat[idx].original_size);
+}
+
+/// Decode one asset by path into `out` (O(1) lookup + single-entry decode, no
+/// FAT re-parse). Returns bytes written (>= 0) or a negative MP_ERR_*/-20..-22.
+pub export fn mp_read_entry(
+    handle: ?*anyopaque,
+    path_ptr: [*:0]const u8,
+    out_buffer_ptr: [*]u8,
+    out_buffer_len: usize,
+) i32 {
+    const h: *Handle = @ptrCast(@alignCast(handle orelse return MP_ERR_NULL));
+    const idx = h.map.get(std.mem.sliceTo(path_ptr, 0)) orelse return -20;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const bytes = h.reader.extractEntry(&h.reader.fat[idx], arena.allocator()) catch |err| {
+        return switch (err) {
+            error.TruncatedContainer => MP_ERR_TRUNCATED,
+            error.SizeMismatch => -21,
+            error.SolidIndexOutOfRange => -22,
+            else => MP_ERR_TRUNCATED,
+        };
+    };
+    if (bytes.len > out_buffer_len) return MP_ERR_OUT_TOO_SMALL;
+    @memcpy(out_buffer_ptr[0..bytes.len], bytes);
+    return @intCast(bytes.len);
+}
+
+/// Enumerate: copy entry `index`'s NUL-terminated relative path into `out`.
+/// Returns the path length (>= 0), -20 if index out of range, or
+/// MP_ERR_OUT_TOO_SMALL if the buffer can't hold the name + NUL.
+pub export fn mp_entry_name(handle: ?*anyopaque, index: usize, out_ptr: [*]u8, out_len: usize) i32 {
+    const h: *Handle = @ptrCast(@alignCast(handle orelse return MP_ERR_NULL));
+    if (index >= h.reader.fat.len) return -20;
+    const name = h.reader.fat[index].getPath();
+    if (name.len + 1 > out_len) return MP_ERR_OUT_TOO_SMALL;
+    @memcpy(out_ptr[0..name.len], name);
+    out_ptr[name.len] = 0;
+    return @intCast(name.len);
+}
+
+/// Original size of entry `index` (enumeration-based sizing).
+pub export fn mp_entry_size_at(handle: ?*anyopaque, index: usize) i64 {
+    const h: *Handle = @ptrCast(@alignCast(handle orelse return MP_ERR_NULL));
+    if (index >= h.reader.fat.len) return -20;
+    return @intCast(h.reader.fat[index].original_size);
+}
+
 
 // ---------------------------------------------------------------------------
 // Tests

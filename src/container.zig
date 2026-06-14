@@ -1447,6 +1447,12 @@ pub const Reader = struct {
     ///   .solid_block     — decompress the shared gz block, slice out this file
     pub fn extract(self: *const Reader, path: []const u8, a: std.mem.Allocator) ![]u8 {
         const entry = self.findEntry(path) orelse return error.FileNotFound;
+        return self.extractEntry(entry, a);
+    }
+
+    /// Decode one already-located entry (used by the open-handle live API for
+    /// O(1) per-asset decode after an O(1) path→entry lookup — no FAT re-parse).
+    pub fn extractEntry(self: *const Reader, entry: *const FatEntry, a: std.mem.Allocator) ![]u8 {
         const block = self.data_region[entry.data_offset..][0..entry.compressed_size];
 
         return switch (entry.comp_type) {
