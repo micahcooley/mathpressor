@@ -86,4 +86,41 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(&run_tests.step);
 
+    // --- `zig build tools` — live-VFS host tools --------------------------------
+    // Kept out of the default install so a bare `zig build` needs no libfuse3.
+    //   * vfs_runner — drives a .math as a live VFS through the C-ABI (lossless
+    //                  verify + per-asset decode throughput).
+    //   * concread   — concurrent read benchmark (parallel-decode scaling).
+    //   * mathfs     — read-only FUSE filesystem that decodes a .math on demand
+    //                  (needs libfuse3-dev). This is the live VFS a game runs off.
+    const tools_step = b.step("tools", "Build the live-VFS host tools (vfs_runner, concread, mathfs)");
+
+    const runner_mod = b.createModule(.{
+        .root_source_file = b.path("src/vfs_runner.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    runner_mod.linkLibrary(lib);
+    const runner = b.addExecutable(.{ .name = "vfs_runner", .root_module = runner_mod });
+    tools_step.dependOn(&b.addInstallArtifact(runner, .{}).step);
+
+    const concread_mod = b.createModule(.{
+        .root_source_file = b.path("src/concread.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const concread = b.addExecutable(.{ .name = "concread", .root_module = concread_mod });
+    tools_step.dependOn(&b.addInstallArtifact(concread, .{}).step);
+
+    const mathfs_mod = b.createModule(.{
+        .root_source_file = b.path("src/mathfs.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    mathfs_mod.linkLibrary(lib);
+    mathfs_mod.linkSystemLibrary("fuse3", .{}); // pkg-config supplies the fuse3 include path
+    const mathfs = b.addExecutable(.{ .name = "mathfs", .root_module = mathfs_mod });
+    tools_step.dependOn(&b.addInstallArtifact(mathfs, .{}).step);
 }
