@@ -291,6 +291,7 @@ pub const Options = struct {
     nice_len: u32 = 64,
     max_depth: u32 = 96,
     dist_penalty: u32 = 0, // experimental far-distance bias (price units per slot)
+    rep_penalty: u32 = 0, // experimental: bias the DP away from reps toward new matches
 };
 
 const Encoder = struct {
@@ -835,7 +836,7 @@ pub fn compressOpt(data: []const u8, a: std.mem.Allocator, opt_in: Options) ![]u
                     opts[cur + 1] = .{ .price = np, .state = litNextState(st), .reps = reps, .from = @intCast(cur), .len = 1, .dist = 0 };
             }
 
-            const rep_base = base + im1 + priceBit(enc.is_rep[st], 1);
+            const rep_base = base + im1 + priceBit(enc.is_rep[st], 1) + enc.opt.rep_penalty;
             const new_base = base + im1 + priceBit(enc.is_rep[st], 0);
             var longest: u32 = 0;
             var longest_dist: u32 = 0;
