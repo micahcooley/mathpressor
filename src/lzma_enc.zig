@@ -1241,6 +1241,97 @@ pub fn compressOptK(data: []const u8, a: std.mem.Allocator, opt_in: Options) ![]
     return out.toOwnedSlice();
 }
 
+/// Parallel chunked multi-state compression: split `data` into `chunk_size`
+/// pieces, compress each independently with compressOptK across a thread pool,
+/// and pack them with a small index. Bounds the multi-state encode time to
+/// ~total/cores (the K-best parse is ~0.08 MB/s single-thread). Cross-chunk
+/// matches are lost, but opaque-data redundancy is mostly local. Block format:
+///   [u32 chunk_size][u32 n_chunks][n_chunks × u32 comp_len][chunk .lzma streams]
+pub fn compressOptKChunked(data: []const u8, a: std.mem.Allocator, chunk_size: usize, kbest: usize) ![]u8 {
+    const n_chunks = (data.len + chunk_size - 1) / chunk_size;
+    const results = try a.alloc(?[]u8, n_chunks);
+    defer {
+        for (results) |r| if (r) |rr| a.free(rr);
+        a.free(results);
+    }
+    @memset(results, null);
+
+    const Worker = struct {
+        fn run(base: std.mem.Allocator, all: []const u8, ci: usize, cs: usize, kb: usize, slot: *?[]u8) void {
+            const start = ci * cs;
+            const end = @min(start + cs, all.len);
+            const chunk = all[start..end];
+            var kd: u32 = 1 << 20;
+            while (kd < chunk.len and kd < (1 << 27)) kd <<= 1;
+            slot.* = compressOptK(chunk, base, .{ .dict_size = kd, .nice_len = 273, .max_depth = 1024, .window = 1024, .kbest = kb }) catch null;
+        }
+    };
+    var pool: std.Thread.Pool = undefined;
+    const njobs = @min(@as(usize, 8), (std.Thread.getCpuCount() catch 4));
+    try pool.init(.{ .allocator = a, .n_jobs = @intCast(njobs) });
+    defer pool.deinit();
+    var wg = std.Thread.WaitGroup{};
+    var ci: usize = 0;
+    while (ci < n_chunks) : (ci += 1) {
+        pool.spawnWg(&wg, Worker.run, .{ a, data, ci, chunk_size, kbest, &results[ci] });
+    }
+    pool.waitAndWork(&wg);
+    for (results) |r| if (r == null) return error.ChunkFailed;
+
+    var out = std.ArrayList(u8).init(a);
+    errdefer out.deinit();
+    var hdr: [8]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], @intCast(chunk_size), .little);
+    std.mem.writeInt(u32, hdr[4..8], @intCast(n_chunks), .little);
+    try out.appendSlice(&hdr);
+    for (results) |r| {
+        var lb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &lb, @intCast(r.?.len), .little);
+        try out.appendSlice(&lb);
+    }
+    for (results) |r| try out.appendSlice(r.?);
+    return out.toOwnedSlice();
+}
+
+/// Decode a chunked multi-state block back to `total_size` bytes.
+pub fn decodeOptKChunked(block: []const u8, a: std.mem.Allocator, total_size: usize) ![]u8 {
+    if (block.len < 8) return error.Truncated;
+    const n_chunks = std.mem.readInt(u32, block[4..8], .little);
+    var off: usize = 8;
+    const lens = try a.alloc(u32, n_chunks);
+    defer a.free(lens);
+    var i: usize = 0;
+    while (i < n_chunks) : (i += 1) {
+        lens[i] = std.mem.readInt(u32, block[off..][0..4], .little);
+        off += 4;
+    }
+    const out = try a.alloc(u8, total_size);
+    errdefer a.free(out);
+    var o: usize = 0;
+    i = 0;
+    while (i < n_chunks) : (i += 1) {
+        const cl = lens[i];
+        const dec = try decode(block[off..][0..cl], a, null);
+        defer a.free(dec);
+        @memcpy(out[o..][0..dec.len], dec);
+        o += dec.len;
+        off += cl;
+    }
+    if (o != total_size) return error.SizeMismatch;
+    return out;
+}
+
+test "chunked multi-state round-trips" {
+    const al = std.testing.allocator;
+    var buf: [40000]u8 = undefined;
+    for (&buf, 0..) |*b, i| b.* = @intCast((i * 5 + i / 7) & 0xFF);
+    const z = try compressOptKChunked(&buf, al, 16384, 8);
+    defer al.free(z);
+    const back = try decodeOptKChunked(z, al, buf.len);
+    defer al.free(back);
+    try std.testing.expectEqualSlices(u8, &buf, back);
+}
+
 /// Decisive diagnostic: decode an LZMA stream's token sequence and RE-EMIT it
 /// through our own encoder/model. If the result ~= the input size, our model is
 /// byte-exact and any ratio gap vs that stream is purely our PARSE/search — not

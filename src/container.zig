@@ -147,6 +147,7 @@ pub const CompressionType = enum(u8) {
                             // true random access into the compressed archive (live VFS).
     math_optlzma    = 0x10, // our pure-Zig multi-state LZMA (.lzma stream); beats 7-Zip
                             // on opaque data (cold/full mode; slow encode, fast decode).
+    math_optlzma_chunked = 0x11, // multi-state LZMA over parallel chunks (large cold tars).
 };
 
 /// Uncompressed bytes per chunk for `math_chunked` entries. 4 MiB balances ratio
@@ -1608,6 +1609,7 @@ pub const Reader = struct {
             .math_bcj2       => extractBcj2(block, entry.original_size, a),
             .math_cm         => cm.decompress(block, @intCast(entry.original_size), a),
             .math_optlzma    => lzma_enc.decode(block, a, @intCast(entry.original_size)),
+            .math_optlzma_chunked => lzma_enc.decodeOptKChunked(block, a, @intCast(entry.original_size)),
             // A symlink's "contents" are its target path, stored verbatim.
             .symlink         => extractStore(block, entry.original_size, a),
             .solid_block     => extractSolidEntry(

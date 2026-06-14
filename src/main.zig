@@ -4150,13 +4150,25 @@ pub fn packTarFullAbi(
         // (~0.08 MB/s at K=32), so size-capped; COLD/Max only. Decodes via our own
         // RangeDecoder (math_optlzma), no liblzma needed. The winning lever on the
         // one data type where nothing else beats LZMA.
-        const OPTLZMA_CAP: u64 = 64 * 1024 * 1024;
-        const optlzma_block: ?[]u8 = if (effort_tier == 2 and tsize <= OPTLZMA_CAP) blk: {
+        const OPTLZMA_SINGLE_CAP: u64 = 64 * 1024 * 1024;
+        const OPTLZMA_CHUNK_CAP: u64 = 2 * 1024 * 1024 * 1024;
+        var optlzma_block: ?[]u8 = null;
+        var optlzma_ct: container.CompressionType = .math_optlzma;
+        if (effort_tier == 2) {
             const lzma_enc = @import("lzma_enc.zig");
-            var kdict: u32 = 1 << 20;
-            while (kdict < tar_data.len and kdict < (1 << 27)) kdict <<= 1;
-            break :blk lzma_enc.compressOptK(tar_data, root, .{ .dict_size = kdict, .nice_len = 273, .max_depth = 1024, .window = 1024, .kbest = 32 }) catch null;
-        } else null;
+            if (tsize <= OPTLZMA_SINGLE_CAP) {
+                var kdict: u32 = 1 << 20;
+                while (kdict < tar_data.len and kdict < (1 << 27)) kdict <<= 1;
+                optlzma_block = lzma_enc.compressOptK(tar_data, root, .{ .dict_size = kdict, .nice_len = 273, .max_depth = 1024, .window = 1024, .kbest = 32 }) catch null;
+                optlzma_ct = .math_optlzma;
+            } else if (tsize <= OPTLZMA_CHUNK_CAP) {
+                // large cold tar: parallel chunked multi-state. 64 MB chunks match
+                // 7-Zip's dict coverage (cross-64 MB redundancy is rare), so the
+                // multi-state win survives; bounds encode time to ~total/cores.
+                optlzma_block = lzma_enc.compressOptKChunked(tar_data, root, 64 * 1024 * 1024, 32) catch null;
+                optlzma_ct = .math_optlzma_chunked;
+            }
+        }
         defer if (optlzma_block) |b| root.free(b);
 
         // Pick the smallest representation across LZMA / BCJ2 / CM / multi-state.
@@ -4172,7 +4184,7 @@ pub fn packTarFullAbi(
         };
         if (optlzma_block) |b| if (b.len < best_block.len) {
             best_block = b;
-            best_ct = .math_optlzma;
+            best_ct = optlzma_ct;
         };
 
         // STORE guard: never let the wrapper inflate the tar.
