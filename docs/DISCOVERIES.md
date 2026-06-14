@@ -128,3 +128,34 @@ empirical findings above.
 spec, Farbrausch/.kkrieger history, encode.su x86-filter + PAQ threads, OS readahead
 literature) plus the per-type benchmark in this repo. No source describing the specific
 procedural+traditional auto-routing live-VFS combination was found.*
+
+---
+
+## 5. Pure-Zig LZMA encoder (in progress — the opaque-data lever)
+
+On truly-opaque data (a monolithic game `.pak`) full mode's only loss to 7-Zip is
+that 7-Zip's LZMA *optimal parser* is ~0.3–6% tighter than liblzma's, depending on
+data. liblzma's encoder is a black box we can't improve, and 7-Zip's is C++ we won't
+vendor (pure-Zig constraint). So we're growing our own LZMA encoder whose parse we
+control — `src/lzma_enc.zig`. It emits the **standard `.lzma` stream**, so *decode is
+free* (liblzma reads it) and every result is round-trip-verified with
+`xz -d --format=lzma`.
+
+Built and verified so far (all bit-perfect):
+- LZMA range coder + full probability model + 12-state machine.
+- **BT4** binary-tree match finder (closest-distance-per-length, as liblzma/7-Zip use).
+- **Optimal parse**: a windowed forward DP over a price model, with a long-match
+  early-stop so it never truncates the 273-byte-capped matches at a window boundary.
+
+Standing vs liblzma `-9e`: **text −0.88 % (we win), code +2.3 %, structured +5.0 %,
+opaque +5.5 %.** Honest findings from the build:
+- The remaining opaque gap is **not** match-finding (BT4 produces byte-identical output
+  to a depth-1024 hash chain) and **not** window size — it's parse-*modeling* depth:
+  9e's `GetOptimum` evaluates "complex" candidates (match→literal→rep0 combinations,
+  periodic price refresh) a single-state-per-node DP can't reach. That port is the
+  remaining work to take full mode past 7-Zip on opaque data.
+- Side-finding: on this opaque data liblzma `-9` (445,945 B) actually *beats* `-9e`
+  (449,490 B) and ~ties 7-Zip (445,715 B) — "extreme" effort can hurt on dense data.
+
+This is a multi-stage build; what's below the complex-candidate layer is correct and
+tested. `mathpressor lzmaenc <file>` runs it and prints the comparison.
