@@ -1,0 +1,4 @@
+mode=native (captured via bypassed fuse run — game read real files)
+launch_to_proc_s=20.6
+disk_bytes_read=833949696
+note=cold cache, vsync-capped

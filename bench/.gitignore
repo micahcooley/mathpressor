@@ -1,0 +1,8 @@
+# Raw run logs and scratch — the curated results live in REPORT.md plus the
+# committed .csv / summary.txt files. Keep the repo to docs + harness + evidence,
+# not verbose process logs.
+*.log
+*.time
+run-*/sample.log
+run-*/timeline.log
+run-*/mathfs.log

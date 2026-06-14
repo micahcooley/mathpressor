@@ -51,6 +51,7 @@ When you pack a directory, Mathpressor automatically routes each file:
 | `MATH_AUDIO` | `0x0C` | 16-bit PCM WAV | fixed-order LPC (per-channel sample predictor) + compressed |
 | `MATH_BCJ2` | `0x0D` | Full mode's solid tar (x86 code) | 4-stream range-coded BCJ2, each LZMA'd |
 | `MATH_CM` | `0x0E` | Full mode's solid tar (text/general) | context-mixing coder (orders + match + logistic mixer + SSE) |
+| `MATH_CHUNKED` | `0x0F` | Large live files (> 256 MB) | independently zstd-compressed 4 MB chunks + seek index — a read decodes only the covering chunk(s), never the whole file (true live random access) |
 
 All routes reconstruct to bit-identical original bytes. To the caller, they are invisible.
 
@@ -323,6 +324,37 @@ old per-file regular mode on such a corpus) without matching solid. That is the
 live-vs-cold trade working as intended — random access has a price, and full
 mode is the place you choose to stop paying it.
 
+## Live VFS — running a game off a `.math`
+
+Regular mode's promise is that a host reads assets *live* from the compressed
+archive — the archive never inflates to its full size on disk. `src/mathfs.zig`
+makes this real: a read-only **FUSE filesystem** that exposes the packed tree and,
+on each read, decodes only the bytes that read touches, into a bounded RAM cache.
+Mount it over a game's install path and the game runs off the `.math` with no idea
+it isn't reading plain files.
+
+The enabling piece is **`MATH_CHUNKED`** storage. A whole-file zstd stream isn't
+seekable — reading one byte of a 961 MB pak means inflating all of it (a multi-
+second stall). So large live files are stored as independently-decodable 4 MB
+chunks plus a seek index; a read maps to its chunk(s) only (`addChunkedStreamingFile`,
+`Reader.readChunk`, ABI `mp_entry_chunk_size` / `mp_read_chunk`). `mathfs` adds a
+concurrent decode engine on top: decodes run outside the cache lock (refcounted,
+so many cores decode at once), an **adaptive prefetch** pool reads ahead only on
+detected sequential runs, and a large RAM LRU keeps the working set warm.
+
+**Measured on a real Proton game** (FPS Chess, UE4, 1.06 GB install, 961 MB pak):
+it runs live off a **320 MB** `.math` at **native 60 fps with zero frametime
+hitches** (worst frame 22 ms; a single-byte pak read dropped from an 8.1 s
+whole-file stall to ~14 ms). Storage 3.3×, nothing inflated to disk, bit-perfect.
+Full methodology, numbers, and the harness are in [`bench/REPORT.md`](bench/REPORT.md);
+the development story is in [`docs/JOURNEY.md`](docs/JOURNEY.md).
+
+```sh
+zig build tools                                    # builds vfs_runner, concread, mathfs (needs libfuse3-dev)
+mathfs <archive.math> <mountpoint> -f -o ro        # mount; reads decode chunks on demand
+fusermount3 -u <mountpoint>                         # unmount
+```
+
 ## The C-ABI
 
 A host application loads `libmathpressor.so` and drives the engine through a plain
@@ -352,6 +384,7 @@ The same library also exposes the tooling entry points used by the bundled deskt
 | `mp_extract_file` | extract one file from a `.math` archive (re-parses each call) |
 | `mp_open` / `mp_close` | open an archive once (parse FAT + build a path index), then close |
 | `mp_read_entry` | decode one asset by path from an open handle — O(1) lookup, no re-parse |
+| `mp_entry_chunk_size` / `mp_read_chunk` | chunk geometry + single-chunk decode — live random access into large `MATH_CHUNKED` files (used by `mathfs`) |
 | `mp_entry_size` / `mp_entry_count` / `mp_entry_name` / `mp_entry_size_at` | size/enumerate entries on a handle |
 | `mp_fnv1a` | FNV-1a checksum helper |
 
@@ -458,4 +491,7 @@ The key invariant: all multi-byte operands in the ISA are decoded with `std.mem.
 | `src/container.zig` | ~700 | `.math` format: in-memory Builder, streaming StreamingBuilder, Reader, 4 extraction paths |
 | `src/abi.zig` | ~60 | C-ABI export, per-call arena, error codes |
 | `src/main.zig` | ~580 | CLI modes, benchmark, pack demo, recursive directory walker |
+| `src/mathfs.zig` | ~480 | Live read-only FUSE VFS: on-demand chunk decode, concurrent + adaptive prefetch, bounded RAM cache (`zig build tools`) |
+| `src/vfs_runner.zig` | ~230 | C-ABI live-VFS runner: lossless verify + per-asset decode throughput |
+| `src/concread.zig` | ~60 | Concurrent read benchmark (parallel-decode scaling) |
 | `examples/*.mpc` | 6 files | Pre-built example programs (26–40 bytes each) |
