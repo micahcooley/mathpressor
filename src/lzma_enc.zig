@@ -292,6 +292,7 @@ pub const Options = struct {
     max_depth: u32 = 96,
     dist_penalty: u32 = 0, // experimental far-distance bias (price units per slot)
     rep_penalty: u32 = 0, // experimental: bias the DP away from reps toward new matches
+    window: usize = 1024, // optimal-parse window (price refreshes at each window)
 };
 
 const Encoder = struct {
@@ -834,12 +835,13 @@ pub fn compressOpt(data: []const u8, a: std.mem.Allocator, opt_in: Options) ![]u
     const pb_mask: u32 = (@as(u32, 1) << opt.pb) - 1;
     const INF: u32 = 0xFFFF_FFFF;
 
-    const WIN: usize = 1024;
+    const WIN: usize = opt.window;
     const OPTS_CAP = WIN + kMatchMaxLen + 1; // matches may reach past WIN without truncation
     const opts = try a.alloc(OptNode, OPTS_CAP);
     defer a.free(opts);
     var matches: [kMatchMaxLen + 2]Match = undefined;
-    var ops: [WIN + 1]Match = undefined; // backtracked op list (len, dist); dist 0 = literal
+    const ops = try a.alloc(Match, WIN + 1); // backtracked op list (len, dist); dist 0 = literal
+    defer a.free(ops);
 
     var anchor: usize = 0;
     while (anchor < data.len) {
