@@ -47,6 +47,114 @@ inline fn updProb1(p: *u16) void {
     p.* -= @intCast(p.* >> kNumMoveBits);
 }
 
+// ---- price model (bit-costs in 1/16-bit units) -----------------------------
+// The optimal parser needs the *cost* of each coding choice, not just to make
+// it. Prices come from the standard LZMA ProbPrices table (LzmaEnc.c).
+const kNumMoveReducingBits = 2;
+const kNumBitPriceShiftBits = 4;
+const kBitPrice: u32 = 1 << kNumBitPriceShiftBits; // a full bit = 16 units
+
+var prob_prices: [kBitModelTotal >> kNumMoveReducingBits]u32 = undefined;
+var prices_ready = false;
+fn initPrices() void {
+    if (prices_ready) return;
+    var i: u32 = 0;
+    while (i < kBitModelTotal) : (i += (1 << kNumMoveReducingBits)) {
+        var w: u32 = i;
+        var bit_count: u32 = 0;
+        var j: u32 = 0;
+        while (j < kNumBitPriceShiftBits) : (j += 1) {
+            w = w *% w;
+            bit_count <<= 1;
+            while (w >= (1 << 16)) {
+                w >>= 1;
+                bit_count += 1;
+            }
+        }
+        prob_prices[i >> kNumMoveReducingBits] =
+            (@as(u32, kNumBitModelTotalBits) << kNumBitPriceShiftBits) - 15 - bit_count;
+    }
+    prices_ready = true;
+}
+
+inline fn priceBit(prob: u16, bit: u1) u32 {
+    const idx = if (bit == 0) prob >> kNumMoveReducingBits else (kBitModelTotal - prob) >> kNumMoveReducingBits;
+    return prob_prices[idx];
+}
+
+fn priceTree(probs: []const u16, num_bits: u6, symbol: u32) u32 {
+    var price: u32 = 0;
+    var m: u32 = 1;
+    var i: u6 = num_bits;
+    while (i != 0) {
+        i -= 1;
+        const bit: u1 = @intCast((symbol >> @intCast(i)) & 1);
+        price += priceBit(probs[m], bit);
+        m = (m << 1) | bit;
+    }
+    return price;
+}
+
+fn priceTreeReverse(probs: []const u16, num_bits: u6, symbol_in: u32) u32 {
+    var price: u32 = 0;
+    var m: u32 = 1;
+    var symbol = symbol_in;
+    var i: u6 = 0;
+    while (i < num_bits) : (i += 1) {
+        const bit: u1 = @intCast(symbol & 1);
+        symbol >>= 1;
+        price += priceBit(probs[m], bit);
+        m = (m << 1) | bit;
+    }
+    return price;
+}
+
+fn priceLiteral(probs: []const u16, symbol: u8, match_byte: u8, matched: bool) u32 {
+    var price: u32 = 0;
+    var ctx: u32 = 1;
+    var i: u8 = 8;
+    if (!matched) {
+        while (i != 0) {
+            i -= 1;
+            const sh: u3 = @intCast(i);
+            const bit: u1 = @intCast((symbol >> sh) & 1);
+            price += priceBit(probs[ctx], bit);
+            ctx = (ctx << 1) | bit;
+        }
+    } else {
+        var same = true;
+        while (i != 0) {
+            i -= 1;
+            const sh: u3 = @intCast(i);
+            const lit_bit: u1 = @intCast((symbol >> sh) & 1);
+            if (same) {
+                const m_bit: u1 = @intCast((match_byte >> sh) & 1);
+                const off: u32 = (@as(u32, m_bit) + 1) << 8;
+                price += priceBit(probs[off + ctx], lit_bit);
+                ctx = (ctx << 1) | lit_bit;
+                if (m_bit != lit_bit) same = false;
+            } else {
+                price += priceBit(probs[ctx], lit_bit);
+                ctx = (ctx << 1) | lit_bit;
+            }
+        }
+    }
+    return price;
+}
+
+inline fn litNextState(state: u32) u32 {
+    return if (state < 4) 0 else if (state < 10) state - 3 else state - 6;
+}
+inline fn matchNextState(state: u32) u32 {
+    return if (state < 7) 7 else 10;
+}
+inline fn repNextState(state: u32) u32 {
+    return if (state < 7) 8 else 11;
+}
+inline fn shortRepNextState(state: u32) u32 {
+    return if (state < 7) 9 else 11;
+}
+
 const RangeEncoder = struct {
     low: u64 = 0,
     range: u32 = 0xFFFF_FFFF,
@@ -157,6 +265,19 @@ const LenCoder = struct {
             }
         }
     }
+
+    fn price(self: *const LenCoder, len_index: u32, pos_state: u32) u32 {
+        if (len_index < 8) {
+            return priceBit(self.choice, 0) + priceTree(self.low[pos_state][0..], 3, len_index);
+        }
+        const l = len_index - 8;
+        if (l < 8) {
+            return priceBit(self.choice, 1) + priceBit(self.choice2, 0) +
+                priceTree(self.mid[pos_state][0..], 3, l);
+        }
+        return priceBit(self.choice, 1) + priceBit(self.choice2, 1) +
+            priceTree(self.high[0..], 8, l - 8);
+    }
 };
 
 // ---- the encoder -----------------------------------------------------------
@@ -193,7 +314,7 @@ const Encoder = struct {
     state: u32 = 0,
     reps: [4]u32 = .{ 0, 0, 0, 0 }, // 0-based distances (true distance - 1)
 
-    // match finder
+    // match finder: hash-4 chains for >=4-byte matches.
     head: []i32,
     chain: []i32,
     hash_mask: u32,
@@ -222,6 +343,59 @@ const Encoder = struct {
                 try rc.encodeBitTreeReverse(self.align_probs[0..], kNumAlignBits, reduced & (kAlignTableSize - 1));
             }
         }
+    }
+
+    fn priceDistance(self: *const Encoder, dist0: u32, len: u32) u32 {
+        const len_state = @min(len - kMatchMinLen, kNumLenToPosStates - 1);
+        const slot = posSlot(dist0);
+        var p = priceTree(self.pos_slot[len_state][0..], 6, slot);
+        if (slot >= kStartPosModelIndex) {
+            const footer_bits: u6 = @intCast((slot >> 1) - 1);
+            const base: u32 = (2 | (slot & 1)) << @as(u5, @intCast(footer_bits));
+            const reduced = dist0 - base;
+            if (slot < kEndPosModelIndex) {
+                const off = base - slot;
+                p += priceTreeReverse(self.spec_pos[off..], footer_bits, reduced);
+            } else {
+                p += (@as(u32, footer_bits) - kNumAlignBits) * kBitPrice;
+                p += priceTreeReverse(self.align_probs[0..], kNumAlignBits, reduced & (kAlignTableSize - 1));
+            }
+        }
+        return p;
+    }
+
+    /// Fill `out` with (len, dist) pairs: for each achievable length the best
+    /// (smallest) distance, lengths strictly increasing. Inserts `pos` into the
+    /// match finder. Returns the number of pairs written.
+    fn getMatches(self: *Encoder, data: []const u8, pos: usize, out: []Match) usize {
+        var n: usize = 0;
+        if (pos + 4 > data.len) {
+            self.insert(data, pos);
+            return 0;
+        }
+        const max_len = @min(@as(u32, kMatchMaxLen), @as(u32, @intCast(data.len - pos)));
+        var best_len: u32 = kMatchMinLen - 1;
+        const min_pos: i64 = @as(i64, @intCast(pos)) - @as(i64, @intCast(self.opt.dict_size));
+
+        const h = hash4(data, pos, self.hash_mask);
+        var cur = self.head[h];
+        var depth: u32 = 0;
+        while (cur >= 0 and @as(i64, cur) >= min_pos and depth < self.opt.max_depth) : (depth += 1) {
+            const src: usize = @intCast(cur);
+            if (best_len < max_len and data[src + best_len] == data[pos + best_len]) {
+                var l: u32 = 0;
+                while (l < max_len and data[src + l] == data[pos + l]) l += 1;
+                if (l > best_len) {
+                    out[n] = .{ .len = l, .dist = @intCast(pos - src) };
+                    n += 1;
+                    best_len = l;
+                    if (l >= max_len or n >= out.len) break;
+                }
+            }
+            cur = self.chain[src];
+        }
+        self.insert(data, pos);
+        return n;
     }
 
     fn litProbs(self: *Encoder, pos: usize, prev: u8) []u16 {
@@ -268,6 +442,13 @@ const Encoder = struct {
         const v = (@as(u32, data[i]) | (@as(u32, data[i + 1]) << 8) |
             (@as(u32, data[i + 2]) << 16) | (@as(u32, data[i + 3]) << 24));
         return (v *% 2654435761) >> 8 & mask;
+    }
+    inline fn hash2(data: []const u8, i: usize) u32 {
+        return @as(u32, data[i]) | (@as(u32, data[i + 1]) << 8);
+    }
+    inline fn hash3(data: []const u8, i: usize) u32 {
+        const v = @as(u32, data[i]) | (@as(u32, data[i + 1]) << 8) | (@as(u32, data[i + 2]) << 16);
+        return (v *% 2654435761) >> 16 & 0xFFFF;
     }
 
     fn findMatch(self: *Encoder, data: []const u8, pos: usize) Match {
@@ -319,6 +500,73 @@ const Encoder = struct {
         for (self.reps, 0..) |r, i| if (r == d0) return i;
         return null;
     }
+
+    // --- emission helpers (no match-finder insert; used by the optimal parse,
+    //     which inserts during the DP) ---
+    fn emitLit(self: *Encoder, rc: *RangeEncoder, data: []const u8, pos: usize, pos_state: u32) !void {
+        const idx = (self.state << kNumPosBitsMax) + pos_state;
+        try rc.encodeBit(&self.is_match[idx], 0);
+        const prev: u8 = if (pos == 0) 0 else data[pos - 1];
+        const probs = self.litProbs(pos, prev);
+        if (self.state < 7) {
+            try self.encodeLiteral(rc, probs, data[pos], 0, false);
+        } else {
+            try self.encodeLiteral(rc, probs, data[pos], data[pos - (self.reps[0] + 1)], true);
+        }
+        self.state = litNextState(self.state);
+    }
+
+    fn emitMatch(self: *Encoder, rc: *RangeEncoder, len: u32, dist: u32, pos_state: u32) !void {
+        const idx = (self.state << kNumPosBitsMax) + pos_state;
+        try rc.encodeBit(&self.is_match[idx], 1);
+        const d0 = dist - 1;
+        if (self.repIndex(dist)) |ri| {
+            try rc.encodeBit(&self.is_rep[self.state], 1);
+            if (ri == 0) {
+                try rc.encodeBit(&self.is_rep_g0[self.state], 0);
+                if (len == 1) {
+                    try rc.encodeBit(&self.is_rep0_long[idx], 0);
+                    self.state = shortRepNextState(self.state);
+                    return;
+                }
+                try rc.encodeBit(&self.is_rep0_long[idx], 1);
+            } else {
+                try rc.encodeBit(&self.is_rep_g0[self.state], 1);
+                if (ri == 1) {
+                    try rc.encodeBit(&self.is_rep_g1[self.state], 0);
+                } else {
+                    try rc.encodeBit(&self.is_rep_g1[self.state], 1);
+                    try rc.encodeBit(&self.is_rep_g2[self.state], @intCast(ri - 2));
+                }
+                const d = self.reps[ri];
+                var k = ri;
+                while (k > 0) : (k -= 1) self.reps[k] = self.reps[k - 1];
+                self.reps[0] = d;
+            }
+            try self.rep_len_coder.encode(rc, len - kMatchMinLen, pos_state);
+            self.state = repNextState(self.state);
+        } else {
+            try rc.encodeBit(&self.is_rep[self.state], 0);
+            self.reps[3] = self.reps[2];
+            self.reps[2] = self.reps[1];
+            self.reps[1] = self.reps[0];
+            self.reps[0] = d0;
+            try self.len_coder.encode(rc, len - kMatchMinLen, pos_state);
+            try self.encodeDistance(rc, d0, len);
+            self.state = matchNextState(self.state);
+        }
+    }
+};
+
+// One node of the forward DP window. `dist == 0` means "literal"; otherwise this
+// node was reached by a (len, dist) match (a shortrep is len==1, dist==rep0+1).
+const OptNode = struct {
+    price: u32,
+    state: u32,
+    reps: [4]u32,
+    from: u32,
+    len: u32,
+    dist: u32,
 };
 
 /// Compress `data` to a standalone `.lzma` (LZMA_alone) buffer that liblzma /
@@ -454,6 +702,181 @@ pub fn compress(data: []const u8, a: std.mem.Allocator, opt_in: Options) ![]u8 {
             enc.insert(data, pos);
             pos += 1;
         }
+    }
+
+    try rc.flush();
+    return out.toOwnedSlice();
+}
+
+/// Optimal-parse compressor: a windowed forward DP over the price model picks
+/// the minimum-cost sequence of literals / matches / rep-matches, instead of the
+/// greedy `compress` above. This is what lifts ratio from "fast preset" class to
+/// "9e" class and is the path to beating 7-Zip. Output is identical-format
+/// standard .lzma (liblzma-decodable).
+pub fn compressOpt(data: []const u8, a: std.mem.Allocator, opt_in: Options) ![]u8 {
+    initPrices();
+    const opt = opt_in;
+    if (opt.lc + opt.lp > 4) return error.BadParams;
+
+    var hbits: u5 = 16;
+    while ((@as(u32, 1) << hbits) < data.len and hbits < 24) hbits += 1;
+    const hsize = @as(u32, 1) << hbits;
+
+    const lit_size: usize = @as(usize, 0x300) << @intCast(opt.lc + opt.lp);
+    const literal = try a.alloc(u16, lit_size);
+    defer a.free(literal);
+    @memset(literal, kProbInit);
+    const head = try a.alloc(i32, hsize);
+    defer a.free(head);
+    @memset(head, -1);
+    const chain = try a.alloc(i32, @max(data.len, 1));
+    defer a.free(chain);
+
+    var enc = Encoder{ .a = a, .opt = opt, .literal = literal, .head = head, .chain = chain, .hash_mask = hsize - 1 };
+
+    var out = std.ArrayList(u8).init(a);
+    errdefer out.deinit();
+    const props: u8 = @intCast((@as(u32, opt.pb) * 5 + opt.lp) * 9 + opt.lc);
+    try out.append(props);
+    var hdr: [12]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], opt.dict_size, .little);
+    std.mem.writeInt(u64, hdr[4..12], data.len, .little);
+    try out.appendSlice(&hdr);
+
+    var rc = RangeEncoder{ .out = &out };
+    const pb_mask: u32 = (@as(u32, 1) << opt.pb) - 1;
+    const INF: u32 = 0xFFFF_FFFF;
+
+    const WIN: usize = 1024;
+    const opts = try a.alloc(OptNode, WIN + 1);
+    defer a.free(opts);
+    var matches: [kMatchMaxLen + 2]Match = undefined;
+    var ops: [WIN]Match = undefined; // backtracked op list (len, dist); dist 0 = literal
+
+    var anchor: usize = 0;
+    while (anchor < data.len) {
+        const max_win = @min(WIN, data.len - anchor);
+        opts[0] = .{ .price = 0, .state = enc.state, .reps = enc.reps, .from = 0, .len = 0, .dist = 0 };
+        var z: usize = 1;
+        while (z <= max_win) : (z += 1) opts[z].price = INF;
+
+        var cur: usize = 0;
+        while (cur < max_win) : (cur += 1) {
+            const p = anchor + cur;
+            const nmatch = enc.getMatches(data, p, &matches); // inserts p
+            if (opts[cur].price == INF) continue;
+            const base = opts[cur].price;
+            const st = opts[cur].state;
+            const reps = opts[cur].reps;
+            const pos_state: u32 = @as(u32, @intCast(p)) & pb_mask;
+            const im_idx = (st << kNumPosBitsMax) + pos_state;
+            const im0 = priceBit(enc.is_match[im_idx], 0);
+            const im1 = priceBit(enc.is_match[im_idx], 1);
+
+            // (1) literal
+            {
+                const prev: u8 = if (p == 0) 0 else data[p - 1];
+                const probs = enc.litProbs(p, prev);
+                const lp: u32 = if (st < 7)
+                    priceLiteral(probs, data[p], 0, false)
+                else
+                    priceLiteral(probs, data[p], data[p - (reps[0] + 1)], true);
+                const np = base + im0 + lp;
+                if (np < opts[cur + 1].price)
+                    opts[cur + 1] = .{ .price = np, .state = litNextState(st), .reps = reps, .from = @intCast(cur), .len = 1, .dist = 0 };
+            }
+
+            const rep_base = base + im1 + priceBit(enc.is_rep[st], 1);
+            const new_base = base + im1 + priceBit(enc.is_rep[st], 0);
+            const win_left: u32 = @intCast(max_win - cur);
+
+            // (2) rep matches
+            for (reps, 0..) |r, ri| {
+                const dist = r + 1;
+                if (dist > p) continue;
+                const src = p - dist;
+                var maxl: u32 = @min(@as(u32, kMatchMaxLen), win_left);
+                if (@as(usize, maxl) > data.len - p) maxl = @intCast(data.len - p);
+                var l: u32 = 0;
+                while (l < maxl and data[src + l] == data[p + l]) l += 1;
+                var rep_sel: u32 = 0;
+                if (ri == 0) {
+                    rep_sel = priceBit(enc.is_rep_g0[st], 0);
+                } else {
+                    rep_sel = priceBit(enc.is_rep_g0[st], 1);
+                    rep_sel += if (ri == 1) priceBit(enc.is_rep_g1[st], 0) else (priceBit(enc.is_rep_g1[st], 1) + priceBit(enc.is_rep_g2[st], @intCast(ri - 2)));
+                }
+                if (ri == 0 and l >= 1) {
+                    // short rep (length 1) — only valid when the byte at rep0 matches
+                    const np = rep_base + rep_sel + priceBit(enc.is_rep0_long[im_idx], 0);
+                    if (np < opts[cur + 1].price)
+                        opts[cur + 1] = .{ .price = np, .state = shortRepNextState(st), .reps = reps, .from = @intCast(cur), .len = 1, .dist = dist };
+                }
+                if (l >= kMatchMinLen) {
+                    var nreps = reps;
+                    if (ri != 0) {
+                        const d = nreps[ri];
+                        var k = ri;
+                        while (k > 0) : (k -= 1) nreps[k] = nreps[k - 1];
+                        nreps[0] = d;
+                    }
+                    const rep0long: u32 = if (ri == 0) priceBit(enc.is_rep0_long[im_idx], 1) else 0;
+                    var len: u32 = kMatchMinLen;
+                    while (len <= l) : (len += 1) {
+                        const np = rep_base + rep_sel + rep0long + enc.rep_len_coder.price(len - kMatchMinLen, pos_state);
+                        if (np < opts[cur + len].price)
+                            opts[cur + len] = .{ .price = np, .state = repNextState(st), .reps = nreps, .from = @intCast(cur), .len = len, .dist = dist };
+                    }
+                }
+            }
+
+            // (3) new-distance matches
+            var mi: usize = 0;
+            var start_len: u32 = kMatchMinLen;
+            while (mi < nmatch) : (mi += 1) {
+                const md = matches[mi];
+                const d0 = md.dist - 1;
+                var nreps = reps;
+                nreps[3] = nreps[2];
+                nreps[2] = nreps[1];
+                nreps[1] = nreps[0];
+                nreps[0] = d0;
+                var len = start_len;
+                const top = @min(md.len, win_left);
+                while (len <= top) : (len += 1) {
+                    const np = new_base + enc.len_coder.price(len - kMatchMinLen, pos_state) + enc.priceDistance(d0, len);
+                    if (np < opts[cur + len].price)
+                        opts[cur + len] = .{ .price = np, .state = matchNextState(st), .reps = nreps, .from = @intCast(cur), .len = len, .dist = md.dist };
+                }
+                start_len = md.len + 1;
+            }
+        }
+
+        // backtrack from max_win to 0, collect ops in reverse
+        var nops: usize = 0;
+        var idx: usize = max_win;
+        while (idx != 0) {
+            const node = opts[idx];
+            ops[nops] = .{ .len = node.len, .dist = node.dist };
+            nops += 1;
+            idx = node.from;
+        }
+        // emit forward (reverse of collection order)
+        var pos = anchor;
+        var oi: usize = nops;
+        while (oi != 0) {
+            oi -= 1;
+            const op = ops[oi];
+            const pos_state: u32 = @as(u32, @intCast(pos)) & pb_mask;
+            if (op.dist == 0) {
+                try enc.emitLit(&rc, data, pos, pos_state);
+                pos += 1;
+            } else {
+                try enc.emitMatch(&rc, op.len, op.dist, pos_state);
+                pos += op.len;
+            }
+        }
+        anchor += max_win;
     }
 
     try rc.flush();

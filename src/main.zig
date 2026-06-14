@@ -80,12 +80,19 @@ fn lzmaEncBench(root: std.mem.Allocator, path: []const u8, out: anytype) !void {
     var dict: u32 = 1 << 20;
     while (dict < data.len and dict < (1 << 27)) dict <<= 1;
 
-    var t = try std.time.Timer.start();
-    const ours = try lzma_enc.compress(data, root, .{ .dict_size = dict, .nice_len = 128, .max_depth = 256 });
-    defer root.free(ours);
-    const enc_ms = t.read() / std.time.ns_per_ms;
+    const cfg = lzma_enc.Options{ .dict_size = dict, .nice_len = 273, .max_depth = 1024 };
 
-    // write the .lzma for external decode verification
+    var t = try std.time.Timer.start();
+    const greedy = try lzma_enc.compress(data, root, cfg);
+    defer root.free(greedy);
+    const greedy_ms = t.read() / std.time.ns_per_ms;
+
+    t.reset();
+    const ours = try lzma_enc.compressOpt(data, root, cfg);
+    defer root.free(ours);
+    const opt_ms = t.read() / std.time.ns_per_ms;
+
+    // write the optimal-parse .lzma for external decode verification
     const lf = try std.fs.cwd().createFile("/tmp/ours.lzma", .{});
     defer lf.close();
     try lf.writeAll(ours);
@@ -96,9 +103,10 @@ fn lzmaEncBench(root: std.mem.Allocator, path: []const u8, out: anytype) !void {
     const o: f64 = @floatFromInt(ours.len);
     const l: f64 = @floatFromInt(lz.len);
     try out.print("lzmaenc on {s} ({d} B)\n", .{ path, data.len });
-    try out.print("  ours (.lzma)  : {d}  ({d} ms)  -> /tmp/ours.lzma\n", .{ ours.len, enc_ms });
+    try out.print("  greedy+lazy   : {d}  ({d} ms)\n", .{ greedy.len, greedy_ms });
+    try out.print("  optimal parse : {d}  ({d} ms)  -> /tmp/ours.lzma\n", .{ ours.len, opt_ms });
     try out.print("  liblzma 9e    : {d}\n", .{lz.len});
-    try out.print("  ours vs lzma  : {d:.2}% ({s})\n", .{ (o / l - 1.0) * 100.0, if (ours.len < lz.len) "ours smaller" else "liblzma smaller" });
+    try out.print("  optimal vs 9e : {d:.2}% ({s})\n", .{ (o / l - 1.0) * 100.0, if (ours.len < lz.len) " OURS SMALLER" else "liblzma smaller" });
     try out.print("  verify: xz -d --format=lzma < /tmp/ours.lzma | cmp - {s}\n", .{path});
 }
 
