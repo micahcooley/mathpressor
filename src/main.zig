@@ -55,6 +55,15 @@ pub fn main() !void {
     } else if (args.len >= 3 and std.mem.eql(u8, args[1], "lzmaenc")) {
         const pen: u32 = if (args.len >= 4) (std.fmt.parseInt(u32, args[3], 10) catch 0) else 0;
         try lzmaEncBench(root, args[2], pen, out);
+    } else if (args.len >= 3 and std.mem.eql(u8, args[1], "transcode")) {
+        const lzma_enc = @import("lzma_enc.zig");
+        const f = try std.fs.cwd().openFile(args[2], .{});
+        defer f.close();
+        const data = try f.readToEndAlloc(root, 1 << 30);
+        defer root.free(data);
+        const known: ?usize = if (args.len >= 4) (std.fmt.parseInt(usize, args[3], 10) catch null) else null;
+        const re = try lzma_enc.transcodeLen(data, known, root);
+        try out.print("input .lzma {d} B -> re-emitted through OUR model: {d} B (delta {d})\n", .{ data.len, re, @as(i64, @intCast(re)) - @as(i64, @intCast(data.len)) });
     } else if (args.len >= 4 and std.mem.eql(u8, args[1], "mfprobe")) {
         const lzma_enc = @import("lzma_enc.zig");
         const f = try std.fs.cwd().openFile(args[2], .{});

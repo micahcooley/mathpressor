@@ -552,6 +552,51 @@ const Encoder = struct {
         self.state = litNextState(self.state);
     }
 
+    /// Emit a match using an EXPLICIT decision (no rep re-derivation) — used by
+    /// the transcoder to faithfully replay another encoder's exact token choices
+    /// through our model. rep_idx: -1 = new match; 0..3 = that rep. is_short =
+    /// rep0 length-1 shortrep.
+    fn emitMatchExplicit(self: *Encoder, rc: *RangeEncoder, rep_idx: i32, is_short: bool, len: u32, dist0: u32, pos_state: u32) !void {
+        const idx = (self.state << kNumPosBitsMax) + pos_state;
+        try rc.encodeBit(&self.is_match[idx], 1);
+        if (rep_idx < 0) {
+            try rc.encodeBit(&self.is_rep[self.state], 0);
+            self.reps[3] = self.reps[2];
+            self.reps[2] = self.reps[1];
+            self.reps[1] = self.reps[0];
+            self.reps[0] = dist0;
+            try self.len_coder.encode(rc, len - kMatchMinLen, pos_state);
+            try self.encodeDistance(rc, dist0, len);
+            self.state = matchNextState(self.state);
+            return;
+        }
+        try rc.encodeBit(&self.is_rep[self.state], 1);
+        const ri: usize = @intCast(rep_idx);
+        if (ri == 0) {
+            try rc.encodeBit(&self.is_rep_g0[self.state], 0);
+            if (is_short) {
+                try rc.encodeBit(&self.is_rep0_long[idx], 0);
+                self.state = shortRepNextState(self.state);
+                return;
+            }
+            try rc.encodeBit(&self.is_rep0_long[idx], 1);
+        } else {
+            try rc.encodeBit(&self.is_rep_g0[self.state], 1);
+            if (ri == 1) {
+                try rc.encodeBit(&self.is_rep_g1[self.state], 0);
+            } else {
+                try rc.encodeBit(&self.is_rep_g1[self.state], 1);
+                try rc.encodeBit(&self.is_rep_g2[self.state], @intCast(ri - 2));
+            }
+            const d = self.reps[ri];
+            var k = ri;
+            while (k > 0) : (k -= 1) self.reps[k] = self.reps[k - 1];
+            self.reps[0] = d;
+        }
+        try self.rep_len_coder.encode(rc, len - kMatchMinLen, pos_state);
+        self.state = repNextState(self.state);
+    }
+
     fn emitMatch(self: *Encoder, rc: *RangeEncoder, len: u32, dist: u32, pos_state: u32) !void {
         const idx = (self.state << kNumPosBitsMax) + pos_state;
         try rc.encodeBit(&self.is_match[idx], 1);
@@ -957,6 +1002,169 @@ pub fn compressOpt(data: []const u8, a: std.mem.Allocator, opt_in: Options) ![]u
 
     try rc.flush();
     return out.toOwnedSlice();
+}
+
+/// Decisive diagnostic: decode an LZMA stream's token sequence and RE-EMIT it
+/// through our own encoder/model. If the result ~= the input size, our model is
+/// byte-exact and any ratio gap vs that stream is purely our PARSE/search — not
+/// the model or prices. Returns our re-encoded length.
+pub fn transcodeLen(stream: []const u8, known_size: ?usize, a: std.mem.Allocator) !usize {
+    if (stream.len < 13) return error.Truncated;
+    const props = stream[0];
+    const lc: u4 = @intCast(props % 9);
+    const r = props / 9;
+    const lp: u4 = @intCast(r % 5);
+    const pb: u4 = @intCast(r / 5);
+    const raw_size = std.mem.readInt(u64, stream[5..13], .little);
+    const out_size: usize = if (raw_size == std.math.maxInt(u64)) (known_size orelse return error.UnknownSize) else @intCast(raw_size);
+
+    initPrices();
+    const out = try a.alloc(u8, out_size);
+    defer a.free(out);
+    const dlit = try a.alloc(u16, @as(usize, 0x300) << @intCast(lc + lp));
+    defer a.free(dlit);
+    @memset(dlit, kProbInit);
+
+    // decoder model
+    var is_match = [_]u16{kProbInit} ** (kNumStates << kNumPosBitsMax);
+    var is_rep = [_]u16{kProbInit} ** kNumStates;
+    var is_rep_g0 = [_]u16{kProbInit} ** kNumStates;
+    var is_rep_g1 = [_]u16{kProbInit} ** kNumStates;
+    var is_rep_g2 = [_]u16{kProbInit} ** kNumStates;
+    var is_rep0_long = [_]u16{kProbInit} ** (kNumStates << kNumPosBitsMax);
+    var pos_slot = [_][1 << 6]u16{[_]u16{kProbInit} ** (1 << 6)} ** kNumLenToPosStates;
+    var spec_pos = [_]u16{kProbInit} ** (kNumFullDistances - kEndPosModelIndex + 1);
+    var align_probs = [_]u16{kProbInit} ** kAlignTableSize;
+    var len_coder = DecLenCoder{};
+    var rep_len_coder = DecLenCoder{};
+
+    // our own encoder (fresh model) to re-emit into
+    const elit = try a.alloc(u16, @as(usize, 0x300) << @intCast(lc + lp));
+    defer a.free(elit);
+    @memset(elit, kProbInit);
+    var enc = Encoder{ .a = a, .opt = .{ .lc = lc, .lp = lp, .pb = pb }, .literal = elit, .head = &[_]i32{}, .hash_mask = 0 };
+    var eout = std.ArrayList(u8).init(a);
+    defer eout.deinit();
+    var rce = RangeEncoder{ .out = &eout };
+
+    var rc = RangeDecoder.init(stream[13..]);
+    var state: u32 = 0;
+    var reps = [4]u32{ 0, 0, 0, 0 };
+    const pb_mask: u32 = (@as(u32, 1) << pb) - 1;
+    const lp_mask: u32 = (@as(u32, 1) << lp) - 1;
+    var o: usize = 0;
+    while (o < out_size) {
+        const ps: u32 = @as(u32, @intCast(o)) & pb_mask;
+        const im = (state << kNumPosBitsMax) + ps;
+        if (rc.decodeBit(&is_match[im]) == 0) {
+            const prev: u8 = if (o == 0) 0 else out[o - 1];
+            const idx = 0x300 * (((@as(u32, @intCast(o)) & lp_mask) << lc) + (@as(u32, prev) >> @intCast(8 - lc)));
+            const probs = dlit[idx..][0..0x300];
+            var sym: u32 = 1;
+            if (state < 7) {
+                while (sym < 0x100) sym = (sym << 1) | rc.decodeBit(&probs[sym]);
+            } else {
+                var mb: u32 = out[o - (reps[0] + 1)];
+                while (sym < 0x100) {
+                    mb <<= 1;
+                    const match_bit = mb & 0x100;
+                    const b = rc.decodeBit(&probs[0x100 + match_bit + sym]);
+                    sym = (sym << 1) | b;
+                    if (match_bit != (@as(u32, b) << 8)) {
+                        while (sym < 0x100) sym = (sym << 1) | rc.decodeBit(&probs[sym]);
+                        break;
+                    }
+                }
+            }
+            out[o] = @intCast(sym & 0xFF);
+            try enc.emitLit(&rce, out, o, ps);
+            o += 1;
+            state = litNextState(state);
+            continue;
+        }
+        var len: u32 = undefined;
+        var rep_idx: i32 = -1;
+        var dist0_new: u32 = 0;
+        if (rc.decodeBit(&is_rep[state]) == 1) {
+            if (rc.decodeBit(&is_rep_g0[state]) == 0) {
+                rep_idx = 0;
+                if (rc.decodeBit(&is_rep0_long[im]) == 0) {
+                    try enc.emitMatchExplicit(&rce, 0, true, 1, reps[0], ps);
+                    state = shortRepNextState(state);
+                    out[o] = out[o - (reps[0] + 1)];
+                    o += 1;
+                    continue;
+                }
+            } else {
+                var d: u32 = undefined;
+                if (rc.decodeBit(&is_rep_g1[state]) == 0) {
+                    rep_idx = 1;
+                    d = reps[1];
+                    reps[1] = reps[0];
+                } else if (rc.decodeBit(&is_rep_g2[state]) == 0) {
+                    rep_idx = 2;
+                    d = reps[2];
+                    reps[2] = reps[1];
+                    reps[1] = reps[0];
+                } else {
+                    rep_idx = 3;
+                    d = reps[3];
+                    reps[3] = reps[2];
+                    reps[2] = reps[1];
+                    reps[1] = reps[0];
+                }
+                reps[0] = d;
+            }
+            len = rep_len_coder.decode(&rc, ps) + kMatchMinLen;
+            state = repNextState(state);
+        } else {
+            reps[3] = reps[2];
+            reps[2] = reps[1];
+            reps[1] = reps[0];
+            len = len_coder.decode(&rc, ps) + kMatchMinLen;
+            const len_state = @min(len - kMatchMinLen, kNumLenToPosStates - 1);
+            const slot = rc.decodeTree(pos_slot[len_state][0..], 6);
+            var dist0: u32 = slot;
+            if (slot >= kStartPosModelIndex) {
+                const footer: u6 = @intCast((slot >> 1) - 1);
+                dist0 = (2 | (slot & 1)) << @as(u5, @intCast(footer));
+                if (slot < kEndPosModelIndex) {
+                    const off = dist0 - slot;
+                    var m: u32 = 1;
+                    var add: u32 = 0;
+                    var i: u6 = 0;
+                    while (i < footer) : (i += 1) {
+                        const b = rc.decodeBit(&spec_pos[off + m]);
+                        m = (m << 1) | b;
+                        add |= @as(u32, b) << @intCast(i);
+                    }
+                    dist0 += add;
+                } else {
+                    dist0 += rc.decodeDirect(footer - kNumAlignBits) << kNumAlignBits;
+                    dist0 += rc.decodeTreeReverse(align_probs[0..], kNumAlignBits);
+                }
+            }
+            if (dist0 == 0xFFFF_FFFF) break;
+            reps[0] = dist0;
+            dist0_new = dist0;
+            state = matchNextState(state);
+        }
+        // replay the EXACT decision through our model
+        try enc.emitMatchExplicit(&rce, rep_idx, false, len, dist0_new, ps);
+        const dist = reps[0] + 1;
+        var k: u32 = 0;
+        while (k < len) : (k += 1) {
+            out[o] = out[o - dist];
+            o += 1;
+        }
+    }
+    try rce.flush();
+    // write the decoded bytes so callers can verify the decoder is faithful
+    if (std.fs.cwd().createFile("/tmp/transcode_out.bin", .{})) |df| {
+        defer df.close();
+        df.writeAll(out) catch {};
+    } else |_| {}
+    return eout.items.len;
 }
 
 /// Diagnostic: run the BT4 match finder up to `pos` and return the matches it
