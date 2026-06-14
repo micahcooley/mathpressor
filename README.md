@@ -305,16 +305,23 @@ ratios:
   - plain LZMA / in-place x86 BCJ as the fast baselines.
 
   The keep-smaller guard means full mode never loses to any single backend.
-  Across text / vertex / image / audio / binary, full mode now beats every
-  general-purpose compressor including 7-Zip — and regular (live) mode holds the
-  #2 spot on every type, beating the 7-Zip archiver everywhere. Maximum ratio, but it must be fully
-  expanded to use — *not* live-runnable. Always the smaller of the two modes.
+  **Where full mode beats 7-Zip / xz (measured):** on *structured* data its
+  context-mixing coder + domain transforms win — text/source **−16 %**, x86-64
+  binaries **−5 %**, raw images **−2 %** vs `7z -mx9`. **Where it doesn't:** on
+  opaque / already-dense data (e.g. an Unreal asset pak) 7-Zip and xz are smaller,
+  and on small raw audio 7-Zip edged it in testing. So the honest claim is *full
+  mode beats general compressors on text / code / image; it is competitive, not
+  uniformly smaller, on opaque data.* Full mode is maximum ratio but must be fully
+  expanded to use — *not* live-runnable.
 
-The intended hierarchy: full mode is #1 on ratio; regular mode is #2 (aiming to
-beat every general-purpose compressor) while staying live. The two constraints —
-"beat everyone on size" and "run live" — are in genuine tension (a stronger but
-slower backend helps the first and hurts the second), which is why regular mode
-keeps a fast path and treats heavier backends as a ship/cold option.
+The intended hierarchy: full mode is #1 on ratio *for the data types it models
+well*; regular (live) mode trades some ratio for random access and on-demand
+decode (it still beats 7-Zip on x86 binaries while staying live). The two
+constraints — "smallest on size" and "run live" — are in genuine tension (a
+stronger but slower backend helps the first and hurts the second), which is why
+regular mode keeps a fast path and treats heavier backends as a ship/cold option.
+See [`bench/REPORT.md`](bench/REPORT.md) and [`docs/DISCOVERIES.md`](docs/DISCOVERIES.md)
+for the per-type numbers and an honest prior-art assessment.
 
 One workload stays structurally full-mode's: many tiny *near-duplicate* files.
 A solid block references the full window across every file with zero per-frame
@@ -347,7 +354,9 @@ it runs live off a **320 MB** `.math` at **native 60 fps with zero frametime
 hitches** (worst frame 22 ms; a single-byte pak read dropped from an 8.1 s
 whole-file stall to ~14 ms). Storage 3.3×, nothing inflated to disk, bit-perfect.
 Full methodology, numbers, and the harness are in [`bench/REPORT.md`](bench/REPORT.md);
-the development story is in [`docs/JOURNEY.md`](docs/JOURNEY.md).
+the development story is in [`docs/JOURNEY.md`](docs/JOURNEY.md); an honest novelty /
+prior-art assessment (what's new vs known, with a per-type ratio comparison vs 7-Zip
+and xz) is in [`docs/DISCOVERIES.md`](docs/DISCOVERIES.md).
 
 ```sh
 zig build tools                                    # builds vfs_runner, concread, mathfs (needs libfuse3-dev)
