@@ -1040,12 +1040,32 @@ pub fn compressOpt(data: []const u8, a: std.mem.Allocator, opt_in: Options) ![]u
 // K-best insertion into a multi-state node's candidate list (ascending price).
 fn kInsert(opts: []OptNode, kc: usize, target: usize, cand: OptNode) void {
     const base = target * kc;
-    if (cand.price >= opts[base + kc - 1].price) return;
-    var i: usize = kc - 1;
-    while (i > 0 and opts[base + i - 1].price > cand.price) : (i -= 1) {
-        opts[base + i] = opts[base + i - 1];
+    // Dedup by (state, reps): keep only the CHEAPEST candidate per distinct
+    // rep-history, so the K slots hold diverse states instead of near-duplicates.
+    // This makes a small K as effective as a much larger naive K — fewer
+    // candidates to relax from per position, i.e. a big speedup at equal ratio.
+    var i: usize = 0;
+    while (i < kc and opts[base + i].price != 0xFFFF_FFFF) : (i += 1) {
+        const e = opts[base + i];
+        if (e.state == cand.state and e.reps[0] == cand.reps[0] and e.reps[1] == cand.reps[1] and e.reps[2] == cand.reps[2] and e.reps[3] == cand.reps[3]) {
+            if (cand.price < e.price) {
+                opts[base + i] = cand;
+                var j = i;
+                while (j > 0 and opts[base + j - 1].price > opts[base + j].price) : (j -= 1) {
+                    const tmp = opts[base + j - 1];
+                    opts[base + j - 1] = opts[base + j];
+                    opts[base + j] = tmp;
+                }
+            }
+            return;
+        }
     }
-    opts[base + i] = cand;
+    if (cand.price >= opts[base + kc - 1].price) return;
+    var k2: usize = kc - 1;
+    while (k2 > 0 and opts[base + k2 - 1].price > cand.price) : (k2 -= 1) {
+        opts[base + k2] = opts[base + k2 - 1];
+    }
+    opts[base + k2] = cand;
 }
 
 /// Multi-state (K-best) optimal parse: keep the top-K (price, state, reps)
