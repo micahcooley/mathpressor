@@ -1,8 +1,12 @@
 # Mathpressor
 
-A deterministic, standalone procedural asset engine and container format, written in 100% Zig. Mathpressor replaces dictionary compression (LZMA, Zstd, zlib) with demoscene-style mathematical synthesis: assets are stored as tiny bytecode programs that *generate* pixels at runtime rather than storing compressed pixel data. It ships as a CLI, a desktop GUI, and a `libmathpressor.so` any host application can embed over a plain C-ABI.
+> **🧒 In plain English** — Mathpressor squeezes a whole folder (say, a video game) into a much smaller file. But unlike a normal `.zip`, your program can **run directly from the squeezed file** — it unpacks only the bits it needs, the instant it needs them, so nothing ever gets unzipped onto your disk. We squeezed a **1 GB game down to 320 MB and it still ran at full speed**, with no way to tell the difference.
+>
+> *This README is written two ways at once: the technical text, and an **In plain English** box like this after the jargon-heavy parts. Read whichever you like — or both, side by side.*
 
-A **26-byte** program expands into a **9,216-pixel** texture — a 354× expansion ratio — with no stored pixel data at all, and the same bits on every CPU architecture.
+A deterministic procedural-asset engine, container format, and **live VFS** — 100% Zig. Mathpressor packs a file tree by routing each asset to whichever is smallest: demoscene-style **procedural synthesis** (store a tiny generator program instead of the pixels), reversible domain transforms (x86 BCJ2/RIP, 2D image predictor, columnar, audio LPC), or a strong general backend (zstd / LZMA / context-mixing). Then a host can **run straight off the compressed archive** — random-access, decode-on-demand, nothing inflated to disk. Ships as a CLI, a desktop GUI, and a `libmathpressor.so` over a plain C-ABI.
+
+Two ends of what that buys: a **26-byte** program expands to a **9,216-pixel** texture (354×, no stored pixels), and a real **1.06 GB Unreal game runs live off a 320 MB archive at native 60 fps** — nothing inflated to disk. Same bits on every CPU architecture.
 
 ---
 
@@ -12,7 +16,9 @@ Traditional game compression: `raw pixels → compress → store → decompress 
 
 Mathpressor: `bytecode program → VM synthesis → raw pixels`
 
-For assets that can be represented procedurally (noise textures, cave masks, marble veins, etc.), the bytecode program is orders of magnitude smaller than even the best compressed representation. For assets that can't be represented procedurally, Mathpressor falls back gracefully to gzip or raw storage — whichever is smaller.
+For assets that can be represented procedurally (noise textures, cave masks, marble veins, etc.), the bytecode program is orders of magnitude smaller than even the best compressed representation. In practice most real-world data *isn't* procedural, so Mathpressor falls back to a strong general backend (zstd / LZMA / context-mixing) plus reversible domain transforms, or raw storage — whichever is smallest. Synthesis is the ideal *live* primitive (near-zero storage, no decompression); the traditional routes carry everything else.
+
+> **🧒 In plain English** — Instead of one way to shrink a file, Mathpressor tries several and keeps the smallest. The fanciest trick: if a texture is something a little math formula can *draw* (like clouds or static), it stores the **recipe** (a few bytes) instead of the picture (thousands of bytes) and re-draws it on demand. Most files aren't drawable that way, so for those it uses normal-but-strong compression. It never makes a file bigger — worst case it just stores it as-is.
 
 ### The Four Storage Routes
 
@@ -266,6 +272,11 @@ Built-in templates: `single_noise`, `noise_invert`, `noise_bright`, `blend_mult`
 
 ## Two modes: live (regular) vs cold (full)
 
+> **🧒 In plain English** — Two settings. **Regular** is the "play it live" setting: a bit
+> bigger, but you can run the game straight from it. **Full** is the "shrink it as much as
+> possible" setting: smaller, but you must fully unpack it before using it (like a backup or a
+> download). Same files, you pick the trade — run-it-now vs smallest-possible.
+
 Mathpressor has two packing modes with different *purposes*, not just different
 ratios:
 
@@ -314,6 +325,12 @@ ratios:
   uniformly smaller, on opaque data.* Full mode is maximum ratio but must be fully
   expanded to use — *not* live-runnable.
 
+> **🧒 In plain English** — Compared to the popular shrink tools (7-Zip, xz), Mathpressor
+> wins on things it understands well — **text, program code, and pictures** (it's noticeably
+> smaller there). It *loses* on stuff that's already hard to shrink, like a game's
+> pre-packed artwork. So it's not "smaller than everything at everything" — it's "smaller on
+> the things it has special tricks for, and you-can-run-it-live on the rest."
+
 The intended hierarchy: full mode is #1 on ratio *for the data types it models
 well*; regular (live) mode trades some ratio for random access and on-demand
 decode (it still beats 7-Zip on x86 binaries while staying live). The two
@@ -348,6 +365,15 @@ chunks plus a seek index; a read maps to its chunk(s) only (`addChunkedStreaming
 concurrent decode engine on top: decodes run outside the cache lock (refcounted,
 so many cores decode at once), an **adaptive prefetch** pool reads ahead only on
 detected sequential runs, and a large RAM LRU keeps the working set warm.
+
+> **🧒 In plain English** — A normal squeezed file is like a vacuum-sealed bag: to grab one
+> sock you must open the whole thing. That's why an early version *froze* for ~8 seconds
+> whenever the game needed something. The fix: pack the big file as many small sealed bags
+> (4 MB each) with a table of contents, so the game opens **only the bag it needs** (a few
+> milliseconds) and leaves the rest sealed. `mathfs` is the helper that *pretends to be
+> ordinary folders* to the game, but secretly opens those little bags on demand — using all
+> your CPU cores, guessing what's needed next, and remembering recent ones. Result: the game
+> reads from the 320 MB file as if it were the full 1 GB sitting on disk, smoothly.
 
 **Measured on a real Proton game** (FPS Chess, UE4, 1.06 GB install, 961 MB pak):
 it runs live off a **320 MB** `.math` at **native 60 fps with zero frametime
