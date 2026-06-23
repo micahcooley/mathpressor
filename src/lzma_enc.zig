@@ -1286,6 +1286,23 @@ pub fn compressOptK(data: []const u8, a: std.mem.Allocator, opt_in: Options) ![]
     return out.toOwnedSlice();
 }
 
+/// Worker-thread budget for all parallel compression (regular-mode chunks,
+/// full-mode chunked optlzma, the file-level pools). Defaults to 3/4 of the
+/// logical CPUs — enough to saturate compression throughput while leaving the
+/// machine responsive during a long pack, and it scales to any CPU instead of a
+/// hardcode tuned to one box. Override with the MATHPRESSOR_THREADS env var.
+/// Floored at 1. Centralised here (the lowest shared module) so every parallel
+/// site obeys one rule.
+pub fn recommendedThreads() usize {
+    if (std.posix.getenv("MATHPRESSOR_THREADS")) |s| {
+        if (std.fmt.parseInt(usize, s, 10) catch null) |n| {
+            if (n >= 1) return n;
+        }
+    }
+    const cpus = std.Thread.getCpuCount() catch 4;
+    return @max(@as(usize, 1), cpus * 3 / 4);
+}
+
 /// Parallel chunked multi-state compression: split `data` into `chunk_size`
 /// pieces, compress each independently with compressOptK across a thread pool,
 /// and pack them with a small index. Bounds the multi-state encode time to
@@ -1312,7 +1329,7 @@ pub fn compressOptKChunked(data: []const u8, a: std.mem.Allocator, chunk_size: u
         }
     };
     var pool: std.Thread.Pool = undefined;
-    const njobs = @min(@as(usize, 8), (std.Thread.getCpuCount() catch 4));
+    const njobs = recommendedThreads();
     try pool.init(.{ .allocator = a, .n_jobs = @intCast(njobs) });
     defer pool.deinit();
     var wg = std.Thread.WaitGroup{};

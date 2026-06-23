@@ -950,7 +950,7 @@ fn runStreamJobsParallel(
     };
 
     var pool: std.Thread.Pool = undefined;
-    try pool.init(.{ .allocator = root, .n_jobs = null });
+    try pool.init(.{ .allocator = root, .n_jobs = @as(u32, @intCast(container.recommendedThreads())) });
     defer pool.deinit();
 
     var wg = std.Thread.WaitGroup{};
@@ -1270,7 +1270,7 @@ fn packDirectory(root: std.mem.Allocator, dir_path: []const u8, out_path: []cons
     };
 
     var pool: std.Thread.Pool = undefined;
-    try pool.init(.{ .allocator = root, .n_jobs = null });
+    try pool.init(.{ .allocator = root, .n_jobs = @as(u32, @intCast(container.recommendedThreads())) });
     defer pool.deinit();
 
     var wg = std.Thread.WaitGroup{};
@@ -1460,6 +1460,80 @@ fn bestColumnarBlock(data: []const u8, effort: Effort, final_comp: container.Com
     const payload = try alloc.alloc(u8, 2 + chosen.len);
     std.mem.writeInt(u16, payload[0..2], sflag, .little);
     @memcpy(payload[2..], chosen);
+    return payload;
+}
+
+/// MATH_FLOAT: the float/numeric predictor. Maps each value to a monotonic int,
+/// predicts it (1D delta OR 2D Lorenzo over an auto-detected row width), and
+/// byte-planes the residual. Net-new ground vs zstd/xz on binary float/int arrays
+/// (sensor/telemetry/scientific/time-series), which have no repeated substrings
+/// but lots of value-domain redundancy; the 2D Lorenzo stencil is what the
+/// scientific compressors (ZFP/SZ) use on smooth grids. Tries element widths 4/8,
+/// mapped/raw, 1D + 2D at power-of-two row widths (+ the square side), ranks them
+/// on a bounded prefix sample, and commits the best — but only if it beats plain.
+/// Block: `[u8 width][u8 mode(bit0=map,bit1=2D)][u32 row_width][compressed
+/// residual]`. Honesty-guarded at the call site; the transform is exact + bijective.
+fn bestFloatBlock(data: []const u8, effort: Effort, final_comp: container.Compressor, alloc: std.mem.Allocator) !?[]u8 {
+    if (effort.tier == 0 or data.len < 4096 or data.len > 64 * 1024 * 1024) return null;
+    if (looksTexty(data)) return null; // numbers-as-text hide the structure; LZMA/CM owns text
+
+    const Cand = struct { ew: u8, map: bool, pred2d: bool, rw: u32 };
+    var cands = std.ArrayList(Cand).init(alloc);
+    defer cands.deinit();
+    inline for ([_]u8{ 4, 8 }) |ew| {
+        if (data.len % ew == 0) {
+            const n = data.len / ew;
+            try cands.append(.{ .ew = ew, .map = true, .pred2d = false, .rw = 0 }); // 1D
+            try cands.append(.{ .ew = ew, .map = false, .pred2d = false, .rw = 0 });
+            var w: usize = 16; // 2D Lorenzo at power-of-two row widths that tile n
+            while (w <= n / 4) : (w *= 2) {
+                if (n % w == 0) try cands.append(.{ .ew = ew, .map = true, .pred2d = true, .rw = @intCast(w) });
+            }
+            var s: usize = @intFromFloat(@sqrt(@as(f64, @floatFromInt(n)))); // square side
+            while (s > 1 and s * s > n) s -= 1;
+            while ((s + 1) * (s + 1) <= n) s += 1;
+            if (s >= 2 and s * s == n and (s & (s - 1)) != 0)
+                try cands.append(.{ .ew = ew, .map = true, .pred2d = true, .rw = @intCast(s) });
+        }
+    }
+    if (cands.items.len == 0) return null;
+
+    // Rank on a bounded prefix sample (whole rows for 2D) in compressed-bytes-per-
+    // input-byte; only commit if the best beats plain on the same sample.
+    const SAMPLE: usize = 4 * 1024 * 1024;
+    const plain_sl: usize = @min(data.len, SAMPLE);
+    const plain_rk = try container.zstdCompress(data[0..plain_sl], alloc, 1);
+    var best_bpb: f64 = @as(f64, @floatFromInt(plain_rk.len)) / @as(f64, @floatFromInt(plain_sl));
+    alloc.free(plain_rk);
+
+    var best: ?Cand = null;
+    for (cands.items) |c| {
+        const unit: usize = if (c.pred2d) @as(usize, c.ew) * @as(usize, c.rw) else c.ew;
+        var sl: usize = @min(data.len, SAMPLE);
+        sl -= sl % unit;
+        if (sl == 0 or (c.pred2d and sl < 2 * unit)) continue;
+        const t = try container.numericForward(data[0..sl], c.ew, c.map, c.pred2d, c.rw, alloc);
+        defer alloc.free(t);
+        const rk = try container.zstdCompress(t, alloc, 1);
+        defer alloc.free(rk);
+        const bpb = @as(f64, @floatFromInt(rk.len)) / @as(f64, @floatFromInt(sl));
+        if (bpb < best_bpb) {
+            best_bpb = bpb;
+            best = c;
+        }
+    }
+    const c = best orelse return null;
+
+    // Commit the winning variant on the FULL data at the final codec.
+    const t = try container.numericForward(data, c.ew, c.map, c.pred2d, c.rw, alloc);
+    defer alloc.free(t);
+    const comp = try final_comp.compress(t, alloc);
+    defer alloc.free(comp);
+    const payload = try alloc.alloc(u8, 6 + comp.len);
+    payload[0] = c.ew;
+    payload[1] = (if (c.map) @as(u8, 1) else 0) | (if (c.pred2d) @as(u8, 2) else 0);
+    std.mem.writeInt(u32, payload[2..6], c.rw, .little);
+    @memcpy(payload[6..], comp);
     return payload;
 }
 
@@ -1760,6 +1834,15 @@ fn chooseFallbackRep(data: []const u8, effort: Effort, alloc: std.mem.Allocator)
         } else alloc.free(payload);
     }
 
+    if (try bestFloatBlock(data, effort, effort.comp, alloc)) |payload| {
+        if (payload.len < best_len) {
+            if (best_payload) |b| alloc.free(b);
+            best_type = .math_float;
+            best_len = payload.len;
+            best_payload = payload;
+        } else alloc.free(payload);
+    }
+
     if (try bestImage2DBlock(data, effort, effort.comp, alloc)) |payload| {
         if (payload.len < best_len) {
             if (best_payload) |b| alloc.free(b);
@@ -1799,6 +1882,7 @@ fn fallbackLabel(ct: container.CompressionType) []const u8 {
         .math_columnar => "COLUMNAR",
         .math_image2d => "IMAGE2D ",
         .math_audio => "AUDIO   ",
+        .math_float => "FLOAT   ",
         .math_bcj2 => "BCJ2    ",
         else => "STORE   ",
     };
@@ -1887,7 +1971,7 @@ fn unpackFullTar(root: std.mem.Allocator, rdr: *container.Reader, out_dir: []con
         // Lifted entries (whole-file program, filtered, columnar, 2D-image, or
         // audio-LPC) are individual files; anything else is the one wrapped tar.
         const is_lifted = switch (entry.comp_type) {
-            .math_bytecode, .math_filtered, .math_columnar, .math_image2d, .math_audio => true,
+            .math_bytecode, .math_filtered, .math_columnar, .math_image2d, .math_audio, .math_float => true,
             else => false,
         };
         if (!is_lifted) {
@@ -2668,7 +2752,7 @@ fn runAutoJobsParallel(
     };
 
     var pool: std.Thread.Pool = undefined;
-    try pool.init(.{ .allocator = root, .n_jobs = null });
+    try pool.init(.{ .allocator = root, .n_jobs = @as(u32, @intCast(container.recommendedThreads())) });
     defer pool.deinit();
 
     var wg = std.Thread.WaitGroup{};
@@ -2892,7 +2976,7 @@ fn packDirectoryAuto(
     };
 
     var pool: std.Thread.Pool = undefined;
-    try pool.init(.{ .allocator = root, .n_jobs = null });
+    try pool.init(.{ .allocator = root, .n_jobs = @as(u32, @intCast(container.recommendedThreads())) });
     defer pool.deinit();
 
     var wg = std.Thread.WaitGroup{};
@@ -3958,7 +4042,7 @@ pub fn packTarFullAbi(
             }
         };
         var pool: std.Thread.Pool = undefined;
-        try pool.init(.{ .allocator = root, .n_jobs = null });
+        try pool.init(.{ .allocator = root, .n_jobs = @as(u32, @intCast(container.recommendedThreads())) });
         defer pool.deinit();
         var wg = std.Thread.WaitGroup{};
         for (jobs.items, 0..) |rel, i| {
@@ -4036,7 +4120,7 @@ pub fn packTarFullAbi(
         const hit = hits[ji] orelse continue;
         switch (hit.comp_type) {
             .math_bytecode => try cb.addMath(rel, hit.payload, hit.size, hit.csum),
-            .math_filtered, .math_columnar, .math_image2d, .math_audio => {
+            .math_filtered, .math_columnar, .math_image2d, .math_audio, .math_float => {
                 var fat = container.FatEntry{
                     .comp_type = hit.comp_type,
                     .data_offset = 0,
@@ -4129,10 +4213,22 @@ pub fn packTarFullAbi(
         //  - x86 code -> BCJ2 with CM main stream (allow_cm=true): the 4-stream
         //    filter + context-mixing the de-addressed code beats 7-Zip.
         //  - everything else -> whole-tar CM (beats LZMA on text by ~15%).
-        // CM is ~0.2-0.4 MB/s, so it's full/cold only and size-capped. The
-        // keep-smaller guard means neither ever loses to plain LZMA.
+        // CM is ~0.2-0.4 MB/s, so it's full/cold only — speed is irrelevant for
+        // cold storage, so the only real ceiling is RAM. The keep-smaller guard
+        // means it can never lose to plain LZMA, so the only cost of trying it is
+        // time + memory.
+        //
+        // The cap is a MEMORY bound, not a speed one. cm.compress holds the whole
+        // input in one buffer (~1× input) plus ~190 MB of fixed model tables, and
+        // the solid tar is already resident (~1× input), so peak ≈ 2× input +
+        // 190 MB. A 1.5 GiB cap ⇒ ~3.2 GB peak for CM, safe alongside the BT4
+        // optlzma encoder (run sequentially, so peak is max() not sum). This lifts
+        // the old 96 MiB cap that silently denied CM to any large tar — e.g. a
+        // ~961 MB game pak or a 100 MB+ text corpus got no CM at all. Inputs past
+        // this need a blocked/streaming CM rewrite (tracked as future work) to keep
+        // the whole-input buffer from dominating RAM.
         const cm = @import("cm.zig");
-        const CM_CAP: u64 = 96 * 1024 * 1024;
+        const CM_CAP: u64 = 1536 * 1024 * 1024;
         const is_code = looksLikeX86(tar_data);
         const bcj2_block: ?[]u8 = if (effort_tier == 2 and is_code and tsize <= CM_CAP)
             (container.buildBcj2Block(tar_data, preset, true, root) catch null)

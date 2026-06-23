@@ -51,6 +51,11 @@ const vm_mod = @import("vm.zig");
 const bcj2 = @import("bcj2.zig");
 const cm = @import("cm.zig");
 const lzma_enc = @import("lzma_enc.zig");
+/// Shared worker-thread budget (3/4 of CPUs, MATHPRESSOR_THREADS override) — one
+/// rule for every parallel site (chunk compression here, the file-level pools in
+/// main.zig, the full-mode optlzma pool). Defined in lzma_enc; re-exported here so
+/// callers that already import container don't need a second import.
+pub const recommendedThreads = lzma_enc.recommendedThreads;
 const x64 = @import("x64.zig");
 
 // ---------------------------------------------------------------------------
@@ -148,12 +153,42 @@ pub const CompressionType = enum(u8) {
     math_optlzma    = 0x10, // our pure-Zig multi-state LZMA (.lzma stream); beats 7-Zip
                             // on opaque data (cold/full mode; slow encode, fast decode).
     math_optlzma_chunked = 0x11, // multi-state LZMA over parallel chunks (large cold tars).
+    math_float      = 0x12, // float/numeric predictor: monotonic-int map + delta + byte-plane.
+                            // Beats zstd/xz on smooth/monotonic binary float & int arrays
+                            // (sensor/telemetry/scientific/time-series) — net-new ground.
 };
 
 /// Uncompressed bytes per chunk for `math_chunked` entries. 4 MiB balances ratio
 /// (window reset per chunk costs a little) against random-access granularity (a
 /// single read decodes 4 MiB, ~ms, instead of the whole multi-hundred-MB file).
 pub const CHUNK_USIZE: u32 = 4 * 1024 * 1024;
+
+/// Flag bit OR'd into a chunked block's first word (the `chunk_usize` field) to
+/// mark that a trained zstd dictionary follows the index. Chunk sizes never get
+/// near 2 GiB, so the top bit is always free. Old archives have it clear ⇒ no
+/// dict ⇒ the original layout; new dict archives set it. This keeps both shapes
+/// under one comp_type (`.math_chunked`) instead of forking the enum.
+pub const CHUNK_FLAG_DICT: u32 = 0x8000_0000;
+
+/// A chunked file's per-frame window resets every 4 MiB, so redundancy that
+/// repeats across chunks (shaders/meshes/strings in a game pak) can't be matched
+/// — this is most of the ~13% the chunked archive gives up vs whole-file zstd.
+/// Building one small dictionary from a sample of the file's own content and
+/// priming every frame with it recovers cross-chunk sharing WITHOUT a solid
+/// block: each frame still decodes on its own, so the file stays live.
+///
+/// The dictionary is RAW sampled content (windows concatenated), not a ZDICT
+/// trained dict. Measured: on a chunk that shares a 256 KiB region with others,
+/// a trained dict recovered ~42 KB while the raw content recovered ~262 KB —
+/// ZDICT optimises entropy tables + small common segments for many-tiny-files,
+/// whereas what a chunked pak needs is large repeated regions present verbatim
+/// in the dict so zstd can match them. So we hand zstd raw bytes to match.
+/// These tune that sampler; final values were picked by benchmarking the pak.
+const DICT_MIN_CHUNKS: u32 = 4; // <4 chunks: too little cross-chunk reuse to bother
+const DICT_CAP: usize = 512 * 1024; // dict size (raw content), stored once per file
+const DICT_SAMPLE_WIN: usize = 64 * 1024; // bytes per sample site (DICT_CAP/win = #sites)
+const DICT_PROBE_CHUNKS: u32 = 6; // full chunks compressed both ways to decide use
+const DICT_PROBE_MARGIN: u64 = 2; // dict must save ≥ MARGIN× its stored size to be used
 
 /// Per-entry compression codec (FAT byte 245). gzip = 0 is the legacy default,
 /// so archives written before this byte existed decode correctly.
@@ -813,13 +848,35 @@ pub const StreamingBuilder = struct {
         }
 
         const num_chunks: u32 = @intCast((size + CHUNK_USIZE - 1) / CHUNK_USIZE);
-        const header_bytes: u64 = 8 + @as(u64, num_chunks) * 4;
+
+        // Train a per-file shared dictionary so each independent 4 MiB frame can
+        // still reference redundancy that repeats ACROSS chunks — recovering most
+        // of the cross-chunk loss while keeping every frame self-decodable (live).
+        // Only adopted when a probe shows it actually pays; otherwise this is byte
+        // for byte the old plain-zstd path (dict == null below).
+        var dict: ?[]u8 = null;
+        defer if (dict) |d| a.free(d);
+        if (num_chunks >= DICT_MIN_CHUNKS) {
+            if (buildChunkDict(file, size, a) catch null) |d| {
+                if (probeDictWorthwhile(file, size, num_chunks, d, self.comp.zstd_level, a) catch false) {
+                    dict = d;
+                } else a.free(d);
+            }
+        }
+        const use_dict = dict != null;
+        const dict_len: u32 = if (use_dict) @intCast(dict.?.len) else 0;
+
+        const head_words: u64 = if (use_dict) 12 else 8; // +4 for the dict_len word
+        const header_bytes: u64 = head_words + @as(u64, num_chunks) * 4 + dict_len;
         const block_offset = self.data_cursor;
 
-        // Header: chunk_usize, num_chunks, then a placeholder index we backfill.
+        // Header: chunk_usize(+dict flag), num_chunks, [dict_len], placeholder
+        // index (backfilled), then [dict bytes]. Chunk frames follow.
         try self.tmp_file.seekTo(block_offset);
-        try self.tmp_file.writer().writeInt(u32, CHUNK_USIZE, .little);
+        const word0: u32 = if (use_dict) (CHUNK_USIZE | CHUNK_FLAG_DICT) else CHUNK_USIZE;
+        try self.tmp_file.writer().writeInt(u32, word0, .little);
         try self.tmp_file.writer().writeInt(u32, num_chunks, .little);
+        if (use_dict) try self.tmp_file.writer().writeInt(u32, dict_len, .little);
         const sizes = try a.alloc(u32, num_chunks);
         defer a.free(sizes);
         @memset(sizes, 0);
@@ -830,32 +887,74 @@ pub const StreamingBuilder = struct {
             @memset(zeros, 0);
             try self.tmp_file.writeAll(zeros);
         }
+        if (use_dict) try self.tmp_file.writeAll(dict.?);
 
-        // Pass 2 — compress each chunk independently, writing it out + recording
-        // its stored size (top bit set ⇒ stored raw because zstd would inflate).
+        // Pass 2 — compress chunks in PARALLEL (dict-primed when chosen). They're
+        // independent by design, so this is embarrassingly parallel; the old serial
+        // loop pinned a whole large file to ONE core — a single 961 MB pak then used
+        // ~1 of 12 cores while the rest sat idle, losing to multi-threaded 7-Zip on
+        // speed even though zstd is the faster codec. Work in batches of `nthreads`
+        // so peak memory stays bounded (~nthreads × 4 MiB) regardless of file size,
+        // and write each batch back in chunk order so the on-disk layout is unchanged.
+        const nthreads: usize = @max(@as(usize, 1), @min(lzma_enc.recommendedThreads(), @as(usize, num_chunks)));
+        const ta = std.heap.page_allocator; // thread-safe; owns the parallel chunk outputs
+        const csem = chunkSem(); // shared cap on total concurrent compressions
+
+        const batch_in = try a.alloc(u8, nthreads * CHUNK_USIZE);
+        defer a.free(batch_in);
+        const tasks = try a.alloc(ChunkCompressTask, nthreads);
+        defer a.free(tasks);
+        const threads = try a.alloc(std.Thread, nthreads);
+        defer a.free(threads);
+
         try file.seekTo(0);
         var data_written: u64 = 0;
-        var i: u32 = 0;
-        while (i < num_chunks) : (i += 1) {
-            const want: usize = @intCast(@min(@as(u64, CHUNK_USIZE), size - @as(u64, i) * CHUNK_USIZE));
-            var got: usize = 0;
-            while (got < want) {
-                const n = try file.read(in_buf[got..want]);
-                if (n == 0) break;
-                got += n;
+        var base: u32 = 0;
+        while (base < num_chunks) {
+            const n: usize = @min(nthreads, @as(usize, num_chunks - base));
+            // Read this batch's chunks into per-task buffers (sequential, cheap).
+            for (0..n) |t| {
+                const ci: u32 = base + @as(u32, @intCast(t));
+                const want: usize = @intCast(@min(@as(u64, CHUNK_USIZE), size - @as(u64, ci) * CHUNK_USIZE));
+                const buf = batch_in[t * CHUNK_USIZE ..][0..want];
+                var got: usize = 0;
+                while (got < want) {
+                    const rd = try file.read(buf[got..]);
+                    if (rd == 0) break;
+                    got += rd;
+                }
+                tasks[t] = .{
+                    .input = buf[0..got],
+                    .dict = if (use_dict) dict.? else null,
+                    .level = self.comp.zstd_level,
+                    .a = ta,
+                    .sem = csem,
+                };
             }
-            const chunk = in_buf[0..got];
-            const comp = try zstdCompress(chunk, a, self.comp.zstd_level);
-            defer a.free(comp);
-            if (comp.len < chunk.len) {
-                try self.tmp_file.writeAll(comp);
-                sizes[i] = @intCast(comp.len);
-                data_written += comp.len;
-            } else {
-                try self.tmp_file.writeAll(chunk); // incompressible chunk → raw
-                sizes[i] = @as(u32, @intCast(chunk.len)) | 0x8000_0000;
-                data_written += chunk.len;
+            // Compress the batch concurrently, then join.
+            for (0..n) |t| threads[t] = try std.Thread.spawn(.{}, ChunkCompressTask.run, .{&tasks[t]});
+            for (0..n) |t| threads[t].join();
+            // Surface any worker error (freeing the siblings that succeeded first).
+            for (0..n) |t| if (tasks[t].err) |e| {
+                for (0..n) |u| if (tasks[u].out.len > 0) ta.free(tasks[u].out);
+                return e;
+            };
+            // Write results back in chunk order — byte-identical layout to the
+            // serial path (top bit of the stored size ⇒ chunk stored raw).
+            for (0..n) |t| {
+                const ci = base + @as(u32, @intCast(t));
+                if (tasks[t].is_raw) {
+                    try self.tmp_file.writeAll(tasks[t].input); // input still live this batch
+                    sizes[ci] = @as(u32, @intCast(tasks[t].input.len)) | 0x8000_0000;
+                    data_written += tasks[t].input.len;
+                } else {
+                    try self.tmp_file.writeAll(tasks[t].out);
+                    sizes[ci] = @intCast(tasks[t].out.len);
+                    data_written += tasks[t].out.len;
+                    ta.free(tasks[t].out);
+                }
             }
+            base += @intCast(n);
         }
 
         const stored = header_bytes + data_written;
@@ -885,8 +984,9 @@ pub const StreamingBuilder = struct {
             return .{ .comp_type = .store, .stored_size = @intCast(written), .guard_fired = true, .gzip_would_have_been = @intCast(written) };
         }
 
-        // Backfill the chunk-size index, then continue at end-of-block.
-        try self.tmp_file.seekTo(block_offset + 8);
+        // Backfill the chunk-size index (which sits right after the head words,
+        // before the dict region), then continue at end-of-block.
+        try self.tmp_file.seekTo(block_offset + head_words);
         for (sizes) |s| try self.tmp_file.writer().writeInt(u32, s, .little);
         try self.tmp_file.seekTo(block_offset + stored);
 
@@ -1605,6 +1705,7 @@ pub const Reader = struct {
                 break :blk zstdDecompressUsingDict(block, entry.original_size, self.dicts[entry.solid_index], a);
             },
             .math_audio      => extractAudio(block, entry.original_size, entry.codec, a),
+            .math_float      => extractFloat(block, entry.original_size, entry.codec, a),
             .math_chunked    => extractChunked(block, entry.original_size, a),
             .math_bcj2       => extractBcj2(block, entry.original_size, a),
             .math_cm         => cm.decompress(block, @intCast(entry.original_size), a),
@@ -1643,7 +1744,8 @@ pub const Reader = struct {
         if (entry.comp_type != .math_chunked) return 0;
         const block = self.data_region[entry.data_offset..][0..entry.compressed_size];
         if (block.len < 8) return 0;
-        return std.mem.readInt(u32, block[0..4], .little);
+        // Mask off the dict flag — callers map byte offsets via off/chunk_usize.
+        return std.mem.readInt(u32, block[0..4], .little) & ~CHUNK_FLAG_DICT;
     }
 
     /// Decode a single chunk of a `math_chunked` entry into a fresh buffer. This
@@ -1654,14 +1756,26 @@ pub const Reader = struct {
         if (entry.comp_type != .math_chunked) return error.NotChunked;
         const block = self.data_region[entry.data_offset..][0..entry.compressed_size];
         if (block.len < 8) return error.TruncatedContainer;
-        const chunk_usize = std.mem.readInt(u32, block[0..4], .little);
+        const word0 = std.mem.readInt(u32, block[0..4], .little);
+        const has_dict = (word0 & CHUNK_FLAG_DICT) != 0;
+        const chunk_usize = word0 & ~CHUNK_FLAG_DICT;
         const num_chunks = std.mem.readInt(u32, block[4..8], .little);
         if (chunk_index >= num_chunks) return error.SolidIndexOutOfRange;
 
+        // Layout: [word0][num_chunks]([dict_len])[index][(dict)][frames]. The dict
+        // (when present) primes every frame so cross-chunk matches survive.
+        const head_words: usize = if (has_dict) 12 else 8;
+        var dict_len: usize = 0;
+        if (has_dict) {
+            if (block.len < 12) return error.TruncatedContainer;
+            dict_len = std.mem.readInt(u32, block[8..12], .little);
+        }
         // Walk the index to this chunk's compressed offset + stored size.
-        const index_off: usize = 8;
-        const data_off: usize = 8 + @as(usize, num_chunks) * 4;
+        const index_off: usize = head_words;
+        const dict_off: usize = head_words + @as(usize, num_chunks) * 4;
+        const data_off: usize = dict_off + dict_len;
         if (block.len < data_off) return error.TruncatedContainer;
+        const dict: []const u8 = if (has_dict) block[dict_off..][0..dict_len] else &[_]u8{};
         var comp_off: usize = data_off;
         var i: u32 = 0;
         var stored_raw: u32 = 0;
@@ -1690,7 +1804,10 @@ pub const Reader = struct {
             @memcpy(out, frame[0..this_usize]);
             return out;
         }
-        return zstdDecompress(frame, this_usize, a);
+        return if (has_dict)
+            zstdDecompressUsingDict(frame, this_usize, dict, a)
+        else
+            zstdDecompress(frame, this_usize, a);
     }
 };
 
@@ -1721,11 +1838,21 @@ fn extractMath(bytecode: []const u8, original_size: u64, a: std.mem.Allocator) !
 /// (unpack/verify); the live VFS uses `Reader.readChunk` for partial reads.
 fn extractChunked(block: []const u8, original_size: u64, a: std.mem.Allocator) ![]u8 {
     if (block.len < 8) return error.TruncatedContainer;
-    const chunk_usize = std.mem.readInt(u32, block[0..4], .little);
+    const word0 = std.mem.readInt(u32, block[0..4], .little);
+    const has_dict = (word0 & CHUNK_FLAG_DICT) != 0;
+    const chunk_usize = word0 & ~CHUNK_FLAG_DICT;
     const num_chunks = std.mem.readInt(u32, block[4..8], .little);
-    const index_off: usize = 8;
-    const data_off: usize = 8 + @as(usize, num_chunks) * 4;
+    const head_words: usize = if (has_dict) 12 else 8;
+    var dict_len: usize = 0;
+    if (has_dict) {
+        if (block.len < 12) return error.TruncatedContainer;
+        dict_len = std.mem.readInt(u32, block[8..12], .little);
+    }
+    const index_off: usize = head_words;
+    const dict_off: usize = head_words + @as(usize, num_chunks) * 4;
+    const data_off: usize = dict_off + dict_len;
     if (block.len < data_off) return error.TruncatedContainer;
+    const dict: []const u8 = if (has_dict) block[dict_off..][0..dict_len] else &[_]u8{};
 
     const out = try a.alloc(u8, @intCast(original_size));
     errdefer a.free(out);
@@ -1744,7 +1871,10 @@ fn extractChunked(block: []const u8, original_size: u64, a: std.mem.Allocator) !
             if (frame.len < this_usize) return error.TruncatedContainer;
             @memcpy(out[@intCast(written)..][0..this_usize], frame[0..this_usize]);
         } else {
-            const dec = try zstdDecompress(frame, this_usize, a);
+            const dec = if (has_dict)
+                try zstdDecompressUsingDict(frame, this_usize, dict, a)
+            else
+                try zstdDecompress(frame, this_usize, a);
             defer a.free(dec);
             @memcpy(out[@intCast(written)..][0..this_usize], dec);
         }
@@ -2107,6 +2237,206 @@ test "columnar transform is an exact involution" {
     const back = try columnarInverse(fwd, stride, a);
     defer a.free(back);
     try testing.expectEqualSlices(u8, data, back);
+}
+
+// ---------------------------------------------------------------------------
+// Float / numeric predictor (math_float)
+//
+// Statistical compressors (zstd/xz/7-Zip) find repeated *substrings*. A binary
+// array of floats/ints has none — its redundancy is that consecutive values are
+// *close*, not equal. This transform exposes that:
+//   1. (optional) map each IEEE float's bits to a sort-order-preserving integer,
+//      so "near in value" ⇒ "near as an integer" across sign/exponent boundaries.
+//   2. delta-code the (mapped) integers — smooth/monotonic data ⇒ tiny residuals.
+//   3. byte-plane the residuals (all byte-0s, then all byte-1s, …) so the
+//      high-order zero bytes of small residuals form long zero runs the codec
+//      crushes. (This is the same trick the columnar codec stumbles into, made
+//      deliberate + combined with delta — much stronger on monotonic data.)
+// Exact + reversible. This is net-new ground vs general compressors, which have
+// no value-domain predictor, only 1D byte delta. The subtraction wraps at the
+// element width so it's a clean bijection.
+// ---------------------------------------------------------------------------
+
+fn floatKeyMap(raw: u64, width: u8) u64 {
+    if (width == 4) {
+        const b: u32 = @truncate(raw);
+        const mask: u32 = (@as(u32, 0) -% (b >> 31)) | 0x8000_0000;
+        return b ^ mask;
+    }
+    const mask: u64 = (@as(u64, 0) -% (raw >> 63)) | 0x8000_0000_0000_0000;
+    return raw ^ mask;
+}
+
+fn floatKeyUnmap(key: u64, width: u8) u64 {
+    if (width == 4) {
+        const k: u32 = @truncate(key);
+        const mask: u32 = ((k >> 31) -% 1) | 0x8000_0000;
+        return k ^ mask;
+    }
+    const mask: u64 = ((key >> 63) -% 1) | 0x8000_0000_0000_0000;
+    return key ^ mask;
+}
+
+/// True when a 2D Lorenzo prediction is well-defined for `n` elements at the
+/// given row width. Encode and decode MUST agree on this, so it's one function.
+fn lorenzoActive(pred2d: bool, n: usize, row_width: u32) bool {
+    return pred2d and row_width >= 2 and n % row_width == 0 and n / row_width >= 2;
+}
+
+/// Read element `i` (`width` bytes, little-endian) and map it to a key.
+fn numKey(data: []const u8, i: usize, width: u8, use_map: bool) u64 {
+    const raw: u64 = if (width == 4)
+        std.mem.readInt(u32, data[i * 4 ..][0..4], .little)
+    else
+        std.mem.readInt(u64, data[i * 8 ..][0..8], .little);
+    return if (use_map) floatKeyMap(raw, width) else raw;
+}
+
+/// Forward transform → byte-planed residual stream (same length as `data`).
+/// `width` ∈ {4,8}, `data.len` a multiple of it (caller guarantees). With
+/// `pred2d`, predicts each cell from the **2D Lorenzo** stencil (left + up −
+/// up-left) over a `row_width`-wide grid — the value-domain predictor zstd/xz
+/// lack, strong on smooth fields; otherwise a 1D delta. Subtraction wraps at the
+/// element width, so it's an exact bijection.
+pub fn numericForward(data: []const u8, width: u8, use_map: bool, pred2d: bool, row_width: u32, a: std.mem.Allocator) ![]u8 {
+    const n = data.len / width;
+    const wmask: u64 = if (width == 4) 0xFFFF_FFFF else 0xFFFF_FFFF_FFFF_FFFF;
+    const keys = try a.alloc(u64, n);
+    defer a.free(keys);
+    for (0..n) |i| keys[i] = numKey(data, i, width, use_map);
+
+    const out = try a.alloc(u8, data.len);
+    const plane = struct {
+        fn put(o: []u8, nn: usize, w: u8, idx: usize, res: u64) void {
+            var j: usize = 0;
+            while (j < w) : (j += 1) o[j * nn + idx] = @truncate(res >> @intCast(8 * j));
+        }
+    };
+    if (lorenzoActive(pred2d, n, row_width)) {
+        const W: usize = row_width;
+        const R: usize = n / W;
+        for (0..R) |r| {
+            for (0..W) |c| {
+                const idx = r * W + c;
+                var p: u64 = 0;
+                if (r > 0 and c > 0) p = (keys[idx - W] +% keys[idx - 1] -% keys[idx - W - 1]) & wmask
+                else if (r > 0) p = keys[idx - W]
+                else if (c > 0) p = keys[idx - 1];
+                plane.put(out, n, width, idx, (keys[idx] -% p) & wmask);
+            }
+        }
+    } else {
+        var prev: u64 = 0;
+        for (0..n) |i| {
+            plane.put(out, n, width, i, (keys[i] -% prev) & wmask);
+            prev = keys[i];
+        }
+    }
+    return out;
+}
+
+/// Inverse of `numericForward`. `res.len` a multiple of `width`.
+pub fn numericInverse(res: []const u8, width: u8, use_map: bool, pred2d: bool, row_width: u32, a: std.mem.Allocator) ![]u8 {
+    const n = res.len / width;
+    const wmask: u64 = if (width == 4) 0xFFFF_FFFF else 0xFFFF_FFFF_FFFF_FFFF;
+    const keys = try a.alloc(u64, n);
+    defer a.free(keys);
+    const unplane = struct {
+        fn get(rr: []const u8, nn: usize, w: u8, idx: usize) u64 {
+            var d: u64 = 0;
+            var j: usize = 0;
+            while (j < w) : (j += 1) d |= @as(u64, rr[j * nn + idx]) << @intCast(8 * j);
+            return d;
+        }
+    };
+    if (lorenzoActive(pred2d, n, row_width)) {
+        const W: usize = row_width;
+        const R: usize = n / W;
+        for (0..R) |r| {
+            for (0..W) |c| {
+                const idx = r * W + c;
+                var p: u64 = 0;
+                if (r > 0 and c > 0) p = (keys[idx - W] +% keys[idx - 1] -% keys[idx - W - 1]) & wmask
+                else if (r > 0) p = keys[idx - W]
+                else if (c > 0) p = keys[idx - 1];
+                keys[idx] = (p +% unplane.get(res, n, width, idx)) & wmask;
+            }
+        }
+    } else {
+        var prev: u64 = 0;
+        for (0..n) |i| {
+            keys[i] = (prev +% unplane.get(res, n, width, i)) & wmask;
+            prev = keys[i];
+        }
+    }
+
+    const out = try a.alloc(u8, res.len);
+    for (0..n) |i| {
+        const raw: u64 = if (use_map) floatKeyUnmap(keys[i], width) else keys[i];
+        if (width == 4)
+            std.mem.writeInt(u32, out[i * 4 ..][0..4], @truncate(raw), .little)
+        else
+            std.mem.writeInt(u64, out[i * 8 ..][0..8], raw, .little);
+    }
+    return out;
+}
+
+/// Decode a `math_float` block: `[u8 width][u8 mode][u32 row_width][compressed
+/// residual]`. mode bit0 = monotonic-int map, bit1 = 2D Lorenzo.
+fn extractFloat(block: []const u8, original_size: u64, codec: Codec, a: std.mem.Allocator) ![]u8 {
+    if (block.len < 6) return error.TruncatedContainer;
+    const width = block[0];
+    const use_map = (block[1] & 1) != 0;
+    const pred2d = (block[1] & 2) != 0;
+    const row_width = std.mem.readInt(u32, block[2..6], .little);
+    if ((width != 4 and width != 8) or original_size % width != 0) return error.TruncatedContainer;
+    const res = try inflateBlock(block[6..], original_size, codec, a);
+    defer a.free(res);
+    if (res.len != original_size) return error.SizeMismatch;
+    return numericInverse(res, width, use_map, pred2d, row_width, a);
+}
+
+test "numeric predictor is an exact involution (1D + 2D Lorenzo, f32/f64, mapped + raw)" {
+    const a = testing.allocator;
+    var rng = @import("math_gen.zig").XorShift32.init(0xF10A);
+    // A smooth f32 grid, a monotonic-ish f64 series, and adversarial random bytes.
+    const f32buf = try a.alloc(u8, 4000 * 4);
+    defer a.free(f32buf);
+    var v: f32 = -123.5;
+    for (0..4000) |k| {
+        v += @as(f32, @floatFromInt(@as(i8, @bitCast(rng.nextByte())))) * 0.01;
+        std.mem.writeInt(u32, f32buf[k * 4 ..][0..4], @bitCast(v), .little);
+    }
+    const f64buf = try a.alloc(u8, 3000 * 8);
+    defer a.free(f64buf);
+    var d: f64 = 1000.0;
+    for (0..3000) |k| {
+        d += 0.25 + @as(f64, @floatFromInt(rng.nextByte())) * 0.001;
+        std.mem.writeInt(u64, f64buf[k * 8 ..][0..8], @bitCast(d), .little);
+    }
+    const rand = try a.alloc(u8, 4096);
+    defer a.free(rand);
+    for (rand) |*p| p.* = rng.nextByte();
+
+    const Case = struct { buf: []const u8, w: u8, rw: u32 };
+    const cases = [_]Case{
+        .{ .buf = f32buf, .w = 4, .rw = 80 }, // 80×50 grid
+        .{ .buf = f64buf, .w = 8, .rw = 60 }, // 60×50 grid
+        .{ .buf = rand, .w = 4, .rw = 64 }, // 64×16
+        .{ .buf = rand, .w = 8, .rw = 32 }, // 32×16
+    };
+    for (cases) |tc| {
+        for ([_]bool{ true, false }) |use_map| {
+            for ([_]bool{ false, true }) |pred2d| {
+                const fwd = try numericForward(tc.buf, tc.w, use_map, pred2d, tc.rw, a);
+                defer a.free(fwd);
+                try testing.expectEqual(tc.buf.len, fwd.len);
+                const back = try numericInverse(fwd, tc.w, use_map, pred2d, tc.rw, a);
+                defer a.free(back);
+                try testing.expectEqualSlices(u8, tc.buf, back);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2656,6 +2986,147 @@ pub fn trainDict(
     return try a.realloc(buf, n);
 }
 
+/// Caps how many chunk compressions run at once across the WHOLE pack (every
+/// file shares this). Large files compress their chunks in parallel, and the
+/// pack also runs files in parallel — without a shared cap, that product could
+/// spawn cpu² concurrent zstd contexts (e.g. a game with 20 big paks) and exhaust
+/// RAM. Lazily sized to the core count on first use.
+var g_chunk_sem = std.Thread.Semaphore{ .permits = 0 };
+var g_chunk_sem_once = std.once(initChunkSem);
+fn initChunkSem() void {
+    g_chunk_sem.permits = lzma_enc.recommendedThreads();
+}
+fn chunkSem() *std.Thread.Semaphore {
+    g_chunk_sem_once.call();
+    return &g_chunk_sem;
+}
+
+/// One chunk's compression job, run on a worker thread. The chunks of a
+/// `math_chunked` file are independent (that's what makes the format seekable),
+/// so compressing them is embarrassingly parallel — the serial loop used to pin a
+/// whole large file to a single core. Allocates its output from a thread-safe
+/// allocator (zstd is thread-safe; the page allocator is too); the caller writes
+/// the outputs back in chunk order and frees them. `out.len == 0` with `is_raw`
+/// means "store the input verbatim" (zstd would have inflated it) — the caller
+/// already holds the input bytes, so no copy is made here. A shared semaphore
+/// bounds the global count of concurrent compressions (and thus zstd contexts).
+const ChunkCompressTask = struct {
+    input: []const u8,
+    dict: ?[]const u8,
+    level: c_int,
+    a: std.mem.Allocator,
+    sem: *std.Thread.Semaphore,
+    out: []u8 = &[_]u8{},
+    is_raw: bool = false,
+    err: ?anyerror = null,
+
+    fn run(self: *ChunkCompressTask) void {
+        self.sem.wait(); // bound global concurrency (memory) — hold only over compress
+        const comp = (if (self.dict) |d|
+            zstdCompressUsingDict(self.input, d, self.level, self.a)
+        else
+            zstdCompress(self.input, self.a, self.level)) catch |e| {
+            self.sem.post();
+            self.err = e;
+            return;
+        };
+        self.sem.post();
+        if (comp.len < self.input.len) {
+            self.out = comp;
+        } else {
+            self.a.free(comp); // would inflate → caller stores the raw input
+            self.is_raw = true;
+        }
+    }
+};
+
+/// Build a raw content dictionary by concatenating fixed-size windows read at
+/// evenly-spaced sites across `file`, so the dictionary holds verbatim samples of
+/// the file's own content from end to end. Priming a `math_chunked` frame with it
+/// lets zstd match that frame against content from anywhere else in the file —
+/// recovering cross-chunk redundancy while each frame still decodes standalone.
+/// Returns null when the file is too small to sample.
+fn buildChunkDict(file: std.fs.File, size: u64, a: std.mem.Allocator) !?[]u8 {
+    const win: usize = @intCast(@min(@as(u64, DICT_SAMPLE_WIN), size));
+    if (win == 0) return null;
+    const fit: usize = @intCast(@max(@as(u64, 1), size / win));
+    const nsites: usize = @min(@max(@as(usize, 1), DICT_CAP / win), fit);
+    if (nsites == 0) return null;
+
+    const dict = try a.alloc(u8, win * nsites);
+    errdefer a.free(dict);
+    const span: u64 = size - win; // last valid sample start offset
+    var got: usize = 0; // bytes actually gathered
+    var i: usize = 0;
+    while (i < nsites) : (i += 1) {
+        const off: u64 = if (nsites == 1) 0 else (span * @as(u64, i)) / @as(u64, nsites - 1);
+        try file.seekTo(off);
+        var read: usize = 0;
+        while (read < win) {
+            const n = try file.read(dict[got + read .. got + win]);
+            if (n == 0) break;
+            read += n;
+        }
+        if (read == win) got += win;
+    }
+    if (got == 0) {
+        a.free(dict);
+        return null;
+    }
+    return if (got < dict.len) try a.realloc(dict, got) else dict;
+}
+
+/// Decide whether priming a `math_chunked` file's frames with `dict` actually
+/// pays its keep. Compresses a handful of full chunks both ways (plain vs
+/// dict-primed), extrapolates the per-chunk saving across the whole file, and
+/// requires it to clear the dict's stored cost by `DICT_PROBE_MARGIN`× — the
+/// margin absorbs the dict's optimistic bias toward its own training samples, and
+/// a wrong "yes" only ever costs the dict's size (~`DICT_CAP`). Returns false if
+/// the dict never helps, so the caller stays on the plain path.
+fn probeDictWorthwhile(
+    file: std.fs.File,
+    size: u64,
+    num_chunks: u32,
+    dict: []const u8,
+    level: c_int,
+    a: std.mem.Allocator,
+) !bool {
+    const nprobe: u32 = @min(DICT_PROBE_CHUNKS, num_chunks);
+    if (nprobe == 0) return false;
+    const buf = try a.alloc(u8, CHUNK_USIZE);
+    defer a.free(buf);
+
+    var plain_sum: u64 = 0;
+    var dict_sum: u64 = 0;
+    var probed: u32 = 0;
+    var i: u32 = 0;
+    while (i < nprobe) : (i += 1) {
+        const ci: u64 = if (nprobe == 1) 0 else (@as(u64, num_chunks - 1) * @as(u64, i)) / @as(u64, nprobe - 1);
+        const off: u64 = ci * CHUNK_USIZE;
+        const want: usize = @intCast(@min(@as(u64, CHUNK_USIZE), size - off));
+        try file.seekTo(off);
+        var got: usize = 0;
+        while (got < want) {
+            const n = try file.read(buf[got..want]);
+            if (n == 0) break;
+            got += n;
+        }
+        if (got != want) continue;
+        const chunk = buf[0..got];
+        const p = try zstdCompress(chunk, a, level);
+        defer a.free(p);
+        const d = try zstdCompressUsingDict(chunk, dict, level, a);
+        defer a.free(d);
+        plain_sum += p.len;
+        dict_sum += d.len;
+        probed += 1;
+    }
+    if (probed == 0 or dict_sum >= plain_sum) return false;
+    const saved_per_chunk = (plain_sum - dict_sum) / probed;
+    const projected = saved_per_chunk * @as(u64, num_chunks);
+    return projected > @as(u64, dict.len) * DICT_PROBE_MARGIN;
+}
+
 // ---------------------------------------------------------------------------
 // LZMA / xz backend (liblzma) — stronger model than zstd (range coder +
 // adaptive bit-contexts + match model). Used by full mode where the extra
@@ -3157,6 +3628,129 @@ test "trained dict: train, dict-compress, round-trip via container" {
         defer a.free(back);
         try testing.expectEqualSlices(u8, s, back);
     }
+}
+
+test "chunked dict: large redundant file round-trips via extract + readChunk" {
+    const a = testing.allocator;
+
+    // Build a multi-chunk file with heavy cross-chunk redundancy: every 4 MiB
+    // chunk holds the same compressible body (only a 4-byte header differs per
+    // chunk). Per-chunk zstd can't see across the 4 MiB window resets, so it
+    // re-pays for that shared body in every chunk; a per-file content dict that
+    // samples the body lets each frame match it instead. Stand-in for the shared
+    // shaders/strings/meshes that recur throughout a game pak.
+    const nchunks: usize = 8;
+    const total: usize = nchunks * CHUNK_USIZE;
+
+    const Xs = @import("math_gen.zig").XorShift32;
+    var body_rng = Xs.init(0x1234_5678);
+    const body = try a.alloc(u8, CHUNK_USIZE);
+    defer a.free(body);
+    for (body) |*b| b.* = body_rng.nextByte() & 0x1F; // 32-symbol, non-repeating ⇒ compressible, not raw
+
+    const orig = try a.alloc(u8, total);
+    defer a.free(orig);
+    {
+        var c: usize = 0;
+        while (c < nchunks) : (c += 1) {
+            const off = c * CHUNK_USIZE;
+            @memcpy(orig[off..][0..CHUNK_USIZE], body);
+            std.mem.writeInt(u32, orig[off..][0..4], @intCast(c), .little); // per-chunk header
+        }
+    }
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const in = try tmp.dir.createFile("big.bin", .{});
+        defer in.close();
+        try in.writeAll(orig);
+    }
+    const in_ro = try tmp.dir.openFile("big.bin", .{});
+    defer in_ro.close();
+
+    var cb = try StreamingBuilder.init(a);
+    defer cb.deinit();
+    _ = try cb.addChunkedStreamingFile("big.bin", in_ro, total);
+
+    const out = try tmp.dir.createFile("big.math", .{ .read = true });
+    defer out.close();
+    try cb.finish(out);
+    try out.seekTo(0);
+    const bytes = try out.readToEndAlloc(a, 64 * 1024 * 1024);
+    defer a.free(bytes);
+
+    var rdr = try Reader.parse(bytes, a);
+    defer rdr.deinit();
+
+    const entry = &rdr.fat[0];
+    try testing.expectEqual(CompressionType.math_chunked, entry.comp_type);
+
+    // The dict path must have been taken for this strongly cross-chunk-redundant
+    // input — proves the dict was trained, probed, adopted, and stored.
+    const blk = rdr.data_region[entry.data_offset..][0..entry.compressed_size];
+    const w0 = std.mem.readInt(u32, blk[0..4], .little);
+    try testing.expect((w0 & CHUNK_FLAG_DICT) != 0);
+    try testing.expectEqual(CHUNK_USIZE, rdr.chunkUsize(entry)); // flag masked off
+
+    // Full decode (extractChunked) is byte-perfect.
+    const whole = try rdr.extract("big.bin", a);
+    defer a.free(whole);
+    try testing.expectEqualSlices(u8, orig, whole);
+
+    // Per-chunk decode (the live-VFS readChunk path) reassembles byte-perfectly.
+    const num_chunks = std.mem.readInt(u32, blk[4..8], .little);
+    var assembled = std.ArrayList(u8).init(a);
+    defer assembled.deinit();
+    var ci: u32 = 0;
+    while (ci < num_chunks) : (ci += 1) {
+        const cdata = try rdr.readChunk(entry, ci, a);
+        defer a.free(cdata);
+        try assembled.appendSlice(cdata);
+    }
+    try testing.expectEqualSlices(u8, orig, assembled.items);
+}
+
+test "chunked (no dict): few-chunk file stays on the plain path and round-trips" {
+    const a = testing.allocator;
+    const total: usize = 5 * 1024 * 1024; // 2 chunks (< DICT_MIN_CHUNKS) ⇒ dict skipped
+
+    const Xs = @import("math_gen.zig").XorShift32;
+    var rng = Xs.init(0x0BAD_F00D);
+    const orig = try a.alloc(u8, total);
+    defer a.free(orig);
+    for (orig) |*b| b.* = rng.nextByte() & 0x1F; // compressible so zstd path is taken
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const in = try tmp.dir.createFile("s.bin", .{});
+        defer in.close();
+        try in.writeAll(orig);
+    }
+    const in_ro = try tmp.dir.openFile("s.bin", .{});
+    defer in_ro.close();
+
+    var cb = try StreamingBuilder.init(a);
+    defer cb.deinit();
+    _ = try cb.addChunkedStreamingFile("s.bin", in_ro, total);
+    const out = try tmp.dir.createFile("s.math", .{ .read = true });
+    defer out.close();
+    try cb.finish(out);
+    try out.seekTo(0);
+    const bytes = try out.readToEndAlloc(a, 16 * 1024 * 1024);
+    defer a.free(bytes);
+
+    var rdr = try Reader.parse(bytes, a);
+    defer rdr.deinit();
+    const entry = &rdr.fat[0];
+    const blk = rdr.data_region[entry.data_offset..][0..entry.compressed_size];
+    const w0 = std.mem.readInt(u32, blk[0..4], .little);
+    try testing.expect((w0 & CHUNK_FLAG_DICT) == 0); // plain path, unchanged behaviour
+
+    const whole = try rdr.extract("s.bin", a);
+    defer a.free(whole);
+    try testing.expectEqualSlices(u8, orig, whole);
 }
 
 // ---------------------------------------------------------------------------
