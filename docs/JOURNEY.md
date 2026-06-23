@@ -127,3 +127,22 @@ archive (or Steam) can't do: more games in storage, run live, no performance los
 Concurrent *scattered* cold decode scales only ~2× across 12 cores (FUSE request
 dispatch + a single cache lock are the limit, not decode CPU). In-game it's already
 hitch-free; sharding the cache lock could push the worst-case cold burst lower still.
+
+## What came after — the game demo was the wrong headline
+
+The game demo proved the live VFS works. But chasing *more* games revealed the real
+story. **Dead by Daylight** (58 GB) turned out **incompressible by everyone** — 7-Zip,
+xz, zstd, and Mathpressor all get ~1.0×, because modern AAA ships its assets already
+Oodle/IoStore-compressed. The storage win only exists for games (like FPS Chess) that
+shipped *uncompressed* assets — a shrinking target.
+
+So we asked the harder question: where does Mathpressor's *formula/predictor* machinery
+genuinely beat the mainstream tools? The answer, measured, was **binary numerical &
+structured data** — float/int arrays, scientific grids, sensor/telemetry, audio — where
+its value-domain predictors beat zstd *and* xz (a smooth float field 3.16× vs xz 1.32×;
+a monotonic counter 9070× vs 29×; real telemetry columns winning 11/11). That prompted
+building a proper **2D Lorenzo float predictor** (the ZFP/SZ stencil), and the project's
+identity sharpened from "a game compressor that loses to 7-Zip" to "a **live, lossless
+compressor for numerical/structured data** that beats zstd/xz." See
+[`DISCOVERIES.md`](DISCOVERIES.md) §0 and
+[`../bench/STRUCTURED-DATA-RESULTS.md`](../bench/STRUCTURED-DATA-RESULTS.md).

@@ -1,22 +1,67 @@
 # Mathpressor
 
-> **→ In plain English** — Mathpressor squeezes a whole folder (say, a video game) into a much smaller file. But unlike a normal `.zip`, your program can **run directly from the squeezed file** — it unpacks only the bits it needs, the instant it needs them, so nothing ever gets unzipped onto your disk. We squeezed a **1 GB game down to 320 MB and it still ran at full speed**, with no way to tell the difference.
+> **→ In plain English** — Mathpressor is a lossless compressor with a specialty: **numbers**. Give it the kind of data that's made of measurements — scientific simulation grids, sensor/telemetry logs, audio, raw float/int arrays — and it beats the popular tools (zstd, xz, 7-Zip), because it understands that *consecutive values are close, not random*. It also does something a normal `.zip` can't: a program can **run directly from the compressed file**, decoding only the bits it needs. It is **not** a magic shrink-ray for everything — on already-squeezed data like game art, photos, or video, the specialist tools win. (We did run a **1 GB game live off a 320 MB archive at full speed** — a neat trick, but the real, measured edge is on numerical data.)
 >
 > *This README is written two ways at once: the technical text, and an **In plain English** box like this after the jargon-heavy parts. It also flows **shallow → deep** — what it is and how to use it come first; the byte-level internals (opcodes, wire format) are at the bottom. Read whichever you like, scroll as far down as you want.*
 
-A deterministic procedural-asset engine, container format, and **live VFS** — 100% Zig. Mathpressor packs a file tree by routing each asset to whichever is smallest: demoscene-style **procedural synthesis** (store a tiny generator program instead of the pixels), reversible domain transforms (x86 BCJ2/RIP, 2D image predictor, columnar, audio LPC), or a strong general backend (zstd / LZMA / context-mixing). Then a host can **run straight off the compressed archive** — random-access, decode-on-demand, nothing inflated to disk. Ships as a CLI, a desktop GUI, and a `libmathpressor.so` over a plain C-ABI.
+A lossless compression engine, container format, and **live VFS** — 100% Zig. Its measured edge is **binary numerical & structured data**: it routes each file to whichever reversible transform is smallest — a **value-domain predictor** (1D delta / 2D Lorenzo over float & int arrays, the stencil the scientific compressors ZFP/SZ use), **columnar** transpose, **audio LPC**, **2D image** prediction, x86 **BCJ2/RIP** filters, or demoscene **procedural synthesis** — then a strong general backend (zstd / LZMA / context-mixing) or raw storage, always keeping the smallest. The insight: statistical compressors (zstd, xz, 7-Zip) hunt for repeated *byte substrings*; numerical data's redundancy is that values *trend and vary smoothly*, which those tools can't exploit but a predictor can. A host can then **run straight off the compressed archive** — random-access, decode-on-demand, nothing inflated to disk. Ships as a CLI, a desktop GUI, and a `libmathpressor.so` over a plain C-ABI.
 
-Two ends of what that buys: a **26-byte** program expands to a **9,216-pixel** texture (354×, no stored pixels), and a real **1.06 GB Unreal game runs live off a 320 MB archive at native 60 fps** — nothing inflated to disk. Same bits on every CPU architecture.
+Measured, lossless, on a Ryzen 5 5600X: a smooth scientific float field compresses **3.16×** where xz manages 1.32× and zstd 1.11×; real sensor/telemetry columns beat xz on **11/11**; a monotonic counter goes **9070×** vs xz's 29×. And a real **1.06 GB Unreal game runs live off a 320 MB archive at native 60 fps**, nothing inflated to disk. Same bits on every CPU architecture. (See [`bench/STRUCTURED-DATA-RESULTS.md`](bench/STRUCTURED-DATA-RESULTS.md).)
+
+---
+
+## What it's for — and what it's not
+
+Mathpressor isn't trying to beat everything at everything. It has a real, measured
+edge on one kind of data and honestly loses on others — knowing which is which is the
+whole point.
+
+**Built for — data with numerical / predictive structure, in *binary* form** (it beats
+zstd *and* xz here, often by a lot, while staying lossless and live):
+- scientific & simulation arrays — float/double grids and fields;
+- sensor / telemetry / IoT time-series;
+- columnar / tabular *binary* data;
+- audio (PCM);
+- monotonic sequences — timestamps, counters, IDs.
+
+**Not built for** (the specialists win — use them):
+- **games / already-compressed assets** (Oodle/IoStore, Bink video) — incompressible by *everyone* (~1.0×);
+- **authored media** (photos, video) — already encoded;
+- **text** (logs, source, JSON, CSV-as-text) — LZMA/7-Zip's substring modeling wins; a number stored as ASCII hides its structure;
+- **high-entropy data** (random, encrypted, embeddings) — incompressible by everyone.
+
+The keep-smaller guard means Mathpressor **never makes a file bigger** — on "not built
+for" data it simply matches the general backend (zstd/LZMA). The *win* is specifically on
+numerical/structured data; that's the lane. One caveat worth stating up front: the
+numerical predictors need the data in **binary** form — the same telemetry that loses as
+a text CSV wins 9/11 as binary float columns. Full results, including the honest losses
+and the cases that flip on format, are in
+[`bench/STRUCTURED-DATA-RESULTS.md`](bench/STRUCTURED-DATA-RESULTS.md).
 
 ---
 
 ## How It Works
 
-Traditional game compression: `raw pixels → compress → store → decompress → raw pixels`
+The core idea: **don't store the data — store how to reconstruct it.** General
+compressors shrink data by finding repeated byte-strings. Mathpressor adds a second axis
+they lack — *prediction*:
 
-Mathpressor: `bytecode program → VM synthesis → raw pixels`
+- **Predict the next value, store only the (tiny) error.** A float in a smooth field is
+  close to its neighbors; an audio sample is close to the last one; a counter is the
+  previous plus a constant. Predict it and the residual collapses to near-zero runs the
+  codec crushes. This is `MATH_FLOAT`'s 2D Lorenzo, `MATH_AUDIO`'s LPC, `MATH_IMAGE2D`'s
+  MED — the predictors general compressors don't have, and the source of the numerical
+  wins.
+- **Or store a generator instead of the output.** If a texture is something a little
+  math formula can *draw* (clouds, noise, gradients), store the recipe — a few bytes —
+  and re-draw it on demand (`MATH_BYTECODE` / `MATH_RESIDUAL`). Rare on real authored
+  data, but unbeatable when it applies: a **26-byte** program expands to a 9,216-pixel
+  texture.
 
-For assets that can be represented procedurally (noise textures, cave masks, marble veins, etc.), the bytecode program is orders of magnitude smaller than even the best compressed representation. In practice most real-world data *isn't* procedural, so Mathpressor falls back to a strong general backend (zstd / LZMA / context-mixing) plus reversible domain transforms, or raw storage — whichever is smallest. Synthesis is the ideal *live* primitive (near-zero storage, no decompression); the traditional routes carry everything else.
+Most files have neither kind of structure, so Mathpressor falls back to a strong general
+backend (zstd / LZMA / context-mixing) or raw storage — always keeping the smallest, so
+it never inflates a file. The predictors double as the ideal *live* primitive: cheap,
+exact, decode-on-demand.
 
 > **→ In plain English** — Instead of one way to shrink a file, Mathpressor tries several and keeps the smallest. The fanciest trick: if a texture is something a little math formula can *draw* (like clouds or static), it stores the **recipe** (a few bytes) instead of the picture (thousands of bytes) and re-draws it on demand. Most files aren't drawable that way, so for those it uses normal-but-strong compression. It never makes a file bigger — worst case it just stores it as-is.
 
@@ -58,7 +103,8 @@ these (the diagram shows the original four; the table lists them all):
 | `MATH_AUDIO` | `0x0C` | 16-bit PCM WAV | fixed-order LPC (per-channel sample predictor) + compressed |
 | `MATH_BCJ2` | `0x0D` | Full mode's solid tar (x86 code) | 4-stream range-coded BCJ2, each LZMA'd |
 | `MATH_CM` | `0x0E` | Full mode's solid tar (text/general) | context-mixing coder (orders + match + logistic mixer + SSE) |
-| `MATH_CHUNKED` | `0x0F` | Large live files (> 256 MB) | independently zstd-compressed 4 MB chunks + seek index — a read decodes only the covering chunk(s), never the whole file (true live random access) |
+| `MATH_CHUNKED` | `0x0F` | Large live files (> 256 MB) | independently zstd-compressed 4 MB chunks + seek index — a read decodes only the covering chunk(s), never the whole file (true live random access); each chunk optionally primed with a per-file content dictionary so cross-chunk redundancy survives |
+| `MATH_FLOAT` | `0x12` | **Binary float/int arrays** (scientific grids, sensor/telemetry, time-series) | value-domain predictor: map each value to a sort-order-preserving integer → **1D delta or 2D Lorenzo** (left+up−up-left, the ZFP/SZ stencil, with auto-detected row width) → byte-plane the residual → compress. Net-new ground vs zstd/xz, which have no value-domain predictor |
 
 All routes reconstruct to bit-identical original bytes. To the caller, they are invisible.
 
@@ -132,11 +178,15 @@ ratios:
   - **CM** (`MATH_CM`) — a pure-Zig context-mixing coder: indirect context
     models (each context → an 8-bit bit-history *state* → a StateMap), orders
     1..16 from the full history buffer, two match models, an online logistic
-    mixer, SSE, binary arithmetic coding. It beats LZMA by ~15% on text **and**
-    ~6% on de-addressed x86 code, so it's also fed the BCJ2 *main* stream — which
-    is how full mode now beats 7-Zip on binary too (e.g. a 24 MB binary set
-    6.12 MB vs 7-Zip 6.27 MB). CM decode is slow → cold-only, never the live
-    path; regular/live mode keeps the fast LZMA main stream.
+    mixer, SSE, binary arithmetic coding. On text/code it beats every general
+    compressor outright: a 116 MB `/usr/include` corpus packs to **7.05 MB vs
+    7-Zip `-mx9`'s 8.34 MB (−15.4%)** and xz's 8.40 MB — measured, repro in
+    [`bench/CM-UNCAP-AND-DICT.md`](bench/CM-UNCAP-AND-DICT.md). CM also feeds the
+    BCJ2 *main* stream (~6% on de-addressed x86 code). It is cold-only and slow
+    (~0.3 MB/s); since cold storage doesn't care about speed, it runs up to a
+    1.5 GiB **memory**-bounded cap — large enough to cover whole archives, where a
+    prior 96 MiB cap used to silently drop CM and fall back to LZMA. Never on the
+    live path; regular/live mode keeps the fast LZMA main stream.
   - **RIP filter** — an x86-64 length decoder rewrites `[rip+disp32]` references
     (the GOT/data refs that fill PIC `.so`/PIE binaries) to position-absolute so
     repeated refs match for the LZ stage. 7-Zip's x86 filter doesn't do this. It's

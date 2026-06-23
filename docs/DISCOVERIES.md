@@ -6,12 +6,45 @@
 >
 > *Shallow → deep: the plain summary first, the per-type numbers and prior-art table below.*
 
-An honest map of Mathpressor's contributions. The headline: Mathpressor's value is a
-**novel system** — procedural synthesis and traditional compression unified into one
-auto-routing, live, random-access container — plus **measured wins on structured
-data** and a **working demonstration** of a real Proton game running off the archive
-at native FPS. The individual algorithms are mostly known; the *assembly*, the
-*implementation*, and several *empirical findings* are the work.
+An honest map of Mathpressor's contributions. The headline, sharpened by measurement:
+Mathpressor's real edge is **lossless compression of binary numerical & structured data**
+— float/int arrays, scientific grids, sensor/telemetry, audio — where its **value-domain
+predictors** (1D delta, 2D Lorenzo, LPC, MED, columnar) beat zstd *and* xz, often by a lot,
+because general compressors find repeated *substrings* while numerical redundancy is that
+values *vary smoothly*. That sits inside a **novel system** (those predictors + procedural
+synthesis + general backends, unified into one auto-routing, live, random-access container)
+with a **working game demo**. The individual algorithms are mostly known; the *assembly*,
+the *implementation*, the *float/numeric predictor*, and several *empirical findings* —
+including the honest negative ones (it loses on games/media/text) — are the work.
+
+---
+
+## 0. The measured identity — a numerical/structured-data compressor
+
+The sharpest finding of all: pointed at the data it was built for, Mathpressor beats the
+mainstream tools; pointed at games/media/text, it loses. Both measured (Ryzen 5 5600X,
+lossless, regular/live mode; full tables incl. the honest losses in
+[`../bench/STRUCTURED-DATA-RESULTS.md`](../bench/STRUCTURED-DATA-RESULTS.md)).
+
+**Wins — binary numerical/structured data (vs zstd-19 / xz-9e):**
+
+| data | mathpressor | zstd-19 | xz-9e |
+|---|---|---|---|
+| smooth scientific float field (2D Lorenzo) | **3.16×** | 1.11× | 1.32× |
+| monotonic u32 counter (delta) | **9070×** | 4.4× | 29× |
+| real sensor/telemetry float columns (binary) | beats xz on **11/11** | — | — |
+| 16-bit PCM audio (LPC) | **5.57×** | 1.13× | 1.26× |
+| tabular records (columnar) | **2.72×** | 1.45× | 1.96× |
+
+**Losses — the honest boundary:**
+- **games / already-compressed assets** (Oodle/IoStore, Bink video) — ~1.0× for *everyone* (Dead by Daylight, 58 GB, measured incompressible);
+- **text** (CSV/JSON/source) — LZMA/7-Zip win; a number stored as ASCII hides its structure (the same telemetry loses as text CSV, wins 9/11 as binary columns);
+- **high-entropy data** (random/encrypted/embeddings) — incompressible by everyone.
+
+The reframing: **stop positioning it as a game/media compressor (it loses to Oodle / 7-Zip
+there) — it is a live, lossless compressor for numerical / scientific / sensor / structured
+data, where it beats zstd/xz.** Not yet measured head-to-head vs the HPC specialists (ZFP/SZ);
+the smooth-field ratios are in their range, but that comparison is future work.
 
 ---
 
